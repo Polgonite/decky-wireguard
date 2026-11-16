@@ -157,6 +157,11 @@ directory), then restart Decky Loader.
   duplicate names are safe. Select a connection to open its management menu and
   connect or disconnect it; use Back to return to the list. The short UUID
   appears beside each status.
+- Select **Edit connection configuration** to change the NetworkManager profile's
+  properties, including WireGuard keys and peer options such as endpoints and
+  allowed IPs. Automatic connection is managed separately by the mutually
+  exclusive startup controls. The editor displays secret values; changes are
+  saved to the profile and take effect on the next connection activation.
 - Every connection management page has two mutually exclusive startup checkboxes.
   **Connect during boot** sets NetworkManager's `connection.autoconnect` through
   `nmcli`; this can delay boot when the Deck is offline. **Connect after boot**
