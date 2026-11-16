@@ -9,7 +9,7 @@
     "watch": "rollup -c -w",
     "lint": "eslint src rollup.config.js eslint.config.js",
     "typecheck": "tsc --noEmit",
-    "test": "python3 -m unittest discover -s tests -v",
+    "test": "python3 -m unittest discover -s tests -v && node --test tests/*.test.cjs",
     "package": "npm run build && python3 tools/package.py"
   },
   "devDependencies": {

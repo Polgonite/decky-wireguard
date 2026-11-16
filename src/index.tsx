@@ -45,11 +45,10 @@ function monitorSteamReadiness(): () => void {
     let error: string | null = null;
     try {
       if (typeof App === "undefined" || typeof App.BHasCurrentUser !== "function" ||
-          typeof App.GetServicesInitialized !== "function" || typeof App.m_eLoginState !== "number") {
+          typeof App.GetServicesInitialized !== "function") {
         throw new Error("Steam UI login state is unavailable.");
       }
-      // ELoginState.Success in Steam's login-state API, including completed offline login.
-      ready = App.m_eLoginState === 7 && App.BHasCurrentUser() && App.GetServicesInitialized();
+      ready = App.BHasCurrentUser() && App.GetServicesInitialized();
     } catch (failure) {
       error = errorMessage(failure);
     }

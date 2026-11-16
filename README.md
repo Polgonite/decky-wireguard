@@ -170,8 +170,9 @@ directory), then restart Decky Loader.
   do not affect NetworkManager boot autoconnect or manual Connect actions.
   Turn off the internet requirement for private/offline-only VPNs if needed.
 - Steam readiness is monitored from plugin initialization, even with the panel
-  closed. It requires Steam's successful login state, a current user, and
-  initialized UI services, including a completed Offline Mode login. The UI
+  closed. It uses Steam's `BHasCurrentUser()` login-completion predicate and
+  `GetServicesInitialized()`, including a completed Offline Mode login, without
+  assuming a numeric value for Steam's internal login-state enum. The UI
   reports readiness every two seconds; unavailable APIs, errors, or a report
   older than ten seconds never count as ready.
 - Internet readiness requests a fresh NetworkManager connectivity check and
@@ -260,4 +261,6 @@ directory), then restart Decky Loader.
   another explicit activation. Unloading the plugin leaves tunnels as they are.
 
 Backend tests mock `nmcli` and `wg`; they do not activate any host network connections.
+`npm test` also exercises the frontend readiness monitor with mocked Steam APIs,
+including online/offline login, unfinished initialization, API errors, and unloading.
 Real Steam Deck/Decky integration must be checked on the device.
