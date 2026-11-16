@@ -30,10 +30,10 @@ const stateLabels: Record<ConnectionState, string> = {
 
 const handshakeLabels: Record<HandshakeState, string> = {
   inactive: "Disconnected",
-  waiting: "Waiting for handshake...",
-  established: "Handshake completed",
-  timeout: "No handshake after 30 seconds",
-  unknown: "Handshake status unavailable",
+  waiting: "Verifying peer...",
+  established: "Peer verified",
+  timeout: "No peer response after 30 seconds",
+  unknown: "Peer status unavailable",
 };
 
 const stateColors: Record<HandshakeState, string> = {
@@ -116,12 +116,16 @@ function Content() {
   useEffect(() => {
     mounted.current = true;
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 5000);
     return () => {
       mounted.current = false;
-      window.clearInterval(timer);
     };
   }, [refresh]);
+
+  const refreshInterval = profiles?.some((profile) => profile.handshake === "waiting") ? 1000 : 5000;
+  useEffect(() => {
+    const timer = window.setInterval(() => void refresh(), refreshInterval);
+    return () => window.clearInterval(timer);
+  }, [refresh, refreshInterval]);
 
   const changeConnection = async (profile: Profile) => {
     if (inFlight.current) return;
@@ -251,9 +255,9 @@ function Content() {
       )}
       <PanelSectionRow>
         <div style={{ fontSize: "0.85em", opacity: 0.75, paddingTop: 8 }}>
-          Status comes from NetworkManager and WireGuard and refreshes every 5 seconds while this panel is open.
-          Yellow waits up to 30 seconds for a peer handshake; red means none was observed.
-          Green confirms a handshake since activation, not internet access or ongoing peer health.
+          Status refreshes every second while verifying, otherwise every 5 seconds while this panel is open.
+          Yellow waits up to 30 seconds for a new handshake or authenticated incoming traffic.
+          Green confirms a peer response, not internet access or ongoing peer health.
         </div>
       </PanelSectionRow>
     </PanelSection>
