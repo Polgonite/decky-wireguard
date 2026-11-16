@@ -386,6 +386,71 @@ class Plugin:
             raise NetworkManagerError("NetworkManager returned unexpected autoconnect data.")
         return value == "yes"
 
+    async def get_connection_settings(self, uuid: str) -> dict[str, object]:
+        try:
+            async with self._lock:
+                profile = await self._profile(uuid)
+                output = await _nmcli(
+                    "--show-secrets", "--fields", "all", "connection", "show",
+                    "uuid", profile["uuid"],
+                )
+                settings: list[dict[str, str]] = []
+                for line in output.splitlines():
+                    fields = _split_fields(line)
+                    if len(fields) != 2 or not fields[0].islower():
+                        continue
+                    key, value = fields
+                    if "." in key and key != "connection.autoconnect":
+                        settings.append({"key": key, "value": value})
+                if not any(setting["key"] == "connection.id" for setting in settings):
+                    raise NetworkManagerError("NetworkManager returned unexpected connection settings.")
+                return {"success": True, "settings": settings}
+        except NetworkManagerError as error:
+            return self._failure(error)
+
+    async def set_connection_settings(
+        self, uuid: str, updates: list[dict[str, str]],
+    ) -> dict[str, object]:
+        if not isinstance(updates, list) or any(
+            not isinstance(update, dict)
+            or set(update) != {"key", "value"}
+            or not isinstance(update["key"], str)
+            or not isinstance(update["value"], str)
+            for update in updates
+        ):
+            return self._failure(NetworkManagerError("Connection settings must be key/value pairs."))
+        keys = [update["key"] for update in updates]
+        if "connection.autoconnect" in keys:
+            return self._failure(NetworkManagerError(
+                "connection.autoconnect is managed by the startup controls."
+            ))
+        if (
+            len(updates) > 512
+            or len(set(keys)) != len(keys)
+            or any(
+                len(key) > 128
+                or not key[0:1].islower()
+                or any(not (character.isascii() and (character.isalnum() or character in ".-"))
+                       for character in key)
+                or "." not in key
+                for key in keys
+            )
+            or any(len(update["value"]) > 16384 for update in updates)
+        ):
+            return self._failure(NetworkManagerError("Invalid or duplicate connection setting."))
+        try:
+            async with self._lock:
+                profile = await self._profile(uuid)
+                if not updates:
+                    return {"success": True}
+                arguments = ["connection", "modify", "uuid", profile["uuid"]]
+                for update in updates:
+                    arguments.extend((update["key"], update["value"]))
+                await _nmcli(*arguments)
+                return {"success": True}
+        except NetworkManagerError as error:
+            return self._failure(error)
+
     async def get_startup_settings(self, uuid: str) -> dict[str, object]:
         try:
             async with self._lock:

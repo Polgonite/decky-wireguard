@@ -1,5 +1,7 @@
 import { callable, definePlugin } from "@decky/api";
-import { ButtonItem, DialogCheckbox, PanelSection, PanelSectionRow, staticClasses } from "@decky/ui";
+import {
+  ButtonItem, DialogCheckbox, PanelSection, PanelSectionRow, staticClasses, TextField,
+} from "@decky/ui";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
 
@@ -13,6 +15,17 @@ interface Profile {
   state: ConnectionState;
   handshake: HandshakeState;
   handshake_error: string | null;
+}
+
+interface ConnectionSetting {
+  key: string;
+  value: string;
+}
+
+interface EditableSetting extends ConnectionSetting {
+  id: string;
+  originalValue: string;
+  isNew: boolean;
 }
 
 type Result<T> = ({ success: true } & T) | { success: false; error: string };
@@ -32,6 +45,12 @@ const setStartup = callable<[uuid: string, mode: StartupMode], Result<object>>("
 const setStartupRequirements = callable<
   [uuid: string, waitForSteam: boolean, waitForInternet: boolean], Result<object>
 >("set_startup_requirements");
+const getConnectionSettings = callable<
+  [uuid: string], Result<{ settings: ConnectionSetting[] }>
+>("get_connection_settings");
+const setConnectionSettings = callable<
+  [uuid: string, updates: ConnectionSetting[]], Result<object>
+>("set_connection_settings");
 const setSteamReadiness = callable<[ready: boolean, error: string | null], Result<object>>("set_steam_readiness");
 
 function monitorSteamReadiness(): () => void {
@@ -136,6 +155,12 @@ function Content() {
   const [busy, setBusy] = useState(false);
   const [pendingUuid, setPendingUuid] = useState<string | null>(null);
   const [selectedUuid, setSelectedUuid] = useState<string | null>(null);
+  const [editingConfig, setEditingConfig] = useState(false);
+  const [configDraft, setConfigDraft] = useState<EditableSetting[] | null>(null);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const configRequest = useRef(0);
+  const nextSettingId = useRef(0);
   const [startup, setStartupSettings] = useState<(StartupSettings & { uuid: string }) | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [startupSettingsError, setStartupSettingsError] = useState<string | null>(null);
@@ -211,7 +236,7 @@ function Content() {
   }, [refresh, refreshInterval]);
 
   const applyChange = async (profile: Profile, action: () => Promise<Result<object>>) => {
-    if (inFlight.current) return;
+    if (inFlight.current) return false;
     inFlight.current = true;
     setBusy(true);
     setPendingUuid(profile.uuid);
@@ -219,12 +244,14 @@ function Content() {
     await refreshing.current;
     if (!mounted.current) {
       inFlight.current = false;
-      return;
+      return false;
     }
     let failure: string | null = null;
+    let succeeded = false;
     try {
       const result = await action();
       if (!result.success) throw new Error(result.error);
+      succeeded = true;
     } catch (error) {
       failure = errorMessage(error);
     }
@@ -241,6 +268,47 @@ function Content() {
         setPendingUuid(null);
       }
     }
+    return succeeded;
+  };
+
+  const loadConfig = async (uuid: string) => {
+    const request = ++configRequest.current;
+    setConfigLoading(true);
+    setConfigError(null);
+    setConfigDraft(null);
+    try {
+      const result = await getConnectionSettings(uuid);
+      if (!result.success) throw new Error(result.error);
+      if (mounted.current && request === configRequest.current) {
+        setConfigDraft(result.settings.map((setting) => ({
+          ...setting,
+          id: setting.key,
+          originalValue: setting.value,
+          isNew: false,
+        })));
+      }
+    } catch (failure) {
+      if (mounted.current && request === configRequest.current) {
+        setConfigError(errorMessage(failure));
+      }
+    } finally {
+      if (mounted.current && request === configRequest.current) setConfigLoading(false);
+    }
+  };
+
+  const saveConfig = async (profile: Profile) => {
+    if (!configDraft) return;
+    const configured = configDraft.filter((setting) => setting.key.trim() !== "");
+    const keys = configured.map((setting) => setting.key.trim());
+    if (new Set(keys).size !== keys.length) {
+      setConfigError("Connection setting names must be unique.");
+      return;
+    }
+    const updates = configured.filter((setting) =>
+      setting.isNew || setting.value !== setting.originalValue,
+    ).map(({ key, value }) => ({ key: key.trim(), value }));
+    const saved = await applyChange(profile, () => setConnectionSettings(profile.uuid, updates));
+    if (saved) await loadConfig(profile.uuid);
   };
 
   const selectedProfile = profiles?.find((profile) => profile.uuid === selectedUuid);
@@ -259,7 +327,9 @@ function Content() {
   };
 
   return (
-    <PanelSection title={selectedUuid === null ? "WireGuard connections" : "Manage connection"}>
+    <PanelSection title={
+      selectedUuid === null ? "WireGuard connections" : editingConfig ? "Edit connection" : "Manage connection"
+    }>
       <style>{`
         @keyframes decky-wireguard-pulse {
           0%, 100% { opacity: 1; transform: scale(1); }
@@ -272,10 +342,23 @@ function Content() {
       <PanelSectionRow>
         <ButtonItem
           layout="below"
-          onClick={() => selectedUuid === null ? void refresh() : setSelectedUuid(null)}
+          onClick={() => {
+            if (editingConfig) {
+              configRequest.current++;
+              setEditingConfig(false);
+              setConfigDraft(null);
+              setConfigError(null);
+              setError(null);
+            } else if (selectedUuid === null) {
+              void refresh();
+            } else {
+              setSelectedUuid(null);
+            }
+          }}
           disabled={selectedUuid === null && busy}
         >
-          {selectedUuid === null ? (busy ? "Working..." : "Refresh") : "Back to connections"}
+          {selectedUuid === null ? (busy ? "Working..." : "Refresh")
+            : editingConfig ? "Back to connection" : "Back to connections"}
         </ButtonItem>
       </PanelSectionRow>
       {error && (
@@ -324,7 +407,7 @@ function Content() {
       {selectedUuid !== null && !selectedProfile && profiles !== null && (
         <PanelSectionRow>Profile no longer available. Return to the connection list.</PanelSectionRow>
       )}
-      {selectedProfile && (
+      {selectedProfile && !editingConfig && (
         <PanelSectionRow>
           <ButtonItem
             layout="below"
@@ -347,8 +430,22 @@ function Content() {
           </ButtonItem>
         </PanelSectionRow>
       )}
-      {selectedProfile && (
+      {selectedProfile && !editingConfig && (
         <>
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              disabled={busy || error !== null}
+              onClick={() => {
+                setError(null);
+                setConfigError(null);
+                setEditingConfig(true);
+                void loadConfig(selectedProfile.uuid);
+              }}
+            >
+              Edit connection configuration
+            </ButtonItem>
+          </PanelSectionRow>
           {startupSettingsError && (
             <PanelSectionRow>
               <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
@@ -418,6 +515,106 @@ function Content() {
                 {selectedStartup.waiting}
               </div>
             </PanelSectionRow>
+          )}
+        </>
+      )}
+      {selectedProfile && editingConfig && (
+        <>
+          <PanelSectionRow>
+            <div style={{ fontSize: "0.85em", opacity: 0.8, padding: "8px 0" }}>
+              Edit NetworkManager profile properties, including WireGuard keys and peer settings.
+              Clear a value to reset it. Changes are saved to the profile; reconnect to apply
+              them to an active tunnel.
+            </div>
+          </PanelSectionRow>
+          {configLoading && <PanelSectionRow>Loading connection settings...</PanelSectionRow>}
+          {configError && (
+            <PanelSectionRow>
+              <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
+                Connection settings: {configError}
+              </div>
+            </PanelSectionRow>
+          )}
+          {configError && configDraft === null && (
+            <PanelSectionRow>
+              <ButtonItem layout="below" disabled={configLoading}
+                onClick={() => void loadConfig(selectedProfile.uuid)}>
+                Retry
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
+          {configDraft?.map((setting, index) => (
+            <PanelSectionRow key={setting.id}>
+              {setting.isNew ? (
+                <TextField
+                  label="Setting name"
+                  value={setting.key}
+                  disabled={busy}
+                  onChange={(event) => {
+                    setConfigError(null);
+                    setConfigDraft((current) => current?.map((entry, entryIndex) =>
+                      entryIndex === index ? { ...entry, key: event.target.value } : entry,
+                    ) ?? null);
+                  }}
+                />
+              ) : (
+                <TextField label={setting.key} value={setting.value} disabled={busy}
+                  onChange={(event) => {
+                    setConfigError(null);
+                    setConfigDraft((current) => current?.map((entry) =>
+                      entry.id === setting.id ? { ...entry, value: event.target.value } : entry,
+                    ) ?? null);
+                  }}
+                />
+              )}
+              {setting.isNew && (
+                <TextField
+                  label="Value"
+                  value={setting.value}
+                  disabled={busy}
+                  onChange={(event) => {
+                    setConfigError(null);
+                    setConfigDraft((current) => current?.map((entry) =>
+                      entry.id === setting.id ? { ...entry, value: event.target.value } : entry,
+                    ) ?? null);
+                  }}
+                />
+              )}
+            </PanelSectionRow>
+          ))}
+          {configDraft && (
+            <>
+              <PanelSectionRow>
+                <ButtonItem
+                  layout="below"
+                  disabled={busy}
+                  onClick={() => {
+                    setConfigError(null);
+                    setConfigDraft((current) => current && [
+                      ...current,
+                      {
+                        id: `new-${nextSettingId.current++}`,
+                        key: "",
+                        value: "",
+                        originalValue: "",
+                        isNew: true,
+                      },
+                    ]);
+                  }}
+                >
+                  Add profile property
+                </ButtonItem>
+              </PanelSectionRow>
+              <PanelSectionRow>
+                <ButtonItem
+                  layout="below"
+                  disabled={busy || configLoading}
+                  onClick={() => void saveConfig(selectedProfile)}
+                >
+                  {busy ? "Saving..." : "Save changes"}
+                </ButtonItem>
+              </PanelSectionRow>
+            </>
           )}
         </>
       )}

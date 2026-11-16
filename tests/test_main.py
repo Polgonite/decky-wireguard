@@ -530,6 +530,57 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
         self.nmcli.return_value = ""
         self.assertEqual(await self.plugin.get_profiles(), {"success": True, "profiles": []})
 
+    async def test_connection_settings_include_secrets_and_profile_properties(self):
+        self.nmcli.side_effect = [
+            f"{HOME}:wireguard:Home:::\n",
+            "GENERAL.NAME:Home\n"
+            "connection.id:Home\\: VPN\n"
+            "connection.autoconnect:yes\n"
+            "wireguard.private-key:private-key\n"
+            "wireguard.peers:public-key=peer;endpoint=host\\:51820;allowed-ips=0.0.0.0/0\n",
+        ]
+        result = await self.plugin.get_connection_settings(HOME)
+        self.assertEqual(result, {
+            "success": True,
+            "settings": [
+                {"key": "connection.id", "value": "Home: VPN"},
+                {"key": "wireguard.private-key", "value": "private-key"},
+                {
+                    "key": "wireguard.peers",
+                    "value": "public-key=peer;endpoint=host:51820;allowed-ips=0.0.0.0/0",
+                },
+            ],
+        })
+        self.nmcli.assert_awaited_with(
+            "--show-secrets", "--fields", "all", "connection", "show", "uuid", HOME,
+        )
+
+    async def test_connection_settings_update_uses_uuid_and_rejects_invalid_fields(self):
+        self.nmcli.side_effect = [f"{HOME}:wireguard:Home:::\n", ""]
+        self.assertEqual(await self.plugin.set_connection_settings(HOME, [
+            {"key": "wireguard.private-key", "value": "replacement"},
+            {"key": "wireguard.peers", "value": "allowed-ips=10.0.0.0/8"},
+        ]), {"success": True})
+        self.nmcli.assert_awaited_with(
+            "connection", "modify", "uuid", HOME,
+            "wireguard.private-key", "replacement",
+            "wireguard.peers", "allowed-ips=10.0.0.0/8",
+        )
+        self.nmcli.reset_mock()
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.set_connection_settings(HOME, [
+                {"key": "connection.autoconnect", "value": "yes"},
+            ])
+        self.assertFalse(result["success"])
+        self.assertIn("managed by the startup controls", result["error"])
+        self.nmcli.assert_not_awaited()
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.set_connection_settings(HOME, [
+                {"key": "--help", "value": "ignored"},
+            ])
+        self.assertFalse(result["success"])
+        self.nmcli.assert_not_awaited()
+
     async def test_transient_and_unrecognized_states(self):
         for raw, expected in [
             ("activating", "connecting"),
