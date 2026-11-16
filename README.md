@@ -55,6 +55,10 @@ tests the backend, type-checks and builds the frontend, verifies the ZIP, then
 publishes it on the [GitHub Releases page](https://github.com/Polgonite/decky-wireguard/releases).
 All releases are marked **prerelease**, not stable or latest.
 
+Both CI jobs use Ubuntu 24.04 runners to avoid automatic OS migrations.
+The checkout and setup actions use Node.js 24 internally; the project still
+builds with Node.js 22.
+
 Each build gets a version such as `0.1.0-dev.123456789.1.shaabcdef0`, containing
 the workflow run ID, attempt number, and short commit SHA. Reruns create distinct
 releases instead of overwriting previous assets. That version is embedded in the
