@@ -146,7 +146,9 @@ directory), then restart Decky Loader.
 
 - Every native WireGuard profile is listed, including disconnected profiles.
   Names with colons and backslashes are supported, and actions use UUIDs so
-  duplicate names are safe. The short UUID appears beside each status.
+  duplicate names are safe. Select a connection to open its management menu and
+  connect or disconnect it; use Back to return to the list. The short UUID
+  appears beside each status.
 - Status refreshes every five seconds while the panel is mounted. Refresh also
   runs after each action. Refreshes keep the current controls visible and only
   update profiles when the response changes; connection actions still show a
@@ -157,8 +159,12 @@ directory), then restart Decky Loader.
   in the panel. Actions have a 30-second NetworkManager wait limit; if an action
   times out, refresh before retrying because NetworkManager may still complete it.
 - **Connected** means NetworkManager activated the interface, not that a
-  WireGuard peer completed a handshake or that traffic is protected. Routing,
-  DNS, allowed IPs, and kill-switch behavior belong to the imported profile.
+  WireGuard peer completed a handshake or that traffic is protected. The status
+  circle is green for an activated interface and gray for deactivated,
+  transitional, unknown, or unavailable status. The plugin cannot reliably
+  distinguish peer failure or internet availability, so it does not display
+  red or yellow connectivity states. Routing, DNS, allowed IPs, and kill-switch
+  behavior belong to the imported profile.
 - Multiple tunnels can be active. Connecting one does not disconnect others;
   overlapping routes may conflict.
 - The plugin does not import, edit, delete, or display configuration secrets. It
