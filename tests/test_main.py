@@ -1,8 +1,19 @@
 import asyncio
+import socket
 import unittest
+from ipaddress import ip_address
 from unittest.mock import AsyncMock, Mock, patch
 
-from main import NetworkManagerError, Plugin, _handshakes, _nmcli
+from main import (
+    NetworkManagerError,
+    Plugin,
+    ProbeTarget,
+    _handshakes,
+    _nmcli,
+    _probe_targets,
+    _received_bytes,
+    _send_probe,
+)
 
 
 HOME = "11111111-1111-4111-8111-111111111111"
@@ -20,6 +31,18 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
         self.handshake_patcher = patch("main._handshakes", new_callable=AsyncMock, return_value={})
         self.handshakes = self.handshake_patcher.start()
         self.addCleanup(self.handshake_patcher.stop)
+        self.received_patcher = patch("main._received_bytes", new_callable=AsyncMock, return_value={})
+        self.received = self.received_patcher.start()
+        self.addCleanup(self.received_patcher.stop)
+        self.targets_patcher = patch(
+            "main._probe_targets", new_callable=AsyncMock,
+            return_value=[ProbeTarget(ip_address("10.0.0.1"))],
+        )
+        self.targets = self.targets_patcher.start()
+        self.addCleanup(self.targets_patcher.stop)
+        self.probe_patcher = patch("main._send_probe", new_callable=AsyncMock)
+        self.probe = self.probe_patcher.start()
+        self.addCleanup(self.probe_patcher.stop)
 
     async def test_list_filters_types_decodes_names_and_sorts(self):
         self.nmcli.return_value = (
@@ -270,8 +293,209 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["profiles"][0]["handshake"], "established")
             self.assertIsNone(result["profiles"][0]["handshake_error"])
 
+    async def test_existing_handshake_is_verified_by_fresh_received_traffic(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        self.handshakes.return_value = {"peer": 900}
+        self.received.return_value = {"peer": 1000}
+        self.assertEqual(await self.handshake_status(), "waiting")
+        self.probe.assert_awaited_once_with("wg0", self.targets.return_value)
+        self.assertEqual(await self.handshake_status(), "waiting")
+        self.received.return_value = {"peer": 1032}
+        self.assertEqual(await self.handshake_status(), "established")
+        self.probe.assert_awaited_once()
+
+    async def test_counter_reset_or_new_peer_baseline_is_not_fresh_evidence(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        self.received.return_value = {"peer": 1000}
+        self.assertEqual(await self.handshake_status(), "waiting")
+        self.received.return_value = {"peer": 10, "new-peer": 10000}
+        self.assertEqual(await self.handshake_status(), "waiting")
+
+    async def test_probe_retries_are_throttled_and_sends_alone_do_not_verify(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        with patch("main.time.monotonic", return_value=100) as clock:
+            self.assertEqual(await self.handshake_status(), "waiting")
+            clock.return_value = 109.999
+            self.assertEqual(await self.handshake_status(), "waiting")
+            self.assertEqual(self.probe.await_count, 1)
+            clock.return_value = 110
+            self.assertEqual(await self.handshake_status(), "waiting")
+            self.assertEqual(self.probe.await_count, 2)
+            clock.return_value = 130
+            self.assertEqual(await self.handshake_status(), "timeout")
+            self.targets.assert_awaited_once_with("wg0")
+            self.received.return_value = {"peer": 0}
+            # First observations are baselines, not newly received traffic.
+            self.assertEqual(await self.handshake_status(), "timeout")
+
+    async def test_receive_baseline_resets_for_reactivation(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        self.received.return_value = {"peer": 1000}
+        await self.handshake_status()
+        self.received.return_value = {"peer": 1032}
+        self.assertEqual(await self.handshake_status(), "established")
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/2\n"
+        self.assertEqual(await self.handshake_status(), "waiting")
+        self.assertEqual(self.probe.await_count, 2)
+        self.received.return_value = {"peer": 1064}
+        self.assertEqual(await self.handshake_status(), "established")
+
+    async def test_probe_failure_reports_unavailable_but_evidence_can_still_recover(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        self.received.return_value = {"peer": 1000}
+        self.probe.side_effect = NetworkManagerError("Probe blocked")
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.get_profiles()
+        self.assertEqual(result["profiles"][0]["handshake"], "unknown")
+        self.assertEqual(result["profiles"][0]["handshake_error"], "Probe blocked")
+        self.received.return_value = {"peer": 1032}
+        self.assertEqual(await self.handshake_status(), "established")
+
+
+class ProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def targets(self, allowed, device):
+        with patch("main._command", new_callable=AsyncMock, return_value=allowed) as command, patch(
+            "main._nmcli", new_callable=AsyncMock, return_value=device,
+        ):
+            result = await _probe_targets("wg0")
+        command.assert_awaited_once_with("wg", "show", "wg0", "allowed-ips")
+        return result
+
+    async def test_provider_dns_and_default_route_need_no_fixed_public_service(self):
+        self.assertEqual(await self.targets(
+            "peer\t0.0.0.0/0 ::/0\n",
+            "IP4.ADDRESS[1]:10.2.0.2/32\nIP4.DNS[1]:10.2.0.1\n",
+        ), [
+            ProbeTarget(ip_address("10.2.0.1"), dns=True),
+            ProbeTarget(ip_address("192.0.2.1")),
+        ])
+
+    async def test_private_tunnel_without_dns_avoids_local_address(self):
+        self.assertEqual(await self.targets(
+            "peer\t10.50.0.0/24\n", "IP4.ADDRESS[1]:10.50.0.1/24\n",
+        ), [ProbeTarget(ip_address("10.50.0.2"))])
+
+    async def test_ipv6_only_default_route_and_escaped_dns_address(self):
+        self.assertEqual(await self.targets(
+            "peer\t::/0\n",
+            "IP6.ADDRESS[1]:fd00\\:\\:2/128\nIP6.DNS[1]:fd00\\:\\:1\n",
+        ), [
+            ProbeTarget(ip_address("fd00::1"), dns=True),
+            ProbeTarget(ip_address("2001:db8::1")),
+        ])
+
+    async def test_dns_outside_allowed_ips_is_never_probed(self):
+        self.assertEqual(await self.targets(
+            "peer\t10.0.0.9/32\n", "IP4.ADDRESS[1]:10.0.0.2/32\nIP4.DNS[1]:192.0.2.53\n",
+        ), [ProbeTarget(ip_address("10.0.0.9"))])
+
+    async def test_multiple_peers_use_longest_prefix_ownership(self):
+        self.assertEqual(await self.targets(
+            "broad\t10.0.0.0/24\nspecific\t10.0.0.1/32\n",
+            "IP4.ADDRESS[1]:10.0.0.3/24\nIP4.DNS[1]:10.0.0.1\n",
+        ), [
+            ProbeTarget(ip_address("10.0.0.2")),
+            ProbeTarget(ip_address("10.0.0.1"), dns=True),
+            ProbeTarget(ip_address("10.0.0.1")),
+        ])
+
+    async def test_bad_or_unusable_addresses_are_explicit_errors(self):
+        for allowed, device in [
+            ("peer\t(none)\n", ""),
+            ("peer\t10.0.0.2/32\n", "IP4.ADDRESS[1]:10.0.0.2/32\n"),
+            ("peer\t127.0.0.0/8 224.0.0.0/4 169.254.0.0/16\n", ""),
+            ("peer\tbad-network\n", ""),
+            ("peer\t10.0.0.0/24\n", "unexpected:field:shape\n"),
+        ]:
+            with self.subTest(allowed=allowed, device=device):
+                with self.assertRaises(NetworkManagerError):
+                    await self.targets(allowed, device)
+
+    async def test_probes_bind_to_tunnel_and_use_dns_or_icmp_for_both_ip_families(self):
+        targets = [
+            ProbeTarget(ip_address("10.0.0.53"), dns=True),
+            ProbeTarget(ip_address("10.0.0.1")),
+            ProbeTarget(ip_address("fd00::53"), dns=True),
+            ProbeTarget(ip_address("fd00::1")),
+        ]
+        send = AsyncMock()
+        with patch("main.socket.socket") as create, patch.object(
+            asyncio.get_running_loop(), "sock_sendto", send,
+        ):
+            await _send_probe("wg0", targets)
+        protocols = [call.args[2] for call in create.call_args_list]
+        self.assertEqual(protocols, [
+            socket.IPPROTO_UDP, socket.IPPROTO_ICMP, socket.IPPROTO_UDP, socket.IPPROTO_ICMPV6,
+        ])
+        probe = create.return_value.__enter__.return_value
+        probe.setsockopt.assert_called_with(
+            socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"wg0\0",
+        )
+        self.assertEqual(probe.setsockopt.call_count, 4)
+        probe.setblocking.assert_called_with(False)
+        packets = [call.args[1] for call in send.await_args_list]
+        self.assertEqual(packets[0][2:], b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\0\0\2\0\1")
+        self.assertEqual(packets[1][0], 8)
+        self.assertEqual(packets[3][0], 128)
+        self.assertEqual(send.await_args_list[0].args[2], ("10.0.0.53", 53))
+        self.assertEqual(send.await_args_list[3].args[2], ("fd00::1", 0, 0, 0))
+
+    async def test_binding_failure_never_sends_unbound_probe(self):
+        with patch("main.socket.socket") as create, patch.object(
+            asyncio.get_running_loop(), "sock_sendto", new_callable=AsyncMock,
+        ) as send:
+            create.return_value.__enter__.return_value.setsockopt.side_effect = PermissionError(
+                "denied",
+            )
+            with self.assertLogs("decky-wireguard"), self.assertRaisesRegex(
+                NetworkManagerError, "denied",
+            ):
+                await _send_probe("wg0", [ProbeTarget(ip_address("10.0.0.1"))])
+            send.assert_not_awaited()
+
+    async def test_failed_probe_does_not_prevent_other_targets_from_being_tried(self):
+        with patch("main.socket.socket"), patch.object(
+            asyncio.get_running_loop(), "sock_sendto",
+            new_callable=AsyncMock, side_effect=[OSError("no route"), None],
+        ) as send, self.assertLogs("decky-wireguard"):
+            await _send_probe("wg0", [
+                ProbeTarget(ip_address("10.0.0.1")), ProbeTarget(ip_address("fd00::1")),
+            ])
+        self.assertEqual(send.await_count, 2)
+
+    async def test_restricted_ping_sockets_use_root_raw_socket_with_valid_checksum(self):
+        raw = Mock()
+        with patch(
+            "main.socket.socket", side_effect=[PermissionError("ping group restricted"), raw],
+        ) as create, patch.object(
+            asyncio.get_running_loop(), "sock_sendto", new_callable=AsyncMock,
+        ) as send:
+            raw.__enter__ = Mock(return_value=raw)
+            raw.__exit__ = Mock(return_value=False)
+            await _send_probe("wg0", [ProbeTarget(ip_address("10.0.0.1"))])
+        self.assertEqual(
+            create.call_args.args, (socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP),
+        )
+        self.assertEqual(send.await_args.args[1], b"\x08\0\xf7\xfe\0\0\0\1")
+        raw.setsockopt.assert_called_once_with(
+            socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"wg0\0",
+        )
+
 
 class SubprocessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transfer_query_only_reads_counters_and_does_not_use_sent_bytes(self):
+        with patch(
+            "main._command", new_callable=AsyncMock, return_value="peer\t123\t999999\n",
+        ) as command:
+            self.assertEqual(await _received_bytes("wg0"), {"peer": 123})
+        command.assert_awaited_once_with("wg", "show", "wg0", "transfer")
+        for output in ["peer\t-1\t0\n", "peer\t1\n", "peer\tx\t10\n", "peer\t1\tbad\n"]:
+            with self.subTest(output=output), patch(
+                "main._command", new_callable=AsyncMock, return_value=output,
+            ):
+                with self.assertRaisesRegex(NetworkManagerError, "unexpected transfer data"):
+                    await _received_bytes("wg0")
+
     async def test_handshake_query_only_requests_timestamps_without_secrets(self):
         process = Mock(
             returncode=0, communicate=AsyncMock(return_value=(b"peer1\t0\npeer2\t1234\n", b"")),

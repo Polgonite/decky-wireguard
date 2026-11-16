@@ -154,7 +154,8 @@ directory), then restart Decky Loader.
   duplicate names are safe. Select a connection to open its management menu and
   connect or disconnect it; use Back to return to the list. The short UUID
   appears beside each status.
-- Status refreshes every five seconds while the panel is mounted. Refresh also
+- Status refreshes every second while verifying a peer, otherwise every five
+  seconds while the panel is mounted. Refresh also
   runs after each action. Refreshes keep the current controls visible and only
   update profiles when the response changes; connection actions still show a
   busy state. Unavailable status disables actions until a successful refresh,
@@ -164,23 +165,43 @@ directory), then restart Decky Loader.
   in the panel. Actions have a 30-second NetworkManager wait limit; if an action
   times out, refresh before retrying because NetworkManager may still complete it.
 - The status circle is **gray** when deactivated, **gently pulsing yellow**
-  while waiting for a peer handshake, **green** once any peer completes a
-  handshake since activation, and **red** if none is observed within 30 seconds.
-  A late handshake changes red to green. Green stays until deactivation; it
-  does not indicate ongoing peer health, internet access, or protected routing.
+  while verifying a peer, **green** once any peer completes a new handshake or
+  sends newly received authenticated traffic, and **red** if neither is observed
+  within 30 seconds. A late response changes red to green. Green stays until
+  deactivation; it does not indicate ongoing peer health, internet access, or protected routing.
   Pulsing is disabled when reduced motion is requested.
-- Handshakes are read with `wg show <interface> latest-handshakes`, without
-  reading private keys. Each NetworkManager active-connection path identifies
+- Evidence is read with `wg show <interface> latest-handshakes` and
+  `wg show <interface> transfer`, without reading private keys. An increase in
+  a peer's receive counter includes authenticated WireGuard keepalives; sent
+  bytes and successful probe sends are never counted as proof of connectivity.
+  Each NetworkManager active-connection path identifies
   an activation, so reconnecting resets status even between refreshes. The
   timeout starts when the plugin requests activation, or first observes an
   external activation. For tunnels already active when the backend starts,
-  existing handshake timestamps are a baseline: a new handshake is required.
+  existing handshake timestamps and received byte counts are baselines: a new
+  handshake or newly received authenticated traffic is required.
   Closing and reopening the panel does not reset backend tracking.
-- WireGuard normally handshakes only when there is traffic (or a configured
-  persistent keepalive). The plugin does not generate traffic or change
-  keepalive settings, so an idle, otherwise working tunnel can turn red.
-  Missing `wg`, permission failures, and unreadable handshake data produce
-  gray/unavailable status with an error, not a red timeout, and do not prevent
+- While unverified, the plugin sends a small round of probes immediately and
+  at most once every 10 seconds while the panel is open. It prefers a root NS
+  query to the tunnel's configured DNS server when covered by that peer's
+  AllowedIPs, and also sends an ICMP echo to a non-local address in its allowed
+  ranges. Both IPv4 and IPv6 are supported. Sockets are bound to the WireGuard
+  interface: probes must not fall back to Wi-Fi or another tunnel.
+- No fixed public service, public endpoint ping, or internet access is required.
+  For default routes without a known private target, an ICMP probe uses a
+  documentation-only address (`192.0.2.1` or `2001:db8::1`); it need not reply.
+  Queuing traffic triggers a handshake when necessary, and an established
+  session can instead return an authenticated WireGuard keepalive. DNS/ICMP
+  replies can verify faster, but a reply from the probe destination itself
+  is not required. There is no nondisruptive command to force a new handshake
+  on an already usable session.
+- No routes, keys, keepalive settings, or saved profiles are changed. This
+  works at the WireGuard protocol level rather than relying on a particular
+  provider or assuming the server's tunnel address is `.1`. Networks blocking
+  probes, missing endpoints, or unusable AllowedIPs can prevent verification;
+  red means no fresh evidence, not definitive proof the tunnel is broken.
+  Missing `wg`, permission failures, probe setup/send failures, and unreadable
+  data produce gray/unavailable status with an error, not a red timeout, and do not prevent
   disconnecting. Routing, DNS, allowed IPs, and kill-switch behavior belong to
   the imported profile.
 - Multiple tunnels can be active. Connecting one does not disconnect others;
