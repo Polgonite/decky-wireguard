@@ -1,0 +1,10 @@
+{
+  "name": "WireGuard",
+  "author": "Polgonite",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["network", "vpn", "wireguard"],
+    "description": "Connect and disconnect existing NetworkManager WireGuard profiles."
+  }
+}
