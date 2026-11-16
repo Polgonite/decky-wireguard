@@ -1,7 +1,7 @@
 import { callable, definePlugin } from "@decky/api";
 import { ButtonItem, PanelSection, PanelSectionRow, staticClasses } from "@decky/ui";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FaShieldAlt } from "react-icons/fa";
+import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
 
 type ConnectionState = "connected" | "connecting" | "disconnecting" | "disconnected" | "unknown";
 
@@ -25,6 +25,29 @@ const stateLabels: Record<ConnectionState, string> = {
   unknown: "Unknown state",
 };
 
+const stateColors: Record<ConnectionState, string> = {
+  connected: "#66c96b",
+  connecting: "#9b9b9b",
+  disconnecting: "#9b9b9b",
+  disconnected: "#9b9b9b",
+  unknown: "#9b9b9b",
+};
+
+function StatusCircle({ state }: { state: ConnectionState }) {
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        backgroundColor: stateColors[state],
+        borderRadius: "50%",
+        flexShrink: 0,
+        height: 12,
+        width: 12,
+      }}
+    />
+  );
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -34,6 +57,7 @@ function Content() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [pendingUuid, setPendingUuid] = useState<string | null>(null);
+  const [selectedUuid, setSelectedUuid] = useState<string | null>(null);
   const inFlight = useRef(false);
   const refreshing = useRef<Promise<void> | null>(null);
   const mounted = useRef(false);
@@ -113,11 +137,21 @@ function Content() {
     }
   };
 
+  const selectedProfile = profiles?.find((profile) => profile.uuid === selectedUuid);
+  const transitioning = selectedProfile?.state === "connecting" || selectedProfile?.state === "disconnecting";
+  const selectedStatus = error ? "Status unavailable" : pendingUuid === selectedProfile?.uuid
+    ? "Applying change..."
+    : selectedProfile ? stateLabels[selectedProfile.state] : "";
+
   return (
-    <PanelSection title="WireGuard connections">
+    <PanelSection title={selectedUuid === null ? "WireGuard connections" : "Manage connection"}>
       <PanelSectionRow>
-        <ButtonItem layout="below" disabled={busy} onClick={() => void refresh()}>
-          {busy ? "Working..." : "Refresh"}
+        <ButtonItem
+          layout="below"
+          onClick={() => selectedUuid === null ? void refresh() : setSelectedUuid(null)}
+          disabled={selectedUuid === null && busy}
+        >
+          {selectedUuid === null ? (busy ? "Working..." : "Refresh") : "Back to connections"}
         </ButtonItem>
       </PanelSectionRow>
       {error && (
@@ -131,32 +165,48 @@ function Content() {
       {profiles === null && !error && (
         <PanelSectionRow>Loading profiles...</PanelSectionRow>
       )}
-      {profiles?.length === 0 && (
+      {selectedUuid === null && profiles?.length === 0 && (
         <PanelSectionRow>
           No WireGuard profiles found. Import a profile into NetworkManager in Desktop Mode first.
         </PanelSectionRow>
       )}
-      {profiles?.map((profile) => {
-        const transitioning = profile.state === "connecting" || profile.state === "disconnecting";
-        const status = pendingUuid === profile.uuid ? "Applying change..." : stateLabels[profile.state];
-        return (
-          <PanelSectionRow key={profile.uuid}>
-            <ButtonItem
-              layout="below"
-              label={profile.name}
-              description={`${status}${profile.device ? ` on ${profile.device}` : ""} \u00b7 ${profile.uuid.slice(0, 8)}`}
-              disabled={busy || error !== null || transitioning || profile.state === "unknown"}
-              onClick={() => void changeConnection(profile)}
-            >
-              {pendingUuid === profile.uuid
-                ? "Please wait..."
-                : transitioning || profile.state === "unknown"
-                  ? stateLabels[profile.state]
-                  : profile.state === "connected" ? "Disconnect" : "Connect"}
-            </ButtonItem>
-          </PanelSectionRow>
-        );
-      })}
+      {selectedUuid === null && profiles?.map((profile) => (
+        <PanelSectionRow key={profile.uuid}>
+          <ButtonItem layout="below" onClick={() => setSelectedUuid(profile.uuid)}>
+            <span style={{ display: "flex", alignItems: "center", gap: 10, width: "100%" }}>
+              <StatusCircle state={error || pendingUuid === profile.uuid ? "unknown" : profile.state} />
+              <span style={{ flex: 1, textAlign: "left", overflowWrap: "anywhere" }}>
+                {profile.name}
+                <span style={{ display: "block", fontSize: "0.8em", opacity: 0.75 }}>
+                  {error ? "Status unavailable" : pendingUuid === profile.uuid
+                    ? "Applying change..." : stateLabels[profile.state]} · {profile.uuid.slice(0, 8)}
+                </span>
+              </span>
+              <FaChevronRight aria-hidden="true" />
+            </span>
+          </ButtonItem>
+        </PanelSectionRow>
+      ))}
+      {selectedUuid !== null && !selectedProfile && profiles !== null && (
+        <PanelSectionRow>Profile no longer available. Return to the connection list.</PanelSectionRow>
+      )}
+      {selectedProfile && (
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            label={selectedProfile.name}
+            description={`${selectedStatus}${selectedProfile.device ? ` on ${selectedProfile.device}` : ""} \u00b7 ${selectedProfile.uuid.slice(0, 8)}`}
+            disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
+            onClick={() => void changeConnection(selectedProfile)}
+          >
+            {pendingUuid === selectedProfile.uuid
+              ? "Please wait..."
+              : transitioning || selectedProfile.state === "unknown"
+                ? stateLabels[selectedProfile.state]
+                : selectedProfile.state === "connected" ? "Disconnect" : "Connect"}
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
         <div style={{ fontSize: "0.85em", opacity: 0.75, paddingTop: 8 }}>
           Status comes from NetworkManager and refreshes every 5 seconds while this panel is open.
