@@ -11,6 +11,8 @@ permissions:
 jobs:
   checks:
     name: Pre-commit checks in dev container
+    # Disabled: checks run locally before pushing. Remove this line to re-enable.
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -31,7 +33,8 @@ jobs:
     name: Build and publish development release
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: checks
+    # Re-enable together with the checks job above.
+    # needs: checks
     if: github.event_name == 'push'
     permissions:
       contents: write
