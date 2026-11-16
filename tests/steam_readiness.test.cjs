@@ -35,7 +35,7 @@ function monitor(app) {
       };
       if (name === "@decky/ui") return { staticClasses: { Title: "title" } };
       if (name === "react/jsx-runtime") return { jsx: () => ({}), jsxs: () => ({}) };
-      if (name === "./config-settings") return {};
+      if (name === "./connection-editor" || name === "./wireguard-config") return {};
       if (name === "react" || name === "react-icons/fa") return {};
       throw new Error(`Unexpected module: ${name}`);
     },

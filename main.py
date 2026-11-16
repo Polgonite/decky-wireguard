@@ -1,7 +1,10 @@
 import asyncio
+import base64
+import copy
 import json
 import logging
 import os
+import re
 import socket
 import struct
 import tempfile
@@ -30,6 +33,24 @@ PROBE_INTERVAL = 10
 Address = IPv4Address | IPv6Address
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 STEAM_READINESS_MAX_AGE = 10
+NM_SERVICE = "org.freedesktop.NetworkManager"
+NM_SETTINGS_PATH = "/org/freedesktop/NetworkManager/Settings"
+NM_CONNECTION_INTERFACE = "org.freedesktop.NetworkManager.Settings.Connection"
+SECRET_NOT_REQUIRED = 4
+# IP methods that NetworkManager rejects alongside addresses, DNS servers or search domains.
+NO_ADDRESS_METHODS = (None, "disabled", "ignore", "link-local")
+CONFIG_FIELDS = ("name", "private_key", "addresses", "dns", "mtu", "listen_port", "peers")
+PEER_FIELDS = (
+    "original_public_key", "public_key", "preshared_key", "allowed_ips", "endpoint",
+    "persistent_keepalive",
+)
+# Edited through the WireGuard editor instead of as raw NetworkManager properties.
+STRUCTURED_PROPERTIES = frozenset({
+    "connection.autoconnect", "connection.id", "wireguard.private-key", "wireguard.peers",
+    "wireguard.mtu", "wireguard.listen-port", "ipv4.addresses", "ipv6.addresses",
+    "ipv4.dns", "ipv6.dns", "ipv4.dns-search", "ipv6.dns-search",
+})
+Settings = dict[str, dict[str, dict[str, object]]]
 
 
 class StartupRequirements(TypedDict):
@@ -113,6 +134,8 @@ async def _command(executable: str, *arguments: str, wait: int = 10) -> str:
             f"{executable} is not installed. "
             + ("This plugin requires NetworkManager and nmcli." if executable == "nmcli"
                else "Install wireguard-tools to monitor peer handshakes." if executable == "wg"
+               else "This plugin requires systemd's busctl to query NetworkManager."
+               if executable == "busctl"
                else "This plugin requires systemd to detect when boot has finished.")
         ) from error
     except OSError as error:
@@ -145,6 +168,455 @@ async def _nmcli(*arguments: str, wait: int = 10) -> str:
     return await _command(
         "nmcli", "--terse", "--escape", "yes", "--colors", "no", "--wait", str(wait),
         *arguments, wait=wait,
+    )
+
+
+def _complete_type_end(signature: str, start: int) -> int:
+    if start >= len(signature):
+        raise ValueError("Truncated D-Bus signature")
+    code = signature[start]
+    if code == "a":
+        return _complete_type_end(signature, start + 1)
+    if code in "({":
+        close = ")" if code == "(" else "}"
+        index = start + 1
+        while index < len(signature) and signature[index] != close:
+            index = _complete_type_end(signature, index)
+        if index >= len(signature) or index == start + 1:
+            raise ValueError("Unterminated D-Bus container signature")
+        return index + 1
+    if code in "ybnqiuxtdsogv":
+        return start + 1
+    raise ValueError(f"Unsupported D-Bus type {code!r}")
+
+
+def _split_signature(signature: str) -> list[str]:
+    types: list[str] = []
+    index = 0
+    while index < len(signature):
+        end = _complete_type_end(signature, index)
+        types.append(signature[index:end])
+        index = end
+    return types
+
+
+def _encode_bus_value(signature: str, value: object) -> list[str]:
+    """Encode busctl JSON-shaped data as busctl call arguments for one complete type."""
+    code = signature[0]
+    if code == "a":
+        element = signature[1:]
+        if element.startswith("{"):
+            key_type, value_type = _split_signature(element[1:-1])
+            if not isinstance(value, dict):
+                raise TypeError("Expected a D-Bus dictionary")
+            arguments = [str(len(value))]
+            for key, item in value.items():
+                arguments += _encode_bus_value(key_type, key) + _encode_bus_value(value_type, item)
+            return arguments
+        if not isinstance(value, list):
+            raise TypeError("Expected a D-Bus array")
+        return [str(len(value)), *(
+            argument for item in value for argument in _encode_bus_value(element, item)
+        )]
+    if code == "(":
+        types = _split_signature(signature[1:-1])
+        if not isinstance(value, list) or len(value) != len(types):
+            raise TypeError("Expected a D-Bus struct")
+        return [
+            argument for kind, item in zip(types, value)
+            for argument in _encode_bus_value(kind, item)
+        ]
+    if code == "v":
+        if (
+            not isinstance(value, dict) or set(value) != {"type", "data"}
+            or not isinstance(value["type"], str) or len(_split_signature(value["type"])) != 1
+        ):
+            raise TypeError("Expected a D-Bus variant")
+        return [value["type"], *_encode_bus_value(value["type"], value["data"])]
+    if code == "b":
+        if not isinstance(value, bool):
+            raise TypeError("Expected a D-Bus boolean")
+        return ["true" if value else "false"]
+    if code in "sog":
+        if not isinstance(value, str):
+            raise TypeError("Expected a D-Bus string")
+        return [value]
+    if code == "d":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("Expected a D-Bus double")
+        return [repr(float(value))]
+    # Integer dictionary keys arrive as JSON object keys, so accept decimal strings too.
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise TypeError("Expected a D-Bus integer")
+    return [str(int(value))]
+
+
+async def _busctl(
+    path: str, interface: str, method: str, signature: str = "", *arguments: str,
+) -> list[object]:
+    output = await _command(
+        "busctl", "--system", "--json=short", "--timeout=10", "--",
+        "call", NM_SERVICE, path, interface, method, signature, *arguments,
+    )
+    if not output.strip():
+        return []
+    try:
+        reply = json.loads(output)
+    except ValueError as error:
+        raise NetworkManagerError("NetworkManager returned an unreadable D-Bus reply.") from error
+    if not isinstance(reply, dict) or not isinstance(reply.get("data"), list):
+        raise NetworkManagerError("NetworkManager returned an unexpected D-Bus reply.")
+    return reply["data"]
+
+
+def _settings_reply(data: list[object]) -> Settings:
+    settings = data[0] if len(data) == 1 else None
+    if not isinstance(settings, dict) or any(
+        not isinstance(values, dict) or any(
+            not isinstance(value, dict) or set(value) != {"type", "data"}
+            or not isinstance(value["type"], str)
+            for value in values.values()
+        )
+        for values in settings.values()
+    ):
+        raise NetworkManagerError("NetworkManager returned unexpected connection settings.")
+    return settings
+
+
+async def _nm_connection(uuid: str) -> tuple[str, Settings]:
+    """Return a profile's D-Bus path and its settings, including WireGuard secrets."""
+    reply = await _busctl(
+        NM_SETTINGS_PATH, "org.freedesktop.NetworkManager.Settings",
+        "GetConnectionByUuid", "s", uuid,
+    )
+    path = reply[0] if len(reply) == 1 else None
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise NetworkManagerError("NetworkManager returned an unexpected connection path.")
+    settings = _settings_reply(await _busctl(path, NM_CONNECTION_INTERFACE, "GetSettings"))
+    secrets = _settings_reply(await _busctl(
+        path, NM_CONNECTION_INTERFACE, "GetSecrets", "s", "wireguard",
+    ))
+    try:
+        for name, values in secrets.items():
+            target = settings.setdefault(name, {})
+            for key, value in values.items():
+                if name != "wireguard" or key != "peers":
+                    target[key] = value
+                    continue
+                # Peer secrets arrive as separate dictionaries identified by public key.
+                peers = {
+                    peer["public-key"]["data"]: peer
+                    for peer in target.get("peers", {"data": []})["data"]
+                }
+                for secret in value["data"]:
+                    peer = peers.get(secret["public-key"]["data"])
+                    if peer is not None:
+                        peer.update({
+                            field: item for field, item in secret.items() if field != "public-key"
+                        })
+    except (KeyError, TypeError) as error:
+        raise NetworkManagerError("NetworkManager returned unexpected WireGuard secrets.") from error
+    return path, settings
+
+
+async def _nm_update(path: str, settings: Settings) -> None:
+    payload = copy.deepcopy(settings)
+    for family in ("ipv4", "ipv6"):
+        values = payload.get(family, {})
+        # NetworkManager prefers deprecated properties when sent, ignoring their replacements.
+        for legacy, replacement in (
+            ("addresses", "address-data"), ("routes", "route-data"), ("dns", "dns-data"),
+        ):
+            if replacement in values:
+                values.pop(legacy, None)
+    try:
+        arguments = _encode_bus_value("a{sa{sv}}", payload)
+    except (TypeError, ValueError) as error:
+        raise NetworkManagerError(f"Unable to encode connection settings: {error}") from error
+    await _busctl(path, NM_CONNECTION_INTERFACE, "Update", "a{sa{sv}}", *arguments)
+
+
+def _variant(kind: str, data: object) -> dict[str, object]:
+    return {"type": kind, "data": data}
+
+
+def _data(values: dict[str, dict[str, object]], key: str, default: object) -> object:
+    value = values.get(key)
+    return default if value is None else value["data"]
+
+
+def _entries(text: str) -> list[str]:
+    return [entry for entry in re.split(r"[\s,]+", text) if entry]
+
+
+def _hostname(text: str) -> bool:
+    labels = text.removesuffix(".").split(".")
+    return 0 < len(text) <= 253 and all(
+        re.fullmatch(r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?", label)
+        for label in labels
+    )
+
+
+def _dns_servers(values: dict[str, dict[str, object]], version: int) -> list[str]:
+    if "dns-data" in values:
+        return [str(server) for server in _data(values, "dns-data", [])]
+    if version == 4:
+        # NetworkManager sends IPv4 DNS as network-byte-order integers in host order.
+        return [
+            str(IPv4Address(struct.pack("=I", server))) for server in _data(values, "dns", [])
+        ]
+    return [str(IPv6Address(bytes(server))) for server in _data(values, "dns", [])]
+
+
+def _peer_config(peer: dict[str, dict[str, object]]) -> dict[str, object]:
+    public_key = str(_data(peer, "public-key", ""))
+    keepalive = int(_data(peer, "persistent-keepalive", 0))
+    return {
+        "original_public_key": public_key,
+        "public_key": public_key,
+        "preshared_key": str(_data(peer, "preshared-key", "")),
+        "allowed_ips": ", ".join(str(network) for network in _data(peer, "allowed-ips", [])),
+        "endpoint": str(_data(peer, "endpoint", "")),
+        "persistent_keepalive": str(keepalive) if keepalive else "",
+    }
+
+
+def _wireguard_config(settings: Settings) -> dict[str, object]:
+    """Represent NetworkManager settings with the fields of a WireGuard .conf file."""
+    try:
+        families = {4: settings.get("ipv4", {}), 6: settings.get("ipv6", {})}
+        wireguard = settings.get("wireguard", {})
+        addresses = [
+            f"{address['address']['data']}/{address['prefix']['data']}"
+            for values in families.values() for address in _data(values, "address-data", [])
+        ]
+        servers = [
+            server for version, values in families.items()
+            for server in _dns_servers(values, version)
+        ]
+        domains = [
+            str(domain) for values in families.values() for domain in _data(values, "dns-search", [])
+        ]
+        mtu = int(_data(wireguard, "mtu", 0))
+        port = int(_data(wireguard, "listen-port", 0))
+        return {
+            "name": str(settings["connection"]["id"]["data"]),
+            "private_key": str(_data(wireguard, "private-key", "")),
+            "addresses": ", ".join(addresses),
+            "dns": ", ".join(dict.fromkeys(servers + domains)),
+            "mtu": str(mtu) if mtu else "",
+            "listen_port": str(port) if port else "",
+            "peers": [_peer_config(peer) for peer in _data(wireguard, "peers", [])],
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise NetworkManagerError("NetworkManager returned unexpected WireGuard settings.") from error
+
+
+def _wireguard_key(text: str, label: str, required: bool) -> str:
+    key = text.strip()
+    if not key:
+        if required:
+            raise NetworkManagerError(f"{label} is required.")
+        return ""
+    try:
+        valid = len(base64.b64decode(key, validate=True)) == 32
+    except ValueError:
+        valid = False
+    if not valid:
+        raise NetworkManagerError(f"{label} must be a 44-character base64 WireGuard key.")
+    return key
+
+
+def _number(text: str, label: str, maximum: int, off: bool = False) -> int:
+    value = text.strip()
+    if not value or (off and value.lower() == "off"):
+        return 0
+    if not value.isascii() or not value.isdecimal() or int(value) > maximum:
+        raise NetworkManagerError(f"{label} must be a whole number from 0 to {maximum}, or empty.")
+    return int(value)
+
+
+def _endpoint(text: str, label: str) -> str:
+    endpoint = text.strip()
+    if not endpoint:
+        return ""
+    host, separator, port = endpoint.rpartition(":")
+    valid = bool(separator and host) and port.isascii() and port.isdecimal() and (
+        1 <= int(port) <= 65535
+    )
+    if valid and host.startswith("["):
+        try:
+            valid = host.endswith("]") and ip_address(host[1:-1]).version == 6
+        except ValueError:
+            valid = False
+    elif valid:
+        valid = ":" not in host and _hostname(host)
+    if not valid:
+        raise NetworkManagerError(
+            f"{label} must be host:port, for example vpn.example.com:51820 or [2001:db8::1]:51820."
+        )
+    return endpoint
+
+
+def _apply_peers(
+    wireguard: dict[str, dict[str, object]], peers: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    existing = {peer["public-key"]["data"]: peer for peer in _data(wireguard, "peers", [])}
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for index, peer in enumerate(peers, 1):
+        label = f"Peer {index}"
+        public_key = _wireguard_key(str(peer["public_key"]), f"{label} public key", True)
+        if public_key in seen:
+            raise NetworkManagerError(f"{label} uses the same public key as another peer.")
+        seen.add(public_key)
+        original = peer["original_public_key"]
+        if original is not None and original not in existing:
+            raise NetworkManagerError(
+                f"{label} was changed outside this editor. Reload the configuration and try again."
+            )
+        # Start from the stored peer to keep properties this editor does not show.
+        values = {} if original is None else copy.deepcopy(existing[original])
+        values["public-key"] = _variant("s", public_key)
+        allowed: list[str] = []
+        for entry in _entries(str(peer["allowed_ips"])):
+            try:
+                allowed.append(str(ip_network(entry, strict=False)))
+            except ValueError as error:
+                raise NetworkManagerError(
+                    f"{label} allowed IPs: {entry!r} is not an IP address or network."
+                ) from error
+        values["allowed-ips"] = _variant("as", allowed)
+        endpoint = _endpoint(str(peer["endpoint"]), label)
+        if endpoint:
+            values["endpoint"] = _variant("s", endpoint)
+        else:
+            values.pop("endpoint", None)
+        values["persistent-keepalive"] = _variant("u", _number(
+            str(peer["persistent_keepalive"]), f"{label} persistent keepalive", 65535, off=True,
+        ))
+        preshared_key = _wireguard_key(str(peer["preshared_key"]), f"{label} preshared key", False)
+        if original is None or preshared_key != _data(values, "preshared-key", ""):
+            if preshared_key:
+                values["preshared-key"] = _variant("s", preshared_key)
+            else:
+                values.pop("preshared-key", None)
+            # Without NOT_REQUIRED, a peer lacking a preshared key makes activation ask for one.
+            values["preshared-key-flags"] = _variant(
+                "u", 0 if preshared_key else SECRET_NOT_REQUIRED,
+            )
+        result.append(values)
+    return result
+
+
+def _apply_wireguard_config(settings: Settings, config: dict[str, object]) -> bool:
+    """Apply changed editor fields to NetworkManager settings; return whether any changed."""
+    current = _wireguard_config(settings)
+    changed = {field for field in CONFIG_FIELDS if config[field] != current[field]}
+    if not changed:
+        return False
+    connection = settings.setdefault("connection", {})
+    wireguard = settings.setdefault("wireguard", {})
+    families = {4: settings.setdefault("ipv4", {}), 6: settings.setdefault("ipv6", {})}
+    if "name" in changed:
+        name = str(config["name"]).strip()
+        if not name:
+            raise NetworkManagerError("Name is required.")
+        connection["id"] = _variant("s", name)
+    if "private_key" in changed:
+        wireguard["private-key"] = _variant(
+            "s", _wireguard_key(str(config["private_key"]), "Private key", True),
+        )
+        wireguard["private-key-flags"] = _variant("u", 0)
+    if "mtu" in changed:
+        wireguard["mtu"] = _variant("u", _number(str(config["mtu"]), "MTU", 65535))
+    if "listen_port" in changed:
+        wireguard["listen-port"] = _variant(
+            "u", _number(str(config["listen_port"]), "Listen port", 65535),
+        )
+    if "peers" in changed:
+        wireguard["peers"] = _variant("aa{sv}", _apply_peers(wireguard, config["peers"]))
+    if "addresses" in changed:
+        addresses: dict[int, list[dict[str, object]]] = {4: [], 6: []}
+        for entry in _entries(str(config["addresses"])):
+            try:
+                interface = ip_interface(entry)
+            except ValueError as error:
+                raise NetworkManagerError(
+                    f"Address: {entry!r} is not an IP address with an optional prefix."
+                ) from error
+            addresses[interface.version].append({
+                "address": _variant("s", str(interface.ip)),
+                "prefix": _variant("u", interface.network.prefixlen),
+            })
+        for version, values in families.items():
+            values["address-data"] = _variant("aa{sv}", addresses[version])
+            method = _data(values, "method", None)
+            if addresses[version] and method in NO_ADDRESS_METHODS:
+                values["method"] = _variant("s", "manual")
+            elif not addresses[version] and method == "manual":
+                values["method"] = _variant("s", "disabled")
+    # Address changes can disable a family, so search domains may need to move.
+    if changed & {"addresses", "dns"}:
+        servers: dict[int, list[Address]] = {4: [], 6: []}
+        domains: list[str] = []
+        for entry in _entries(str(config["dns"])):
+            try:
+                server = ip_address(entry)
+            except ValueError:
+                if not _hostname(entry.removeprefix("~")) and entry != "~":
+                    raise NetworkManagerError(
+                        f"DNS: {entry!r} is not an IP address or search domain."
+                    ) from None
+                domains.append(entry)
+            else:
+                servers[server.version].append(server)
+        for version, values in families.items():
+            if "dns-data" in values:
+                values["dns-data"] = _variant("as", [str(server) for server in servers[version]])
+            elif version == 4:
+                values["dns"] = _variant("au", [
+                    struct.unpack("=I", server.packed)[0] for server in servers[4]
+                ])
+            else:
+                values["dns"] = _variant("aay", [list(server.packed) for server in servers[6]])
+            values["dns-search"] = _variant("as", [])
+        if domains:
+            family = next((
+                values for values in families.values()
+                if _data(values, "method", None) not in NO_ADDRESS_METHODS
+            ), None)
+            if family is None:
+                raise NetworkManagerError("DNS: search domains need a tunnel address in Address.")
+            family["dns-search"] = _variant("as", domains)
+    if changed & {"addresses", "dns"}:
+        for version, values in families.items():
+            if _data(values, "method", None) in NO_ADDRESS_METHODS and (
+                _dns_servers(values, version) or _data(values, "dns-search", [])
+            ):
+                raise NetworkManagerError(
+                    f"DNS: IPv{version} DNS servers need an IPv{version} tunnel address in Address."
+                )
+    return True
+
+
+def _config_input(config: object) -> bool:
+    return (
+        isinstance(config, dict) and set(config) == set(CONFIG_FIELDS)
+        and all(
+            isinstance(config[field], str) and len(config[field]) <= 16384
+            for field in CONFIG_FIELDS if field != "peers"
+        )
+        and isinstance(config["peers"], list) and len(config["peers"]) <= 64
+        and all(
+            isinstance(peer, dict) and set(peer) == set(PEER_FIELDS)
+            and all(
+                isinstance(peer[field], str) and len(peer[field]) <= 16384
+                for field in PEER_FIELDS if field != "original_public_key"
+            )
+            and (peer["original_public_key"] is None or isinstance(peer["original_public_key"], str))
+            for peer in config["peers"]
+        )
     )
 
 
@@ -386,46 +858,56 @@ class Plugin:
             raise NetworkManagerError("NetworkManager returned unexpected autoconnect data.")
         return value == "yes"
 
-    async def get_connection_settings(self, uuid: str) -> dict[str, object]:
+    async def _advanced_properties(self, uuid: str) -> list[dict[str, str]]:
+        output = await _nmcli("--fields", "all", "connection", "show", "uuid", uuid)
+        properties: list[dict[str, str]] = []
+        for line in output.splitlines():
+            fields = _split_fields(line)
+            if len(fields) != 2 or not fields[0].islower():
+                continue
+            key, value = fields
+            if "." in key and key not in STRUCTURED_PROPERTIES:
+                properties.append({"key": key, "value": value})
+        return properties
+
+    async def get_connection_config(self, uuid: str) -> dict[str, object]:
         try:
             async with self._lock:
                 profile = await self._profile(uuid)
-                output = await _nmcli(
-                    "--show-secrets", "--fields", "all", "connection", "show",
-                    "uuid", profile["uuid"],
-                )
-                settings: list[dict[str, str]] = []
-                for line in output.splitlines():
-                    fields = _split_fields(line)
-                    if len(fields) != 2 or not fields[0].islower():
-                        continue
-                    key, value = fields
-                    if "." in key and key != "connection.autoconnect":
-                        settings.append({"key": key, "value": value})
-                if not any(setting["key"] == "connection.id" for setting in settings):
-                    raise NetworkManagerError("NetworkManager returned unexpected connection settings.")
-                return {"success": True, "settings": settings}
+                _, settings = await _nm_connection(profile["uuid"])
+                return {
+                    "success": True,
+                    "config": _wireguard_config(settings),
+                    "advanced": await self._advanced_properties(profile["uuid"]),
+                }
         except NetworkManagerError as error:
             return self._failure(error)
 
-    async def set_connection_settings(
-        self, uuid: str, updates: list[dict[str, str]],
+    async def set_connection_config(
+        self, uuid: str, config: dict[str, object], advanced: list[dict[str, str]],
     ) -> dict[str, object]:
-        if not isinstance(updates, list) or any(
+        if not _config_input(config):
+            return self._failure(NetworkManagerError("Invalid WireGuard configuration."))
+        if not isinstance(advanced, list) or any(
             not isinstance(update, dict)
             or set(update) != {"key", "value"}
             or not isinstance(update["key"], str)
             or not isinstance(update["value"], str)
-            for update in updates
+            for update in advanced
         ):
-            return self._failure(NetworkManagerError("Connection settings must be key/value pairs."))
-        keys = [update["key"] for update in updates]
+            return self._failure(NetworkManagerError("Advanced properties must be key/value pairs."))
+        keys = [update["key"] for update in advanced]
         if "connection.autoconnect" in keys:
             return self._failure(NetworkManagerError(
                 "connection.autoconnect is managed by the startup controls."
             ))
+        if STRUCTURED_PROPERTIES.intersection(keys):
+            return self._failure(NetworkManagerError(
+                f"{sorted(STRUCTURED_PROPERTIES.intersection(keys))[0]} is edited in the "
+                "WireGuard fields above, not as an advanced property."
+            ))
         if (
-            len(updates) > 512
+            len(advanced) > 512
             or len(set(keys)) != len(keys)
             or any(
                 len(key) > 128
@@ -435,18 +917,25 @@ class Plugin:
                 or "." not in key
                 for key in keys
             )
-            or any(len(update["value"]) > 16384 for update in updates)
+            or any(len(update["value"]) > 16384 for update in advanced)
         ):
-            return self._failure(NetworkManagerError("Invalid or duplicate connection setting."))
+            return self._failure(NetworkManagerError("Invalid or duplicate advanced property."))
         try:
             async with self._lock:
                 profile = await self._profile(uuid)
-                if not updates:
-                    return {"success": True}
-                arguments = ["connection", "modify", "uuid", profile["uuid"]]
-                for update in updates:
-                    arguments.extend((update["key"], update["value"]))
-                await _nmcli(*arguments)
+                path, settings = await _nm_connection(profile["uuid"])
+                # Validate before nmcli so invalid fields cannot leave a partial save.
+                changed = _apply_wireguard_config(settings, config)
+                if advanced:
+                    arguments = ["connection", "modify", "uuid", profile["uuid"]]
+                    for update in advanced:
+                        arguments.extend((update["key"], update["value"]))
+                    await _nmcli(*arguments)
+                    if changed:
+                        path, settings = await _nm_connection(profile["uuid"])
+                        changed = _apply_wireguard_config(settings, config)
+                if changed:
+                    await _nm_update(path, settings)
                 return {"success": True}
         except NetworkManagerError as error:
             return self._failure(error)
