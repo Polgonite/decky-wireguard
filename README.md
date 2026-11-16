@@ -7,6 +7,9 @@ NetworkManager WireGuard profiles** from Steam Deck Gaming Mode.
 
 - Steam Deck with Decky Loader (current stable, supporting `@decky/api` and API v1).
 - NetworkManager running, with `nmcli` available to the Decky backend.
+- `systemctl` and `busctl` from systemd for plugin-managed startup readiness.
+  The internet readiness option requires NetworkManager's connectivity check
+  to be configured and enabled.
 - `wg` from `wireguard-tools` available to the backend for handshake status.
 - At least one native NetworkManager WireGuard profile, with its keys already
   saved. Connections requiring an interactive password prompt are not supported.
@@ -161,6 +164,28 @@ directory), then restart Decky Loader.
   when the plugin loads, after systemd reports boot finished (`running` or
   `degraded`). Neither checkbox needs to be enabled; changing them does not
   immediately connect or disconnect the tunnel.
+- Two independent per-connection checkboxes control plugin-managed startup:
+  **Wait for Steam login** and **Wait for internet**. Both default to enabled,
+  including for connections configured before these options were added. They
+  do not affect NetworkManager boot autoconnect or manual Connect actions.
+  Turn off the internet requirement for private/offline-only VPNs if needed.
+- Steam readiness is monitored from plugin initialization, even with the panel
+  closed. It requires Steam's successful login state, a current user, and
+  initialized UI services, including a completed Offline Mode login. The UI
+  reports readiness every two seconds; unavailable APIs, errors, or a report
+  older than ten seconds never count as ready.
+- Internet readiness requests a fresh NetworkManager connectivity check and
+  requires `full` connectivity on a connected Wi-Fi, Ethernet, or mobile-data
+  device. A VPN's connectivity, Wi-Fi association alone, captive portals, and
+  limited connectivity do not qualify. This uses NetworkManager's configured
+  connectivity-check service, not a plugin-selected endpoint. Disabled or
+  unconfigured checks produce an actionable error and leave the VPN off,
+  rather than trusting a default route as proof of internet access.
+- With either requirement unmet, the backend leaves the tunnel off and checks
+  again every five seconds. Each connection waits independently; its management
+  page shows what it is waiting for. Requirement changes apply to pending
+  startup work. Manual Connect or Disconnect cancels that connection's pending
+  automatic activation for this boot, even if it is already disconnected.
 - After-boot preferences and the last handled Linux boot ID are saved atomically
   in Decky's persistent plugin settings directory (`startup.json`). The backend
   records the boot before attempting activation, including when no profiles are
@@ -169,9 +194,11 @@ directory), then restart Decky Loader.
   Enabling this option after the plugin's first load takes effect next boot.
   Uninstalling or deleting plugin settings resets this record.
 - After-boot activation runs in the background without blocking plugin loading
-  or the system boot path. Each configured tunnel gets one bounded attempt;
-  offline failures are shown in the panel, with no automatic retries. Connect
-  manually after restoring the network. Already active or activating tunnels
+  or the system boot path. After its enabled requirements are met, each configured
+  tunnel gets one bounded activation attempt; activation/readiness-check errors
+  are shown in the panel with no automatic retries. Missing internet or an
+  unfinished Steam login is a waiting condition, not an activation failure.
+  Already active or activating tunnels
   are left alone. Unloading cancels pending startup work; it does not retry on
   reload that boot. External NetworkManager edits that re-enable autoconnect
   cause the plugin to skip that tunnel and report the conflict.
