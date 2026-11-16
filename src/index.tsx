@@ -4,6 +4,7 @@ import {
 } from "@decky/ui";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
+import { advancedSettingLabel, groupConnectionSettings } from "./config-settings";
 
 type ConnectionState = "connected" | "connecting" | "disconnecting" | "disconnected" | "unknown";
 type HandshakeState = "inactive" | "waiting" | "established" | "timeout" | "unknown";
@@ -156,6 +157,7 @@ function Content() {
   const [pendingUuid, setPendingUuid] = useState<string | null>(null);
   const [selectedUuid, setSelectedUuid] = useState<string | null>(null);
   const [editingConfig, setEditingConfig] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [configDraft, setConfigDraft] = useState<EditableSetting[] | null>(null);
   const [configLoading, setConfigLoading] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
@@ -312,6 +314,7 @@ function Content() {
   };
 
   const selectedProfile = profiles?.find((profile) => profile.uuid === selectedUuid);
+  const groupedSettings = groupConnectionSettings(configDraft ?? []);
   const selectedStartup = startup?.uuid === selectedUuid ? startup : null;
   const transitioning = selectedProfile?.state === "connecting" || selectedProfile?.state === "disconnecting";
   const selectedStatus = error ? "Status unavailable" : pendingUuid === selectedProfile?.uuid
@@ -325,6 +328,36 @@ function Content() {
     }
     return profile.handshake;
   };
+
+  const updateSetting = (id: string, changes: Partial<ConnectionSetting>) => {
+    setConfigError(null);
+    setConfigDraft((current) => current?.map((entry) =>
+      entry.id === id ? { ...entry, ...changes } : entry,
+    ) ?? null);
+  };
+
+  const settingField = (
+    setting: EditableSetting, label: string, description: string,
+  ) => (
+    <PanelSectionRow key={setting.id}>
+      {setting.isNew && (
+        <TextField
+          label="Setting name"
+          description="NetworkManager property name, for example ipv4.dns-search."
+          value={setting.key}
+          disabled={busy}
+          onChange={(event) => updateSetting(setting.id, { key: event.target.value })}
+        />
+      )}
+      <TextField
+        label={setting.isNew ? "Value" : label}
+        description={setting.isNew ? undefined : description}
+        value={setting.value}
+        disabled={busy}
+        onChange={(event) => updateSetting(setting.id, { value: event.target.value })}
+      />
+    </PanelSectionRow>
+  );
 
   return (
     <PanelSection title={
@@ -439,6 +472,7 @@ function Content() {
               onClick={() => {
                 setError(null);
                 setConfigError(null);
+                setShowAdvanced(false);
                 setEditingConfig(true);
                 void loadConfig(selectedProfile.uuid);
               }}
@@ -543,48 +577,25 @@ function Content() {
               </ButtonItem>
             </PanelSectionRow>
           )}
-          {configDraft?.map((setting, index) => (
-            <PanelSectionRow key={setting.id}>
-              {setting.isNew ? (
-                <TextField
-                  label="Setting name"
-                  value={setting.key}
-                  disabled={busy}
-                  onChange={(event) => {
-                    setConfigError(null);
-                    setConfigDraft((current) => current?.map((entry, entryIndex) =>
-                      entryIndex === index ? { ...entry, key: event.target.value } : entry,
-                    ) ?? null);
-                  }}
-                />
-              ) : (
-                <TextField label={setting.key} value={setting.value} disabled={busy}
-                  onChange={(event) => {
-                    setConfigError(null);
-                    setConfigDraft((current) => current?.map((entry) =>
-                      entry.id === setting.id ? { ...entry, value: event.target.value } : entry,
-                    ) ?? null);
-                  }}
-                />
+          {groupedSettings.common.map((group) => (
+            <div key={group.title}>
+              <PanelSectionRow><h3>{group.title}</h3></PanelSectionRow>
+              {group.settings.map(({ setting, definition }) =>
+                settingField(setting, definition.label, definition.description),
               )}
-              {setting.isNew && (
-                <TextField
-                  label="Value"
-                  value={setting.value}
-                  disabled={busy}
-                  onChange={(event) => {
-                    setConfigError(null);
-                    setConfigDraft((current) => current?.map((entry) =>
-                      entry.id === setting.id ? { ...entry, value: event.target.value } : entry,
-                    ) ?? null);
-                  }}
-                />
-              )}
-            </PanelSectionRow>
+            </div>
           ))}
+          {showAdvanced && (
+            <>
+              <PanelSectionRow><h3>Advanced settings</h3></PanelSectionRow>
+              {groupedSettings.advanced.map((setting) =>
+                settingField(setting, advancedSettingLabel(setting.key), setting.key),
+              )}
+            </>
+          )}
           {configDraft && (
             <>
-              <PanelSectionRow>
+              {showAdvanced && <PanelSectionRow>
                 <ButtonItem
                   layout="below"
                   disabled={busy}
@@ -603,6 +614,15 @@ function Content() {
                   }}
                 >
                   Add profile property
+                </ButtonItem>
+              </PanelSectionRow>}
+              <PanelSectionRow>
+                <ButtonItem
+                  layout="below"
+                  aria-expanded={showAdvanced}
+                  onClick={() => setShowAdvanced((current) => !current)}
+                >
+                  {showAdvanced ? "Hide advanced" : "Show advanced"}
                 </ButtonItem>
               </PanelSectionRow>
               <PanelSectionRow>

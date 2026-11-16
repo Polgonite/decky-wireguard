@@ -159,7 +159,10 @@ directory), then restart Decky Loader.
   appears beside each status.
 - Select **Edit connection configuration** to change the NetworkManager profile's
   properties, including WireGuard keys and peer options such as endpoints and
-  allowed IPs. Automatic connection is managed separately by the mutually
+  allowed IPs. Common options appear first in Interface/Peer configuration order,
+  with readable labels. **Show advanced**, above Save, reveals the remaining
+  NetworkManager properties and the option to add a property; hiding them preserves
+  any edits. Automatic connection is managed separately by the mutually
   exclusive startup controls. The editor displays secret values; changes are
   saved to the profile and take effect on the next connection activation.
 - Every connection management page has two mutually exclusive startup checkboxes.
