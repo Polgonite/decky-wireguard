@@ -1,0 +1,14 @@
+{
+  "name": "Decky WireGuard development",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "node",
+  "postCreateCommand": "npm ci && pre-commit install",
+  "customizations": {
+    "vscode": {
+      "extensions": ["dbaeumer.vscode-eslint", "charliermarsh.ruff"]
+    }
+  }
+}

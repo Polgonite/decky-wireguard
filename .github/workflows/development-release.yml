@@ -1,0 +1,109 @@
+name: Development release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Pre-commit checks in dev container
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run checks in the development container
+        uses: devcontainers/ci@v0.3
+        with:
+          push: never
+          runCmd: |
+            npm ci
+            pre-commit run --all-files
+
+  release:
+    name: Build and publish development release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: checks
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - name: Check out pushed commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Assign unique development version
+        id: version
+        shell: bash
+        run: |
+          base_version="$(node -p "require('./package.json').version.split('-')[0]")"
+          version="${base_version}-dev.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.sha${GITHUB_SHA:0:7}"
+          npm version "$version" --no-git-tag-version --ignore-scripts
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Run backend tests
+        run: npm test
+
+      - name: Build installable ZIP
+        run: npm run package
+
+      - name: Verify installable ZIP
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from zipfile import ZipFile
+
+          version = os.environ["VERSION"]
+          with ZipFile(f"out/decky-wireguard-{version}.zip") as archive:
+              assert archive.testzip() is None, "Corrupt ZIP archive"
+              expected = {
+                  "plugin.json", "package.json", "main.py", "dist/index.js", "README.md"
+              }
+              assert set(archive.namelist()) == {
+                  f"decky-wireguard/{name}" for name in expected
+              }, "Unexpected ZIP layout"
+              package = json.loads(archive.read("decky-wireguard/package.json"))
+              assert package["version"] == version, "Incorrect embedded version"
+              assert archive.getinfo("decky-wireguard/dist/index.js").file_size > 0
+          PY
+
+      - name: Publish development prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          gh release create "v${VERSION}" \
+            "out/decky-wireguard-${VERSION}.zip" \
+            --target "$GITHUB_SHA" \
+            --title "Development build ${VERSION}" \
+            --notes "Automated development build of commit ${GITHUB_SHA}. Not a stable release. Install the attached ZIP through Decky Loader. Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --prerelease \
+            --latest=false
