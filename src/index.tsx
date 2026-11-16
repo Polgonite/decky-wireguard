@@ -35,27 +35,39 @@ function Content() {
   const [busy, setBusy] = useState(false);
   const [pendingUuid, setPendingUuid] = useState<string | null>(null);
   const inFlight = useRef(false);
+  const refreshing = useRef<Promise<void> | null>(null);
   const mounted = useRef(false);
 
   const loadProfiles = useCallback(async () => {
     const result = await getProfiles();
     if (!result.success) throw new Error(result.error);
-    if (mounted.current) setProfiles(result.profiles);
+    if (mounted.current) {
+      setProfiles((previous) =>
+        previous?.length === result.profiles.length &&
+        previous.every((profile, index) => {
+          const next = result.profiles[index];
+          return next !== undefined && profile.uuid === next.uuid &&
+            profile.name === next.name && profile.device === next.device &&
+            profile.state === next.state;
+        }) ? previous : result.profiles,
+      );
+    }
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(() => {
     if (inFlight.current) return;
-    inFlight.current = true;
-    if (mounted.current) setBusy(true);
-    try {
-      await loadProfiles();
-      if (mounted.current) setError(null);
-    } catch (error) {
-      if (mounted.current) setError(errorMessage(error));
-    } finally {
-      inFlight.current = false;
-      if (mounted.current) setBusy(false);
-    }
+    if (refreshing.current) return refreshing.current;
+    refreshing.current = (async () => {
+      try {
+        await loadProfiles();
+        if (mounted.current) setError(null);
+      } catch (error) {
+        if (mounted.current) setError(errorMessage(error));
+      } finally {
+        refreshing.current = null;
+      }
+    })();
+    return refreshing.current;
   }, [loadProfiles]);
 
   useEffect(() => {
@@ -74,6 +86,11 @@ function Content() {
     setBusy(true);
     setPendingUuid(profile.uuid);
     setError(null);
+    await refreshing.current;
+    if (!mounted.current) {
+      inFlight.current = false;
+      return;
+    }
     let failure: string | null = null;
     try {
       const result = await setConnection(profile.uuid, profile.state !== "connected");
