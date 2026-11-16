@@ -1,7 +1,11 @@
 import asyncio
+import json
+import os
 import socket
+import tempfile
 import unittest
 from ipaddress import ip_address
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from main import (
@@ -20,6 +24,244 @@ HOME = "11111111-1111-4111-8111-111111111111"
 WORK = "22222222-2222-4222-8222-222222222222"
 WIFI = "33333333-3333-4333-8333-333333333333"
 FIELDS = ("--fields", "UUID,TYPE,NAME,DEVICE,STATE,ACTIVE-PATH", "connection", "show")
+
+
+class StartupTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        self.settings_path = self.directory / "startup.json"
+        self.boot_path = self.directory / "boot-id"
+        self.boot_path.write_text(HOME)
+        environment = patch.dict(os.environ, {"DECKY_PLUGIN_SETTINGS_DIR": directory.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+        boot = patch("main.BOOT_ID_PATH", self.boot_path)
+        boot.start()
+        self.addCleanup(boot.stop)
+        self.autoconnect = {HOME: True, WORK: False}
+        self.states = {HOME: "", WORK: ""}
+        self.up_error = None
+
+        async def run(*arguments, **kwargs):
+            if arguments == FIELDS:
+                return "".join(
+                    f"{uuid}:wireguard:VPN:wg0:{state}:/active/1\n"
+                    for uuid, state in self.states.items()
+                )
+            if arguments[:2] == ("--get-values", "connection.autoconnect"):
+                return "yes\n" if self.autoconnect[arguments[-1]] else "no\n"
+            if arguments[:2] == ("connection", "modify"):
+                self.autoconnect[arguments[3]] = arguments[-1] == "yes"
+                return ""
+            if arguments[:2] == ("connection", "up"):
+                if self.up_error is not None:
+                    raise self.up_error
+                self.states[arguments[-1]] = "activated"
+                return ""
+            self.fail(f"Unexpected nmcli call: {arguments}")
+
+        nmcli = patch("main._nmcli", new_callable=AsyncMock, side_effect=run)
+        self.nmcli = nmcli.start()
+        self.addCleanup(nmcli.stop)
+        command = patch("main._command", new_callable=AsyncMock, return_value="running\n")
+        self.command = command.start()
+        self.addCleanup(command.stop)
+        self.plugin = Plugin()
+
+    def settings(self):
+        return json.loads(self.settings_path.read_text())
+
+    def activations(self):
+        return [
+            call for call in self.nmcli.await_args_list
+            if call.args[:2] == ("connection", "up")
+        ]
+
+    async def test_startup_modes_are_exclusive_and_persist_across_instances(self):
+        self.assertEqual(await self.plugin.get_startup_settings(HOME), {
+            "success": True, "on_boot": True, "after_boot": False,
+        })
+        for mode, on_boot, after_boot in [
+            ("after_boot", False, True),
+            ("on_boot", True, False),
+            ("off", False, False),
+        ]:
+            with self.subTest(mode=mode):
+                self.assertEqual(await self.plugin.set_startup(HOME, mode), {"success": True})
+                self.assertEqual(await Plugin().get_startup_settings(HOME), {
+                    "success": True, "on_boot": on_boot, "after_boot": after_boot,
+                })
+        self.assertFalse(self.activations())
+
+    async def test_invalid_inputs_and_non_wireguard_profiles_are_rejected(self):
+        for uuid, mode in [
+            (HOME, "invalid"), ("--help", "off"), (None, "off"), (WIFI, "after_boot"),
+        ]:
+            with self.subTest(uuid=uuid, mode=mode), self.assertLogs("decky-wireguard"):
+                self.assertFalse((await self.plugin.set_startup(uuid, mode))["success"])
+        self.assertTrue(all(call.args == FIELDS for call in self.nmcli.await_args_list))
+
+    async def test_failed_nmcli_edit_cannot_enable_plugin_mode(self):
+        self.nmcli.side_effect = [
+            f"{HOME}:wireguard:VPN:::\n", NetworkManagerError("Permission denied"),
+        ]
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.set_startup(HOME, "after_boot")
+        self.assertEqual(result, {"success": False, "error": "Permission denied"})
+        self.assertFalse(self.settings_path.exists())
+
+    async def test_failed_switch_to_networkmanager_disables_plugin_first(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.nmcli.side_effect = [
+            f"{HOME}:wireguard:VPN:::\n", NetworkManagerError("Permission denied"),
+        ]
+        with self.assertLogs("decky-wireguard"):
+            self.assertFalse((await self.plugin.set_startup(HOME, "on_boot"))["success"])
+        self.assertEqual(self.settings()["after_boot"], [])
+        self.assertFalse(self.autoconnect[HOME])
+
+    async def test_failed_file_replace_leaves_both_modes_off_and_cleans_temporary_file(self):
+        with patch("main.os.replace", side_effect=PermissionError("Read-only disk")), self.assertLogs(
+            "decky-wireguard",
+        ):
+            result = await self.plugin.set_startup(HOME, "after_boot")
+        self.assertFalse(result["success"])
+        self.assertIn("Unable to save startup settings", result["error"])
+        self.assertFalse(self.autoconnect[HOME])
+        self.assertEqual(list(self.directory.iterdir()), [self.boot_path])
+
+    async def test_startup_query_reports_unrecognized_networkmanager_output(self):
+        self.nmcli.side_effect = [f"{HOME}:wireguard:VPN:::\n", "unexpected\n"]
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.get_startup_settings(HOME)
+        self.assertFalse(result["success"])
+        self.assertIn("unexpected autoconnect data", result["error"])
+
+    async def test_once_per_boot_even_after_disconnect_and_backend_restart(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        await self.plugin._main()
+        await self.plugin._startup_task
+        self.assertEqual(len(self.activations()), 1)
+        self.assertEqual(self.activations()[0].args, ("connection", "up", "uuid", HOME))
+        self.assertEqual(self.activations()[0].kwargs, {"wait": 30})
+        await self.plugin._unload()
+        self.states[HOME] = ""
+        await Plugin()._activate_after_boot()
+        self.assertEqual(len(self.activations()), 1)
+        self.boot_path.write_text(WORK)
+        await Plugin()._activate_after_boot()
+        self.assertEqual(len(self.activations()), 2)
+
+    async def test_enabling_after_first_load_waits_until_next_boot(self):
+        await self.plugin._activate_after_boot()
+        await self.plugin.set_startup(HOME, "after_boot")
+        await Plugin()._activate_after_boot()
+        self.assertFalse(self.activations())
+        self.boot_path.write_text(WORK)
+        await Plugin()._activate_after_boot()
+        self.assertEqual(len(self.activations()), 1)
+
+    async def test_waits_until_system_boot_finishes_including_degraded_boot(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.command.side_effect = ["initializing\n", "starting\n", "degraded\n"]
+
+        async def sleeping(_):
+            self.assertFalse(self.activations())
+
+        with patch("main.asyncio.sleep", side_effect=sleeping) as sleep:
+            await self.plugin._activate_after_boot()
+        self.assertEqual(sleep.await_count, 2)
+        self.assertEqual(len(self.activations()), 1)
+        self.command.assert_awaited_with("systemctl", "show", "--property=SystemState", "--value")
+
+    async def test_setting_disabled_while_waiting_does_not_activate(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.command.side_effect = ["starting\n", "running\n"]
+
+        async def sleeping(_):
+            await self.plugin.set_startup(HOME, "off")
+
+        with patch("main.asyncio.sleep", side_effect=sleeping):
+            await self.plugin._activate_after_boot()
+        self.assertFalse(self.activations())
+
+    async def test_offline_failure_is_reported_without_retrying_on_reload(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.up_error = NetworkManagerError("Endpoint DNS unavailable")
+        with self.assertLogs("decky-wireguard"):
+            await self.plugin._activate_after_boot()
+        self.assertIn("Endpoint DNS unavailable", (await self.plugin.get_profiles())["startup_error"])
+        await Plugin()._activate_after_boot()
+        self.assertEqual(len(self.activations()), 1)
+
+    async def test_failure_does_not_skip_other_configured_tunnels(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        await self.plugin.set_startup(WORK, "after_boot")
+        self.states.pop(HOME)
+        with self.assertLogs("decky-wireguard"):
+            await self.plugin._activate_after_boot()
+        self.assertEqual([call.args[-1] for call in self.activations()], [WORK])
+
+    async def test_external_autoconnect_conflict_does_not_activate(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.autoconnect[HOME] = True
+        with self.assertLogs("decky-wireguard"):
+            await self.plugin._activate_after_boot()
+        self.assertFalse(self.activations())
+        self.assertIn("resolve the conflict", self.plugin._startup_error)
+
+    async def test_active_or_activating_tunnels_are_left_alone(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        await self.plugin.set_startup(WORK, "after_boot")
+        self.states.update({HOME: "activated", WORK: "activating"})
+        await self.plugin._activate_after_boot()
+        self.assertFalse(self.activations())
+
+    async def test_unreadable_or_invalid_boot_id_fails_closed(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        for value in ["invalid", None]:
+            with self.subTest(value=value), self.assertLogs("decky-wireguard"):
+                if value is None:
+                    self.boot_path.unlink()
+                else:
+                    self.boot_path.write_text(value)
+                await self.plugin._activate_after_boot()
+        self.assertFalse(self.activations())
+        self.assertIsNone(self.settings()["last_boot_id"])
+
+    async def test_settings_errors_are_reported_and_do_not_change_networkmanager(self):
+        for contents in ["{", '{"after_boot": ["invalid"]}', '{"after_boot": true}']:
+            with self.subTest(contents=contents), self.assertLogs("decky-wireguard"):
+                self.settings_path.write_text(contents)
+                self.assertFalse((await self.plugin.set_startup(HOME, "after_boot"))["success"])
+        self.assertTrue(all(call.args == FIELDS for call in self.nmcli.await_args_list))
+
+    async def test_failed_save_does_not_start_automatic_connection(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        with patch.object(
+            self.plugin, "_write_settings", side_effect=NetworkManagerError("Read-only disk"),
+        ), self.assertLogs("decky-wireguard"):
+            await self.plugin._activate_after_boot()
+        self.assertFalse(self.activations())
+        self.command.assert_not_awaited()
+
+    async def test_unloading_cancels_pending_startup_and_does_not_retry_this_boot(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        waiting = asyncio.Event()
+
+        async def system_state(*args):
+            waiting.set()
+            await asyncio.Event().wait()
+
+        self.command.side_effect = system_state
+        await self.plugin._main()
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        await self.plugin._unload()
+        self.assertTrue(self.plugin._startup_task.cancelled())
+        await Plugin()._activate_after_boot()
+        self.assertFalse(self.activations())
 
 
 class ProfileTests(unittest.IsolatedAsyncioTestCase):

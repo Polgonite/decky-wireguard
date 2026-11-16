@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 import os
 import socket
 import struct
+import tempfile
 import time
 from dataclasses import dataclass
 from ipaddress import (
@@ -14,6 +16,7 @@ from ipaddress import (
     ip_interface,
     ip_network,
 )
+from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
 
@@ -25,6 +28,12 @@ HandshakeState = Literal["inactive", "waiting", "established", "timeout", "unkno
 HANDSHAKE_TIMEOUT = 30
 PROBE_INTERVAL = 10
 Address = IPv4Address | IPv6Address
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+class StartupSettings(TypedDict):
+    after_boot: list[str]
+    last_boot_id: str | None
 
 
 class Profile(TypedDict):
@@ -92,7 +101,8 @@ async def _command(executable: str, *arguments: str, wait: int = 10) -> str:
         raise NetworkManagerError(
             f"{executable} is not installed. "
             + ("This plugin requires NetworkManager and nmcli." if executable == "nmcli"
-               else "Install wireguard-tools to monitor peer handshakes.")
+               else "Install wireguard-tools to monitor peer handshakes." if executable == "wg"
+               else "This plugin requires systemd to detect when boot has finished.")
         ) from error
     except OSError as error:
         raise NetworkManagerError(f"Unable to start {executable}: {error}") from error
@@ -275,6 +285,117 @@ class Plugin:
         self._active_paths: dict[str, str] = {}
         self._activations: dict[str, Activation] = {}
         self._pending_activations: dict[str, tuple[float, int]] = {}
+        self._startup_task: asyncio.Task[None] | None = None
+        self._startup_error: str | None = None
+
+    def _settings_path(self) -> Path:
+        directory = os.environ.get("DECKY_PLUGIN_SETTINGS_DIR")
+        if not directory:
+            raise NetworkManagerError("Decky's plugin settings directory is unavailable.")
+        return Path(directory) / "startup.json"
+
+    def _read_settings(self) -> StartupSettings:
+        path = self._settings_path()
+        try:
+            settings = json.loads(path.read_text())
+            if (
+                not isinstance(settings, dict)
+                or not isinstance(settings.get("after_boot"), list)
+                or any(
+                    not isinstance(uuid, str) or str(UUID(uuid)) != uuid
+                    for uuid in settings["after_boot"]
+                )
+                or (
+                    settings.get("last_boot_id") is not None
+                    and not isinstance(settings["last_boot_id"], str)
+                )
+            ):
+                raise ValueError("Invalid startup settings")
+            return {
+                "after_boot": settings["after_boot"],
+                "last_boot_id": settings.get("last_boot_id"),
+            }
+        except FileNotFoundError:
+            return {"after_boot": [], "last_boot_id": None}
+        except (OSError, ValueError) as error:
+            raise NetworkManagerError(f"Unable to read startup settings: {error}") from error
+
+    def _write_settings(self, settings: StartupSettings) -> None:
+        path = self._settings_path()
+        temporary: str | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as output:
+                    temporary = output.name
+                    json.dump(settings, output)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, path)
+            finally:
+                if temporary is not None:
+                    Path(temporary).unlink(missing_ok=True)
+        except OSError as error:
+            raise NetworkManagerError(f"Unable to save startup settings: {error}") from error
+
+    async def _profile(self, uuid: str) -> Profile:
+        if not isinstance(uuid, str):
+            raise NetworkManagerError("A profile UUID is required.")
+        try:
+            canonical_uuid = str(UUID(uuid))
+        except ValueError as error:
+            raise NetworkManagerError("Invalid connection UUID.") from error
+        profile = next(
+            (profile for profile in await self._profiles() if profile["uuid"] == canonical_uuid),
+            None,
+        )
+        if profile is None:
+            raise NetworkManagerError("WireGuard profile not found. Refresh the list and try again.")
+        return profile
+
+    async def _autoconnect(self, uuid: str) -> bool:
+        value = (await _nmcli(
+            "--get-values", "connection.autoconnect", "connection", "show", "uuid", uuid,
+        )).strip()
+        if value not in ("yes", "no"):
+            raise NetworkManagerError("NetworkManager returned unexpected autoconnect data.")
+        return value == "yes"
+
+    async def get_startup_settings(self, uuid: str) -> dict[str, object]:
+        try:
+            async with self._lock:
+                profile = await self._profile(uuid)
+                settings = self._read_settings()
+                return {
+                    "success": True,
+                    "on_boot": await self._autoconnect(profile["uuid"]),
+                    "after_boot": profile["uuid"] in settings["after_boot"],
+                }
+        except NetworkManagerError as error:
+            return self._failure(error)
+
+    async def set_startup(self, uuid: str, mode: str) -> dict[str, object]:
+        if mode not in ("off", "on_boot", "after_boot"):
+            return self._failure(NetworkManagerError("Invalid startup mode."))
+        try:
+            async with self._lock:
+                profile = await self._profile(uuid)
+                uuid = profile["uuid"]
+                settings = self._read_settings()
+                # Disable the plugin first: a failed nmcli edit must not enable both modes.
+                if mode != "after_boot" and uuid in settings["after_boot"]:
+                    settings["after_boot"].remove(uuid)
+                    self._write_settings(settings)
+                await _nmcli(
+                    "connection", "modify", "uuid", uuid,
+                    "connection.autoconnect", "yes" if mode == "on_boot" else "no",
+                )
+                if mode == "after_boot" and uuid not in settings["after_boot"]:
+                    settings["after_boot"].append(uuid)
+                    self._write_settings(settings)
+                return {"success": True}
+        except NetworkManagerError as error:
+            return self._failure(error)
 
     async def _profiles(self) -> list[Profile]:
         output = await _nmcli(
@@ -388,7 +509,10 @@ class Plugin:
                     statuses.append({
                         **profile, "handshake": handshake, "handshake_error": error_message,
                     })
-                return {"success": True, "profiles": statuses}
+                result: dict[str, object] = {"success": True, "profiles": statuses}
+                if self._startup_error is not None:
+                    result["startup_error"] = self._startup_error
+                return result
         except NetworkManagerError as error:
             return self._failure(error)
 
@@ -396,47 +520,93 @@ class Plugin:
         if not isinstance(uuid, str) or not isinstance(connected, bool):
             return self._failure(NetworkManagerError("A profile UUID and boolean state are required."))
         try:
-            canonical_uuid = str(UUID(uuid))
-        except ValueError:
-            return self._failure(NetworkManagerError("Invalid connection UUID."))
-
-        try:
             async with self._lock:
-                profiles = await self._profiles()
-                profile = next(
-                    (profile for profile in profiles if profile["uuid"] == canonical_uuid),
-                    None,
-                )
-                if profile is None:
-                    raise NetworkManagerError(
-                        "WireGuard profile not found. Refresh the list and try again."
-                    )
-                target: State = "connected" if connected else "disconnected"
-                if profile["state"] == target:
-                    return {"success": True}
-                if profile["state"] in ("connecting", "disconnecting"):
-                    raise NetworkManagerError(
-                        "This profile is changing state. Wait and refresh before trying again."
-                    )
-                if profile["state"] == "unknown":
-                    raise NetworkManagerError(
-                        "This profile has an unknown state. Check it in NetworkManager."
-                    )
-                if connected:
-                    self._activations.pop(canonical_uuid, None)
-                    self._pending_activations[canonical_uuid] = (time.monotonic(), int(time.time()))
-                await _nmcli(
-                    "connection", "up" if connected else "down", "uuid", canonical_uuid, wait=30
-                )
-                if not connected:
-                    self._activations.pop(canonical_uuid, None)
-                    self._pending_activations.pop(canonical_uuid, None)
+                profile = await self._profile(uuid)
+                await self._change_connection(profile, connected)
                 return {"success": True}
         except NetworkManagerError as error:
             return self._failure(error)
 
+    async def _change_connection(self, profile: Profile, connected: bool) -> None:
+        uuid = profile["uuid"]
+        target: State = "connected" if connected else "disconnected"
+        if profile["state"] == target:
+            return
+        if profile["state"] in ("connecting", "disconnecting"):
+            raise NetworkManagerError(
+                "This profile is changing state. Wait and refresh before trying again."
+            )
+        if profile["state"] == "unknown":
+            raise NetworkManagerError(
+                "This profile has an unknown state. Check it in NetworkManager."
+            )
+        if connected:
+            self._activations.pop(uuid, None)
+            self._pending_activations[uuid] = (time.monotonic(), int(time.time()))
+        await _nmcli("connection", "up" if connected else "down", "uuid", uuid, wait=30)
+        if not connected:
+            self._activations.pop(uuid, None)
+            self._pending_activations.pop(uuid, None)
+
     async def _main(self) -> None:
         logger.info("WireGuard plugin loaded.")
+        self._startup_task = asyncio.create_task(self._activate_after_boot())
+
+    async def _activate_after_boot(self) -> None:
+        try:
+            async with self._lock:
+                settings = self._read_settings()
+                try:
+                    boot_id = str(UUID(BOOT_ID_PATH.read_text().strip()))
+                except (OSError, ValueError) as error:
+                    raise NetworkManagerError(f"Unable to identify this boot: {error}") from error
+                if settings["last_boot_id"] == boot_id:
+                    return
+                # Claim this boot even with no configured profiles, before any activation.
+                settings["last_boot_id"] = boot_id
+                self._write_settings(settings)
+                configured = settings["after_boot"].copy()
+            if not configured:
+                return
+            while True:
+                state = (await _command(
+                    "systemctl", "show", "--property=SystemState", "--value",
+                )).strip()
+                if state in ("running", "degraded"):
+                    break
+                if state not in ("initializing", "starting"):
+                    raise NetworkManagerError(f"Cannot connect after boot: system state is {state!r}.")
+                await asyncio.sleep(2)
+            for uuid in configured:
+                try:
+                    async with self._lock:
+                        # The user may change the setting while boot is finishing.
+                        if uuid not in self._read_settings()["after_boot"]:
+                            continue
+                        profile = await self._profile(uuid)
+                        if await self._autoconnect(uuid):
+                            raise NetworkManagerError(
+                                "NetworkManager autoconnect is enabled; "
+                                "select a startup mode again to resolve the conflict."
+                            )
+                        if profile["state"] in ("connected", "connecting"):
+                            continue
+                        await self._change_connection(profile, True)
+                except NetworkManagerError as error:
+                    message = f"After-boot connection failed for {uuid}: {error}"
+                    logger.warning("%s", message)
+                    self._startup_error = (
+                        f"{self._startup_error}\n{message}" if self._startup_error else message
+                    )
+        except NetworkManagerError as error:
+            logger.warning("After-boot connection: %s", error)
+            self._startup_error = str(error)
 
     async def _unload(self) -> None:
+        if self._startup_task is not None:
+            self._startup_task.cancel()
+            try:
+                await self._startup_task
+            except asyncio.CancelledError:
+                pass
         logger.info("WireGuard plugin unloaded; existing connections are unchanged.")

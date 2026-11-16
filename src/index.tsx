@@ -1,5 +1,5 @@
 import { callable, definePlugin } from "@decky/api";
-import { ButtonItem, PanelSection, PanelSectionRow, staticClasses } from "@decky/ui";
+import { ButtonItem, DialogCheckbox, PanelSection, PanelSectionRow, staticClasses } from "@decky/ui";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
 
@@ -16,9 +16,16 @@ interface Profile {
 }
 
 type Result<T> = ({ success: true } & T) | { success: false; error: string };
+type StartupMode = "off" | "on_boot" | "after_boot";
+interface StartupSettings {
+  on_boot: boolean;
+  after_boot: boolean;
+}
 
-const getProfiles = callable<[], Result<{ profiles: Profile[] }>>("get_profiles");
+const getProfiles = callable<[], Result<{ profiles: Profile[]; startup_error?: string }>>("get_profiles");
 const setConnection = callable<[uuid: string, connected: boolean], Result<object>>("set_connection");
+const getStartupSettings = callable<[uuid: string], Result<StartupSettings>>("get_startup_settings");
+const setStartup = callable<[uuid: string, mode: StartupMode], Result<object>>("set_startup");
 
 const stateLabels: Record<ConnectionState, string> = {
   connected: "Connected",
@@ -76,6 +83,9 @@ function Content() {
   const [busy, setBusy] = useState(false);
   const [pendingUuid, setPendingUuid] = useState<string | null>(null);
   const [selectedUuid, setSelectedUuid] = useState<string | null>(null);
+  const [startup, setStartupSettings] = useState<(StartupSettings & { uuid: string }) | null>(null);
+  const [startupError, setStartupError] = useState<string | null>(null);
+  const [startupSettingsError, setStartupSettingsError] = useState<string | null>(null);
   const inFlight = useRef(false);
   const refreshing = useRef<Promise<void> | null>(null);
   const mounted = useRef(false);
@@ -83,7 +93,22 @@ function Content() {
   const loadProfiles = useCallback(async () => {
     const result = await getProfiles();
     if (!result.success) throw new Error(result.error);
+    let settings: StartupSettings | null = null;
+    let settingsError: string | null = null;
+    if (selectedUuid && result.profiles.some((profile) => profile.uuid === selectedUuid)) {
+      try {
+        const response = await getStartupSettings(selectedUuid);
+        if (!response.success) throw new Error(response.error);
+        settings = response;
+      } catch (error) {
+        settingsError = errorMessage(error);
+      }
+    }
     if (mounted.current) {
+      setStartupError(result.startup_error ?? null);
+      setStartupSettingsError(settingsError);
+      setStartupSettings(settings && selectedUuid
+        ? { uuid: selectedUuid, on_boot: settings.on_boot, after_boot: settings.after_boot } : null);
       setProfiles((previous) =>
         previous?.length === result.profiles.length &&
         previous.every((profile, index) => {
@@ -95,7 +120,7 @@ function Content() {
         }) ? previous : result.profiles,
       );
     }
-  }, []);
+  }, [selectedUuid]);
 
   const refresh = useCallback(() => {
     if (inFlight.current) return;
@@ -115,8 +140,13 @@ function Content() {
 
   useEffect(() => {
     mounted.current = true;
-    void refresh();
+    let cancelled = false;
+    void (async () => {
+      await refreshing.current;
+      if (!cancelled) await refresh();
+    })();
     return () => {
+      cancelled = true;
       mounted.current = false;
     };
   }, [refresh]);
@@ -127,7 +157,7 @@ function Content() {
     return () => window.clearInterval(timer);
   }, [refresh, refreshInterval]);
 
-  const changeConnection = async (profile: Profile) => {
+  const applyChange = async (profile: Profile, action: () => Promise<Result<object>>) => {
     if (inFlight.current) return;
     inFlight.current = true;
     setBusy(true);
@@ -140,7 +170,7 @@ function Content() {
     }
     let failure: string | null = null;
     try {
-      const result = await setConnection(profile.uuid, profile.state !== "connected");
+      const result = await action();
       if (!result.success) throw new Error(result.error);
     } catch (error) {
       failure = errorMessage(error);
@@ -161,6 +191,7 @@ function Content() {
   };
 
   const selectedProfile = profiles?.find((profile) => profile.uuid === selectedUuid);
+  const selectedStartup = startup?.uuid === selectedUuid ? startup : null;
   const transitioning = selectedProfile?.state === "connecting" || selectedProfile?.state === "disconnecting";
   const selectedStatus = error ? "Status unavailable" : pendingUuid === selectedProfile?.uuid
     ? "Applying change..."
@@ -199,6 +230,13 @@ function Content() {
           <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
             {error}
             {profiles !== null && <div>Displayed status may be out of date.</div>}
+          </div>
+        </PanelSectionRow>
+      )}
+      {startupError && (
+        <PanelSectionRow>
+          <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
+            Automatic startup: {startupError} You can still connect manually.
           </div>
         </PanelSectionRow>
       )}
@@ -243,7 +281,10 @@ function Content() {
             </span>}
             description={`${selectedStatus}${selectedProfile.device ? ` on ${selectedProfile.device}` : ""} \u00b7 ${selectedProfile.uuid.slice(0, 8)}${selectedProfile.handshake_error ? ` \u00b7 ${selectedProfile.handshake_error}` : ""}`}
             disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
-            onClick={() => void changeConnection(selectedProfile)}
+            onClick={() => void applyChange(
+              selectedProfile,
+              () => setConnection(selectedProfile.uuid, selectedProfile.state !== "connected"),
+            )}
           >
             {pendingUuid === selectedProfile.uuid
               ? "Please wait..."
@@ -252,6 +293,43 @@ function Content() {
                 : selectedProfile.state === "connected" ? "Disconnect" : "Connect"}
           </ButtonItem>
         </PanelSectionRow>
+      )}
+      {selectedProfile && (
+        <>
+          {startupSettingsError && (
+            <PanelSectionRow>
+              <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
+                Startup settings unavailable: {startupSettingsError}
+              </div>
+            </PanelSectionRow>
+          )}
+          <PanelSectionRow>
+            <DialogCheckbox
+              controlled
+              label="Connect during boot"
+              description="Use NetworkManager autoconnect. May delay boot when offline."
+              checked={selectedStartup?.on_boot ?? false}
+              disabled={busy || error !== null || selectedStartup === null}
+              onChange={(checked) => void applyChange(
+                selectedProfile,
+                () => setStartup(selectedProfile.uuid, checked ? "on_boot" : "off"),
+              )}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <DialogCheckbox
+              controlled
+              label="Connect after boot"
+              description="From next boot, connect once when the plugin loads and boot has finished. Disables NetworkManager autoconnect; reloads do not reconnect."
+              checked={selectedStartup?.after_boot ?? false}
+              disabled={busy || error !== null || selectedStartup === null}
+              onChange={(checked) => void applyChange(
+                selectedProfile,
+                () => setStartup(selectedProfile.uuid, checked ? "after_boot" : "off"),
+              )}
+            />
+          </PanelSectionRow>
+        </>
       )}
       <PanelSectionRow>
         <div style={{ fontSize: "0.85em", opacity: 0.75, paddingTop: 8 }}>
