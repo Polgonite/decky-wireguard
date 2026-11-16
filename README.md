@@ -94,6 +94,40 @@ devcontainer up --workspace-folder .
 devcontainer exec --workspace-folder . pre-commit run --all-files
 ```
 
+### Committing from the terminal
+
+With Docker running, run these commands from the repository root. The `npx`
+form works without a globally installed Dev Container CLI:
+
+```sh
+npx --yes @devcontainers/cli up --workspace-folder .
+git status --short
+git diff
+git add README.md src/index.tsx # Replace with the files you intend to commit.
+git diff --cached --check
+git diff --cached
+```
+
+Commit inside the container so the installed hooks can find their tools. The
+container may not inherit the host's Git identity. Resolve the effective host
+identity (including environment-based configuration) and pass it only for this
+command, without saving personal details in the container or repository:
+
+```sh
+git_name=$(git var GIT_AUTHOR_IDENT | sed 's/ <.*//')
+git_email=$(git var GIT_AUTHOR_IDENT | sed 's/.*<//; s/>.*//')
+npx --yes @devcontainers/cli exec --workspace-folder . \
+  git -c "user.name=$git_name" -c "user.email=$git_email" \
+  commit -m "Describe the change"
+git status --short
+git --no-pager log --oneline -1
+```
+
+If Git cannot resolve your identity, configure it on the host first. If a hook
+fails, fix the reported issue and retry without bypassing hooks. If a hook
+rewrites files, review and stage those changes before retrying. An empty final
+status means the working tree is clean.
+
 ## Install on Steam Deck
 
 1. Enable Developer Mode in Decky Loader settings.
