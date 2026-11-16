@@ -20,7 +20,7 @@ nmcli connection import type wireguard file /absolute/path/to/wg0.conf
 
 Keep configuration files and private keys out of this repository. Importing may
 enable NetworkManager autoconnect; review the imported profile's settings in
-Desktop Mode before returning to Gaming Mode. The plugin does not change them.
+Desktop Mode or use the plugin's startup checkboxes before rebooting.
 
 ## Build
 
@@ -154,6 +154,27 @@ directory), then restart Decky Loader.
   duplicate names are safe. Select a connection to open its management menu and
   connect or disconnect it; use Back to return to the list. The short UUID
   appears beside each status.
+- Every connection management page has two mutually exclusive startup checkboxes.
+  **Connect during boot** sets NetworkManager's `connection.autoconnect` through
+  `nmcli`; this can delay boot when the Deck is offline. **Connect after boot**
+  disables NetworkManager autoconnect and lets the backend attempt activation
+  when the plugin loads, after systemd reports boot finished (`running` or
+  `degraded`). Neither checkbox needs to be enabled; changing them does not
+  immediately connect or disconnect the tunnel.
+- After-boot preferences and the last handled Linux boot ID are saved atomically
+  in Decky's persistent plugin settings directory (`startup.json`). The backend
+  records the boot before attempting activation, including when no profiles are
+  configured. Closing the panel, reloading the frontend, restarting Decky, or
+  reloading the backend does not trigger another attempt during the same boot.
+  Enabling this option after the plugin's first load takes effect next boot.
+  Uninstalling or deleting plugin settings resets this record.
+- After-boot activation runs in the background without blocking plugin loading
+  or the system boot path. Each configured tunnel gets one bounded attempt;
+  offline failures are shown in the panel, with no automatic retries. Connect
+  manually after restoring the network. Already active or activating tunnels
+  are left alone. Unloading cancels pending startup work; it does not retry on
+  reload that boot. External NetworkManager edits that re-enable autoconnect
+  cause the plugin to skip that tunnel and report the conflict.
 - Status refreshes every second while verifying a peer, otherwise every five
   seconds while the panel is mounted. Refresh also
   runs after each action. Refreshes keep the current controls visible and only
@@ -195,7 +216,7 @@ directory), then restart Decky Loader.
   replies can verify faster, but a reply from the probe destination itself
   is not required. There is no nondisruptive command to force a new handshake
   on an already usable session.
-- No routes, keys, keepalive settings, or saved profiles are changed. This
+- No routes, keys, or keepalive settings are changed. This
   works at the WireGuard protocol level rather than relying on a particular
   provider or assuming the server's tunnel address is `.1`. Networks blocking
   probes, missing endpoints, or unusable AllowedIPs can prevent verification;
@@ -206,8 +227,8 @@ directory), then restart Decky Loader.
   the imported profile.
 - Multiple tunnels can be active. Connecting one does not disconnect others;
   overlapping routes may conflict.
-- The plugin does not import, edit, delete, or display configuration secrets. It
-  does not alter saved autoconnect settings, though NetworkManager's normal
+- The plugin does not import, delete, or display configuration secrets. Its only
+  saved NetworkManager edit is the startup autoconnect setting. NetworkManager's normal
   connection-down behavior can temporarily inhibit autoconnect until reboot or
   another explicit activation. Unloading the plugin leaves tunnels as they are.
 
