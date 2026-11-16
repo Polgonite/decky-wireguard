@@ -20,12 +20,66 @@ type StartupMode = "off" | "on_boot" | "after_boot";
 interface StartupSettings {
   on_boot: boolean;
   after_boot: boolean;
+  wait_for_steam: boolean;
+  wait_for_internet: boolean;
+  waiting: string | null;
 }
 
 const getProfiles = callable<[], Result<{ profiles: Profile[]; startup_error?: string }>>("get_profiles");
 const setConnection = callable<[uuid: string, connected: boolean], Result<object>>("set_connection");
 const getStartupSettings = callable<[uuid: string], Result<StartupSettings>>("get_startup_settings");
 const setStartup = callable<[uuid: string, mode: StartupMode], Result<object>>("set_startup");
+const setStartupRequirements = callable<
+  [uuid: string, waitForSteam: boolean, waitForInternet: boolean], Result<object>
+>("set_startup_requirements");
+const setSteamReadiness = callable<[ready: boolean, error: string | null], Result<object>>("set_steam_readiness");
+
+function monitorSteamReadiness(): () => void {
+  let stopped = false;
+  let inFlight = false;
+  let lastError: string | null = null;
+  const report = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    let ready = false;
+    let error: string | null = null;
+    try {
+      if (typeof App === "undefined" || typeof App.BHasCurrentUser !== "function" ||
+          typeof App.GetServicesInitialized !== "function" || typeof App.m_eLoginState !== "number") {
+        throw new Error("Steam UI login state is unavailable.");
+      }
+      // ELoginState.Success in Steam's login-state API, including completed offline login.
+      ready = App.m_eLoginState === 7 && App.BHasCurrentUser() && App.GetServicesInitialized();
+    } catch (failure) {
+      error = errorMessage(failure);
+    }
+    try {
+      const result = await setSteamReadiness(ready, error);
+      if (!result.success) throw new Error(result.error);
+      lastError = null;
+    } catch (failure) {
+      const message = errorMessage(failure);
+      if (message !== lastError) console.error("WireGuard Steam readiness:", message);
+      lastError = message;
+    } finally {
+      inFlight = false;
+    }
+  };
+  void report();
+  const timer = window.setInterval(() => void report(), 2000);
+  return () => {
+    stopped = true;
+    window.clearInterval(timer);
+    void (async () => {
+      try {
+        const result = await setSteamReadiness(false, null);
+        if (!result.success) throw new Error(result.error);
+      } catch (error) {
+        console.error("WireGuard Steam readiness cleanup:", errorMessage(error));
+      }
+    })();
+  };
+}
 
 const stateLabels: Record<ConnectionState, string> = {
   connected: "Connected",
@@ -108,7 +162,7 @@ function Content() {
       setStartupError(result.startup_error ?? null);
       setStartupSettingsError(settingsError);
       setStartupSettings(settings && selectedUuid
-        ? { uuid: selectedUuid, on_boot: settings.on_boot, after_boot: settings.after_boot } : null);
+        ? { ...settings, uuid: selectedUuid } : null);
       setProfiles((previous) =>
         previous?.length === result.profiles.length &&
         previous.every((profile, index) => {
@@ -329,6 +383,43 @@ function Content() {
               )}
             />
           </PanelSectionRow>
+          <PanelSectionRow>
+            <DialogCheckbox
+              controlled
+              label="Wait for Steam login"
+              description="For plugin-managed startup, wait until Steam finishes logging in, including Offline Mode."
+              checked={selectedStartup?.wait_for_steam ?? true}
+              disabled={busy || error !== null || selectedStartup === null}
+              onChange={(checked) => selectedStartup && void applyChange(
+                selectedProfile,
+                () => setStartupRequirements(
+                  selectedProfile.uuid, checked, selectedStartup.wait_for_internet,
+                ),
+              )}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <DialogCheckbox
+              controlled
+              label="Wait for internet"
+              description="For plugin-managed startup, wait for NetworkManager to verify internet on Wi-Fi, Ethernet, or mobile data, not a VPN."
+              checked={selectedStartup?.wait_for_internet ?? true}
+              disabled={busy || error !== null || selectedStartup === null}
+              onChange={(checked) => selectedStartup && void applyChange(
+                selectedProfile,
+                () => setStartupRequirements(
+                  selectedProfile.uuid, selectedStartup.wait_for_steam, checked,
+                ),
+              )}
+            />
+          </PanelSectionRow>
+          {selectedStartup?.waiting && (
+            <PanelSectionRow>
+              <div role="status" style={{ fontSize: "0.85em", padding: "8px 0" }}>
+                {selectedStartup.waiting}
+              </div>
+            </PanelSectionRow>
+          )}
         </>
       )}
       <PanelSectionRow>
@@ -342,9 +433,13 @@ function Content() {
   );
 }
 
-export default definePlugin(() => ({
-  name: "WireGuard",
-  titleView: <div className={staticClasses.Title}>WireGuard</div>,
-  content: <Content />,
-  icon: <FaShieldAlt />,
-}));
+export default definePlugin(() => {
+  const stopMonitoring = monitorSteamReadiness();
+  return {
+    name: "WireGuard",
+    titleView: <div className={staticClasses.Title}>WireGuard</div>,
+    content: <Content />,
+    icon: <FaShieldAlt />,
+    onDismount: stopMonitoring,
+  };
+});

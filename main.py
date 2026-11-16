@@ -29,11 +29,22 @@ HANDSHAKE_TIMEOUT = 30
 PROBE_INTERVAL = 10
 Address = IPv4Address | IPv6Address
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+STEAM_READINESS_MAX_AGE = 10
+
+
+class StartupRequirements(TypedDict):
+    wait_for_steam: bool
+    wait_for_internet: bool
+
+
+def _default_requirements() -> StartupRequirements:
+    return {"wait_for_steam": True, "wait_for_internet": True}
 
 
 class StartupSettings(TypedDict):
     after_boot: list[str]
     last_boot_id: str | None
+    requirements: dict[str, StartupRequirements]
 
 
 class Profile(TypedDict):
@@ -287,6 +298,11 @@ class Plugin:
         self._pending_activations: dict[str, tuple[float, int]] = {}
         self._startup_task: asyncio.Task[None] | None = None
         self._startup_error: str | None = None
+        self._startup_waiting: dict[str, str] = {}
+        self._startup_pending: set[str] = set()
+        self._steam_ready = False
+        self._steam_reported_at: float | None = None
+        self._steam_error: str | None = None
 
     def _settings_path(self) -> Path:
         directory = os.environ.get("DECKY_PLUGIN_SETTINGS_DIR")
@@ -311,12 +327,21 @@ class Plugin:
                 )
             ):
                 raise ValueError("Invalid startup settings")
+            requirements = settings.get("requirements", {})
+            if not isinstance(requirements, dict) or any(
+                not isinstance(uuid, str) or str(UUID(uuid)) != uuid
+                or not isinstance(options, dict)
+                or any(not isinstance(options.get(key), bool) for key in _default_requirements())
+                for uuid, options in requirements.items()
+            ):
+                raise ValueError("Invalid startup requirements")
             return {
                 "after_boot": settings["after_boot"],
                 "last_boot_id": settings.get("last_boot_id"),
+                "requirements": requirements,
             }
         except FileNotFoundError:
-            return {"after_boot": [], "last_boot_id": None}
+            return {"after_boot": [], "last_boot_id": None, "requirements": {}}
         except (OSError, ValueError) as error:
             raise NetworkManagerError(f"Unable to read startup settings: {error}") from error
 
@@ -370,9 +395,79 @@ class Plugin:
                     "success": True,
                     "on_boot": await self._autoconnect(profile["uuid"]),
                     "after_boot": profile["uuid"] in settings["after_boot"],
+                    **settings["requirements"].get(profile["uuid"], _default_requirements()),
+                    "waiting": self._startup_waiting.get(profile["uuid"]),
                 }
         except NetworkManagerError as error:
             return self._failure(error)
+
+    async def set_startup_requirements(
+        self, uuid: str, wait_for_steam: bool, wait_for_internet: bool,
+    ) -> dict[str, object]:
+        if not isinstance(wait_for_steam, bool) or not isinstance(wait_for_internet, bool):
+            return self._failure(NetworkManagerError("Startup requirements must be boolean values."))
+        try:
+            async with self._lock:
+                profile = await self._profile(uuid)
+                settings = self._read_settings()
+                settings["requirements"][profile["uuid"]] = {
+                    "wait_for_steam": wait_for_steam, "wait_for_internet": wait_for_internet,
+                }
+                self._write_settings(settings)
+                return {"success": True}
+        except NetworkManagerError as error:
+            return self._failure(error)
+
+    async def set_steam_readiness(
+        self, ready: bool, error: str | None = None,
+    ) -> dict[str, object]:
+        if not isinstance(ready, bool) or (error is not None and not isinstance(error, str)):
+            return self._failure(NetworkManagerError("Invalid Steam readiness report."))
+        if error and error != self._steam_error:
+            logger.warning("Steam readiness unavailable: %s", error)
+        self._steam_error = error
+        self._steam_ready = ready and error is None
+        self._steam_reported_at = time.monotonic()
+        return {"success": True}
+
+    def _steam_login_ready(self) -> bool:
+        return (
+            self._steam_ready
+            and self._steam_reported_at is not None
+            and time.monotonic() - self._steam_reported_at < STEAM_READINESS_MAX_AGE
+        )
+
+    async def _internet_ready(self) -> bool:
+        # Without active checks NetworkManager can infer "full" from a default route.
+        checks = await _command(
+            "busctl", "--system", "get-property", "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager", "org.freedesktop.NetworkManager",
+            "ConnectivityCheckAvailable", "ConnectivityCheckEnabled",
+        )
+        if checks.splitlines() != ["b true", "b true"]:
+            raise NetworkManagerError(
+                "Internet readiness requires NetworkManager connectivity checking to be "
+                "available and enabled. Enable it or turn off 'Wait for internet' for this profile."
+            )
+        connectivity = (await _nmcli("networking", "connectivity", "check")).strip()
+        if connectivity not in ("unknown", "none", "portal", "limited", "full"):
+            raise NetworkManagerError("NetworkManager returned unexpected internet connectivity data.")
+        if connectivity != "full":
+            return False
+        output = await _nmcli(
+            "--fields", "TYPE,STATE,IP4-CONNECTIVITY,IP6-CONNECTIVITY", "device", "status",
+        )
+        ready = False
+        for line in output.splitlines():
+            fields = _split_fields(line)
+            if len(fields) != 4:
+                raise NetworkManagerError("NetworkManager returned unexpected device connectivity data.")
+            kind, state, ipv4, ipv6 = fields
+            if any(value not in ("unknown", "none", "portal", "limited", "full") for value in (ipv4, ipv6)):
+                raise NetworkManagerError("NetworkManager returned unexpected device connectivity data.")
+            if kind in ("wifi", "ethernet", "gsm", "cdma", "bluetooth") and state == "connected":
+                ready |= ipv4 == "full" or ipv6 == "full"
+        return ready
 
     async def set_startup(self, uuid: str, mode: str) -> dict[str, object]:
         if mode not in ("off", "on_boot", "after_boot"):
@@ -523,6 +618,8 @@ class Plugin:
             async with self._lock:
                 profile = await self._profile(uuid)
                 await self._change_connection(profile, connected)
+                self._startup_pending.discard(profile["uuid"])
+                self._startup_waiting.pop(profile["uuid"], None)
                 return {"success": True}
         except NetworkManagerError as error:
             return self._failure(error)
@@ -566,6 +663,8 @@ class Plugin:
                 settings["last_boot_id"] = boot_id
                 self._write_settings(settings)
                 configured = settings["after_boot"].copy()
+                self._startup_pending = set(configured)
+                self._startup_waiting = {uuid: "Waiting for system boot to finish." for uuid in configured}
             if not configured:
                 return
             while True:
@@ -577,30 +676,60 @@ class Plugin:
                 if state not in ("initializing", "starting"):
                     raise NetworkManagerError(f"Cannot connect after boot: system state is {state!r}.")
                 await asyncio.sleep(2)
-            for uuid in configured:
-                try:
-                    async with self._lock:
-                        # The user may change the setting while boot is finishing.
-                        if uuid not in self._read_settings()["after_boot"]:
-                            continue
-                        profile = await self._profile(uuid)
-                        if await self._autoconnect(uuid):
-                            raise NetworkManagerError(
-                                "NetworkManager autoconnect is enabled; "
-                                "select a startup mode again to resolve the conflict."
-                            )
-                        if profile["state"] in ("connected", "connecting"):
-                            continue
-                        await self._change_connection(profile, True)
-                except NetworkManagerError as error:
-                    message = f"After-boot connection failed for {uuid}: {error}"
-                    logger.warning("%s", message)
-                    self._startup_error = (
-                        f"{self._startup_error}\n{message}" if self._startup_error else message
-                    )
+            while self._startup_pending:
+                for uuid in configured:
+                    if uuid not in self._startup_pending:
+                        continue
+                    waiting = False
+                    try:
+                        async with self._lock:
+                            settings = self._read_settings()
+                            if uuid not in settings["after_boot"]:
+                                continue
+                            profile = await self._profile(uuid)
+                            if await self._autoconnect(uuid):
+                                raise NetworkManagerError(
+                                    "NetworkManager autoconnect is enabled; "
+                                    "select a startup mode again to resolve the conflict."
+                                )
+                            if profile["state"] in ("connected", "connecting"):
+                                continue
+                            options = settings["requirements"].get(uuid, _default_requirements())
+                            if options["wait_for_steam"] and not self._steam_login_ready():
+                                self._startup_waiting[uuid] = (
+                                    f"Steam readiness unavailable: {self._steam_error}"
+                                    if self._steam_error else "Waiting for Steam login or Offline Mode."
+                                )
+                                waiting = True
+                                continue
+                            if options["wait_for_internet"] and not await self._internet_ready():
+                                self._startup_waiting[uuid] = "Waiting for internet on a non-VPN connection."
+                                waiting = True
+                                continue
+                            # Recheck the heartbeat after the potentially slow connectivity check.
+                            if options["wait_for_steam"] and not self._steam_login_ready():
+                                self._startup_waiting[uuid] = "Waiting for Steam login or Offline Mode."
+                                waiting = True
+                                continue
+                            await self._change_connection(profile, True)
+                    except NetworkManagerError as error:
+                        message = f"After-boot connection failed for {uuid}: {error}"
+                        logger.warning("%s", message)
+                        self._startup_error = (
+                            f"{self._startup_error}\n{message}" if self._startup_error else message
+                        )
+                    finally:
+                        if not waiting:
+                            self._startup_pending.discard(uuid)
+                            self._startup_waiting.pop(uuid, None)
+                if self._startup_pending:
+                    await asyncio.sleep(5)
         except NetworkManagerError as error:
             logger.warning("After-boot connection: %s", error)
             self._startup_error = str(error)
+        finally:
+            self._startup_pending.clear()
+            self._startup_waiting.clear()
 
     async def _unload(self) -> None:
         if self._startup_task is not None:

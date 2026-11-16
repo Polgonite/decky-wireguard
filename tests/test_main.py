@@ -68,6 +68,14 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         command = patch("main._command", new_callable=AsyncMock, return_value="running\n")
         self.command = command.start()
         self.addCleanup(command.stop)
+        self.steam_patcher = patch.object(Plugin, "_steam_login_ready", return_value=True)
+        self.steam = self.steam_patcher.start()
+        self.addCleanup(self.steam_patcher.stop)
+        self.internet_patcher = patch.object(
+            Plugin, "_internet_ready", new_callable=AsyncMock, return_value=True,
+        )
+        self.internet = self.internet_patcher.start()
+        self.addCleanup(self.internet_patcher.stop)
         self.plugin = Plugin()
 
     def settings(self):
@@ -82,6 +90,7 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_startup_modes_are_exclusive_and_persist_across_instances(self):
         self.assertEqual(await self.plugin.get_startup_settings(HOME), {
             "success": True, "on_boot": True, "after_boot": False,
+            "wait_for_steam": True, "wait_for_internet": True, "waiting": None,
         })
         for mode, on_boot, after_boot in [
             ("after_boot", False, True),
@@ -92,6 +101,7 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self.plugin.set_startup(HOME, mode), {"success": True})
                 self.assertEqual(await Plugin().get_startup_settings(HOME), {
                     "success": True, "on_boot": on_boot, "after_boot": after_boot,
+                    "wait_for_steam": True, "wait_for_internet": True, "waiting": None,
                 })
         self.assertFalse(self.activations())
 
@@ -262,6 +272,215 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.plugin._startup_task.cancelled())
         await Plugin()._activate_after_boot()
         self.assertFalse(self.activations())
+
+    async def test_legacy_settings_enable_both_requirements_and_preserve_boot_guard(self):
+        self.settings_path.write_text(json.dumps({"after_boot": [HOME], "last_boot_id": HOME}))
+        result = await self.plugin.get_startup_settings(HOME)
+        self.assertTrue(result["wait_for_steam"])
+        self.assertTrue(result["wait_for_internet"])
+        await self.plugin._activate_after_boot()
+        self.assertFalse(self.activations())
+
+    async def test_requirements_persist_independently_per_connection_without_activation(self):
+        self.assertEqual(
+            await self.plugin.set_startup_requirements(HOME, False, True), {"success": True},
+        )
+        self.assertEqual(
+            await self.plugin.set_startup_requirements(WORK, True, False), {"success": True},
+        )
+        for uuid, steam, internet in [(HOME, False, True), (WORK, True, False)]:
+            result = await Plugin().get_startup_settings(uuid)
+            self.assertEqual(result["wait_for_steam"], steam)
+            self.assertEqual(result["wait_for_internet"], internet)
+        self.assertFalse(self.activations())
+        self.assertTrue(self.autoconnect[HOME])
+
+    async def test_invalid_requirements_do_not_write_or_modify_networkmanager(self):
+        for uuid, steam, internet in [
+            (HOME, "yes", True), (HOME, True, 1), (WIFI, False, False), ("--help", True, True),
+        ]:
+            with self.subTest(uuid=uuid, steam=steam), self.assertLogs("decky-wireguard"):
+                result = await self.plugin.set_startup_requirements(uuid, steam, internet)
+                self.assertFalse(result["success"])
+        self.assertFalse(self.settings_path.exists())
+        self.assertTrue(all(call.args == FIELDS for call in self.nmcli.await_args_list))
+
+    async def test_steam_gate_waits_without_blocking_a_different_connection(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        await self.plugin.set_startup(WORK, "after_boot")
+        await self.plugin.set_startup_requirements(WORK, False, True)
+        self.steam.return_value = False
+
+        async def sleeping(_):
+            self.assertEqual([call.args[-1] for call in self.activations()], [WORK])
+            status = await self.plugin.get_startup_settings(HOME)
+            self.assertIn("Waiting for Steam", status["waiting"])
+            self.steam.return_value = True
+
+        with patch("main.asyncio.sleep", side_effect=sleeping):
+            await self.plugin._activate_after_boot()
+        self.assertEqual([call.args[-1] for call in self.activations()], [WORK, HOME])
+        self.assertIsNone((await self.plugin.get_startup_settings(HOME))["waiting"])
+
+    async def test_internet_gate_waits_until_connectivity_returns(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.internet.return_value = False
+
+        async def sleeping(_):
+            self.assertFalse(self.activations())
+            self.assertIn("Waiting for internet", self.plugin._startup_waiting[HOME])
+            self.internet.return_value = True
+
+        with patch("main.asyncio.sleep", side_effect=sleeping) as sleep:
+            await self.plugin._activate_after_boot()
+        self.assertEqual(sleep.await_count, 1)
+        self.assertEqual(len(self.activations()), 1)
+
+    async def test_disabling_both_requirements_bypasses_only_readiness_checks(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        await self.plugin.set_startup_requirements(HOME, False, False)
+        self.steam.return_value = False
+        self.internet.return_value = False
+        await self.plugin._activate_after_boot()
+        self.assertEqual(len(self.activations()), 1)
+        self.steam.assert_not_called()
+        self.internet.assert_not_awaited()
+        self.command.assert_awaited_once()
+
+    async def test_requirement_changes_apply_while_waiting(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.steam.return_value = False
+
+        async def sleeping(_):
+            self.assertFalse(self.activations())
+            await self.plugin.set_startup_requirements(HOME, False, False)
+
+        with patch("main.asyncio.sleep", side_effect=sleeping):
+            await self.plugin._activate_after_boot()
+        self.assertEqual(len(self.activations()), 1)
+
+    async def test_manual_disconnect_cancels_pending_startup_even_when_already_disconnected(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.steam.return_value = False
+
+        async def sleeping(_):
+            self.assertEqual(await self.plugin.set_connection(HOME, False), {"success": True})
+            self.steam.return_value = True
+
+        with patch("main.asyncio.sleep", side_effect=sleeping):
+            await self.plugin._activate_after_boot()
+        self.assertFalse(self.activations())
+
+    async def test_disabling_startup_while_waiting_cancels_activation(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.internet.return_value = False
+
+        async def sleeping(_):
+            await self.plugin.set_startup(HOME, "off")
+            self.internet.return_value = True
+
+        with patch("main.asyncio.sleep", side_effect=sleeping):
+            await self.plugin._activate_after_boot()
+        self.assertFalse(self.activations())
+
+    async def test_readiness_failure_is_reported_without_activating_or_reloading_retry(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.internet.side_effect = NetworkManagerError("Connectivity checking is disabled")
+        with self.assertLogs("decky-wireguard"):
+            await self.plugin._activate_after_boot()
+        await Plugin()._activate_after_boot()
+        self.assertFalse(self.activations())
+        self.assertIn("Connectivity checking is disabled", self.plugin._startup_error)
+
+    async def test_steam_readiness_fails_closed_on_missing_stale_or_failed_reports(self):
+        self.steam_patcher.stop()
+        self.assertFalse(self.plugin._steam_login_ready())
+        with patch("main.time.monotonic", return_value=100) as clock:
+            self.assertEqual(await self.plugin.set_steam_readiness(True), {"success": True})
+            self.assertTrue(self.plugin._steam_login_ready())
+            clock.return_value = 110
+            self.assertFalse(self.plugin._steam_login_ready())
+            with self.assertLogs("decky-wireguard"):
+                await self.plugin.set_steam_readiness(True, "Steam API unavailable")
+            self.assertFalse(self.plugin._steam_login_ready())
+            await self.plugin.set_steam_readiness(True)
+            self.assertTrue(self.plugin._steam_login_ready())
+            await self.plugin.set_steam_readiness(False)
+            self.assertFalse(self.plugin._steam_login_ready())
+
+    async def test_invalid_steam_report_is_logged_and_rejected(self):
+        for ready, error in [("yes", None), (True, 123)]:
+            with self.subTest(ready=ready), self.assertLogs("decky-wireguard"):
+                self.assertFalse((await self.plugin.set_steam_readiness(ready, error))["success"])
+        self.assertIsNone(self.plugin._steam_reported_at)
+
+    async def test_steam_readiness_rechecked_after_slow_internet_check(self):
+        await self.plugin.set_startup(HOME, "after_boot")
+        self.steam.side_effect = [True, False, True, True]
+
+        async def sleeping(_):
+            self.assertFalse(self.activations())
+
+        with patch("main.asyncio.sleep", side_effect=sleeping) as sleep:
+            await self.plugin._activate_after_boot()
+        self.assertEqual(sleep.await_count, 1)
+        self.assertEqual(len(self.activations()), 1)
+
+    async def test_invalid_requirement_settings_are_not_silently_defaulted(self):
+        for requirements in [[], {HOME: {"wait_for_steam": "yes", "wait_for_internet": True}}]:
+            with self.subTest(requirements=requirements), self.assertLogs("decky-wireguard"):
+                self.settings_path.write_text(json.dumps({
+                    "after_boot": [HOME], "last_boot_id": None, "requirements": requirements,
+                }))
+                self.assertFalse((await self.plugin.get_startup_settings(HOME))["success"])
+
+
+class InternetReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_connected_physical_uplink_with_verified_internet_passes(self):
+        for output, ready in [
+            ("wifi:connected:full:none\n", True),
+            ("ethernet:connected:none:full\n", True),
+            ("gsm:connected:full:none\n", True),
+            ("wireguard:connected:full:full\nwifi:connected:limited:none\n", False),
+            ("tun:connected:full:full\n", False),
+            ("wifi:disconnected:full:full\n", False),
+            ("wifi:connected:portal:none\n", False),
+            ("wifi:connected:unknown:none\n", False),
+            ("", False),
+        ]:
+            with self.subTest(output=output), patch(
+                "main._command", new_callable=AsyncMock, return_value="b true\nb true\n",
+            ), patch("main._nmcli", new_callable=AsyncMock, side_effect=["full\n", output]) as nmcli:
+                self.assertEqual(await Plugin()._internet_ready(), ready)
+                self.assertEqual(nmcli.await_args_list[0].args, ("networking", "connectivity", "check"))
+                self.assertEqual(nmcli.await_args_list[1].args, (
+                    "--fields", "TYPE,STATE,IP4-CONNECTIVITY,IP6-CONNECTIVITY", "device", "status",
+                ))
+
+    async def test_no_internet_and_captive_portals_do_not_pass(self):
+        for state in ["none", "unknown", "limited", "portal"]:
+            with self.subTest(state=state), patch(
+                "main._command", new_callable=AsyncMock, return_value="b true\nb true\n",
+            ), patch("main._nmcli", new_callable=AsyncMock, return_value=state) as nmcli:
+                self.assertFalse(await Plugin()._internet_ready())
+                nmcli.assert_awaited_once()
+
+    async def test_disabled_or_unavailable_connectivity_checks_cannot_infer_readiness(self):
+        for output in ["b true\nb false\n", "b false\nb true\n", "unexpected"]:
+            with self.subTest(output=output), patch(
+                "main._command", new_callable=AsyncMock, return_value=output,
+            ), patch("main._nmcli", new_callable=AsyncMock) as nmcli:
+                with self.assertRaisesRegex(NetworkManagerError, "available and enabled"):
+                    await Plugin()._internet_ready()
+                nmcli.assert_not_awaited()
+
+    async def test_malformed_connectivity_data_is_an_error_not_readiness(self):
+        for responses in [["unexpected\n"], ["full\n", "broken:row\n"]]:
+            with self.subTest(responses=responses), patch(
+                "main._command", new_callable=AsyncMock, return_value="b true\nb true\n",
+            ), patch("main._nmcli", new_callable=AsyncMock, side_effect=responses):
+                with self.assertRaisesRegex(NetworkManagerError, "unexpected"):
+                    await Plugin()._internet_ready()
 
 
 class ProfileTests(unittest.IsolatedAsyncioTestCase):
