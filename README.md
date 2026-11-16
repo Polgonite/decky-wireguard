@@ -114,8 +114,10 @@ directory), then restart Decky Loader.
   Names with colons and backslashes are supported, and actions use UUIDs so
   duplicate names are safe. The short UUID appears beside each status.
 - Status refreshes every five seconds while the panel is mounted. Refresh also
-  runs after each action. Unavailable status disables actions until a successful
-  refresh, rather than treating an error as a disconnected profile.
+  runs after each action. Refreshes keep the current controls visible and only
+  update profiles when the response changes; connection actions still show a
+  busy state. Unavailable status disables actions until a successful refresh,
+  rather than treating an error as a disconnected profile.
 - All mutations are serialized and restricted to WireGuard profiles. No shell is
   used. Missing tools, authorization failures, and NetworkManager errors appear
   in the panel. Actions have a 30-second NetworkManager wait limit; if an action
