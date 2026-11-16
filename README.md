@@ -23,7 +23,7 @@ Desktop Mode before returning to Gaming Mode. The plugin does not change them.
 
 ## Build
 
-Use Node.js 20+ with npm and Python 3.10+:
+Use Node.js 22.13+ with npm and Python 3.10+:
 
 ```sh
 npm ci
@@ -47,11 +47,59 @@ These packages are not shipped in the plugin archive; avoid building untrusted
 source trees. `npm audit --omit=dev` reports no runtime dependency advisories
 for the committed lockfile at creation time.
 
+## Development releases
+
+Every push to `main` runs `.github/workflows/development-release.yml`, which
+tests the backend, type-checks and builds the frontend, verifies the ZIP, then
+publishes it on the [GitHub Releases page](https://github.com/Polgonite/decky-wireguard/releases).
+All releases are marked **prerelease**, not stable or latest.
+
+Each build gets a version such as `0.1.0-dev.123456789.1.shaabcdef0`, containing
+the workflow run ID, attempt number, and short commit SHA. Reruns create distinct
+releases instead of overwriting previous assets. That version is embedded in the
+packaged `package.json` and ZIP filename; source versions are not committed back.
+Releases target the exact pushed commit. Pre-commit checks run in the development
+container on pull requests and pushes; a failed check blocks publication.
+Runs are not canceled or grouped by a
+concurrency limit, so each push can publish its own build after successful checks.
+
+The workflow uses the automatic `GITHUB_TOKEN` with `contents: write`; no
+additional secret is required. Repository or organization policies must allow
+GitHub Actions to create releases.
+
+## Development container and pre-commit
+
+Open the repository in VS Code and select **Dev Containers: Reopen in Container**.
+The container includes Node.js 22, Python 3, pinned pre-commit and Ruff versions,
+actionlint, and ShellCheck. Creation installs npm dependencies and the Git
+pre-commit hook. Run commits from inside the container so the hook can find its
+tools.
+
+Inside the container:
+
+```sh
+pre-commit run --all-files
+npm run package
+```
+
+The hooks lint Python with Ruff, lint JavaScript/TypeScript with ESLint, check
+frontend types, run backend tests, and validate Actions workflows (including
+embedded shell) with actionlint/ShellCheck. The same container and hook command
+run in CI before development releases can publish.
+
+For terminal-only development, install the Dev Container CLI and use:
+
+```sh
+devcontainer up --workspace-folder .
+devcontainer exec --workspace-folder . pre-commit run --all-files
+```
+
 ## Install on Steam Deck
 
 1. Enable Developer Mode in Decky Loader settings.
 2. Use Decky's **Install Plugin from ZIP File** developer option and select the
-   generated archive copied to your Deck. Approve installation only if you trust
+   downloaded development release ZIP or generated archive copied to your Deck.
+   Approve installation only if you trust
    the code: the backend requests root privileges to control NetworkManager.
 3. Open **WireGuard** in the Decky quick-access panel.
 
