@@ -7,6 +7,7 @@ NetworkManager WireGuard profiles** from Steam Deck Gaming Mode.
 
 - Steam Deck with Decky Loader (current stable, supporting `@decky/api` and API v1).
 - NetworkManager running, with `nmcli` available to the Decky backend.
+- `wg` from `wireguard-tools` available to the backend for handshake status.
 - At least one native NetworkManager WireGuard profile, with its keys already
   saved. Connections requiring an interactive password prompt are not supported.
 
@@ -158,13 +159,26 @@ directory), then restart Decky Loader.
   used. Missing tools, authorization failures, and NetworkManager errors appear
   in the panel. Actions have a 30-second NetworkManager wait limit; if an action
   times out, refresh before retrying because NetworkManager may still complete it.
-- **Connected** means NetworkManager activated the interface, not that a
-  WireGuard peer completed a handshake or that traffic is protected. The status
-  circle is green for an activated interface and gray for deactivated,
-  transitional, unknown, or unavailable status. The plugin cannot reliably
-  distinguish peer failure or internet availability, so it does not display
-  red or yellow connectivity states. Routing, DNS, allowed IPs, and kill-switch
-  behavior belong to the imported profile.
+- The status circle is **gray** when deactivated, **gently pulsing yellow**
+  while waiting for a peer handshake, **green** once any peer completes a
+  handshake since activation, and **red** if none is observed within 30 seconds.
+  A late handshake changes red to green. Green stays until deactivation; it
+  does not indicate ongoing peer health, internet access, or protected routing.
+  Pulsing is disabled when reduced motion is requested.
+- Handshakes are read with `wg show <interface> latest-handshakes`, without
+  reading private keys. Each NetworkManager active-connection path identifies
+  an activation, so reconnecting resets status even between refreshes. The
+  timeout starts when the plugin requests activation, or first observes an
+  external activation. For tunnels already active when the backend starts,
+  existing handshake timestamps are a baseline: a new handshake is required.
+  Closing and reopening the panel does not reset backend tracking.
+- WireGuard normally handshakes only when there is traffic (or a configured
+  persistent keepalive). The plugin does not generate traffic or change
+  keepalive settings, so an idle, otherwise working tunnel can turn red.
+  Missing `wg`, permission failures, and unreadable handshake data produce
+  gray/unavailable status with an error, not a red timeout, and do not prevent
+  disconnecting. Routing, DNS, allowed IPs, and kill-switch behavior belong to
+  the imported profile.
 - Multiple tunnels can be active. Connecting one does not disconnect others;
   overlapping routes may conflict.
 - The plugin does not import, edit, delete, or display configuration secrets. It
@@ -172,5 +186,5 @@ directory), then restart Decky Loader.
   connection-down behavior can temporarily inhibit autoconnect until reboot or
   another explicit activation. Unloading the plugin leaves tunnels as they are.
 
-Backend tests mock `nmcli`; they do not activate any host network connections.
+Backend tests mock `nmcli` and `wg`; they do not activate any host network connections.
 Real Steam Deck/Decky integration must be checked on the device.
