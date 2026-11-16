@@ -7,7 +7,7 @@ NetworkManager WireGuard profiles** from Steam Deck Gaming Mode.
 
 - Steam Deck with Decky Loader (current stable, supporting `@decky/api` and API v1).
 - NetworkManager running, with `nmcli` available to the Decky backend.
-- `systemctl` and `busctl` from systemd for plugin-managed startup readiness.
+- `systemctl` and `busctl` from systemd for startup readiness and the configuration editor.
   The internet readiness option requires NetworkManager's connectivity check
   to be configured and enabled.
 - `wg` from `wireguard-tools` available to the backend for handshake status.
@@ -157,14 +157,18 @@ directory), then restart Decky Loader.
   duplicate names are safe. Select a connection to open its management menu and
   connect or disconnect it; use Back to return to the list. The short UUID
   appears beside each status.
-- Select **Edit connection configuration** to change the NetworkManager profile's
-  properties, including WireGuard keys and peer options such as endpoints and
-  allowed IPs. Common options appear first in Interface/Peer configuration order,
-  with readable labels. **Show advanced**, above Save, reveals the remaining
-  NetworkManager properties and the option to add a property; hiding them preserves
-  any edits. Automatic connection is managed separately by the mutually
-  exclusive startup controls. The editor displays secret values; changes are
-  saved to the profile and take effect on the next connection activation.
+- Select **Edit configuration** to edit the profile laid out like a WireGuard
+  `.conf` file: **Interface** (private key with its derived public key, addresses,
+  DNS servers and search domains) followed by each **Peer** (public key, preshared
+  key, allowed IPs, endpoint, persistent keepalive). Peers can be added and
+  removed. **Show advanced**, above Save, reveals listen port, MTU, and the
+  remaining raw NetworkManager properties, including adding one; hiding them
+  preserves any edits. Interface and peer fields are read and saved through
+  NetworkManager's D-Bus API with `busctl`, because SteamOS's `nmcli` cannot edit
+  WireGuard peers; peer options this editor does not show are preserved.
+  Automatic connection is managed separately by the mutually exclusive startup
+  controls. The editor displays secret values; changes are validated before
+  anything is saved and take effect the next time the tunnel connects.
 - Every connection management page has two mutually exclusive startup checkboxes.
   **Connect during boot** sets NetworkManager's `connection.autoconnect` through
   `nmcli`; this can delay boot when the Deck is offline. **Connect after boot**
@@ -263,12 +267,13 @@ directory), then restart Decky Loader.
   the imported profile.
 - Multiple tunnels can be active. Connecting one does not disconnect others;
   overlapping routes may conflict.
-- The plugin does not import, delete, or display configuration secrets. Its only
-  saved NetworkManager edit is the startup autoconnect setting. NetworkManager's normal
+- The plugin does not import or delete profiles. Secrets are shown only in the
+  configuration editor, and profiles change only through that editor or the startup
+  autoconnect setting. NetworkManager's normal
   connection-down behavior can temporarily inhibit autoconnect until reboot or
   another explicit activation. Unloading the plugin leaves tunnels as they are.
 
-Backend tests mock `nmcli` and `wg`; they do not activate any host network connections.
+Backend tests mock `nmcli`, `busctl`, and `wg`; they do not activate any host network connections.
 `npm test` also exercises the frontend readiness monitor with mocked Steam APIs,
 including online/offline login, unfinished initialization, API errors, and unloading.
 Real Steam Deck/Decky integration must be checked on the device.
