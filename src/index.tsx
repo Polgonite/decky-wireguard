@@ -4,12 +4,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
 
 type ConnectionState = "connected" | "connecting" | "disconnecting" | "disconnected" | "unknown";
+type HandshakeState = "inactive" | "waiting" | "established" | "timeout" | "unknown";
 
 interface Profile {
   uuid: string;
   name: string;
   device: string;
   state: ConnectionState;
+  handshake: HandshakeState;
+  handshake_error: string | null;
 }
 
 type Result<T> = ({ success: true } & T) | { success: false; error: string };
@@ -25,20 +28,35 @@ const stateLabels: Record<ConnectionState, string> = {
   unknown: "Unknown state",
 };
 
-const stateColors: Record<ConnectionState, string> = {
-  connected: "#66c96b",
-  connecting: "#9b9b9b",
-  disconnecting: "#9b9b9b",
-  disconnected: "#9b9b9b",
+const handshakeLabels: Record<HandshakeState, string> = {
+  inactive: "Disconnected",
+  waiting: "Waiting for handshake...",
+  established: "Handshake completed",
+  timeout: "No handshake after 30 seconds",
+  unknown: "Handshake status unavailable",
+};
+
+const stateColors: Record<HandshakeState, string> = {
+  established: "#66c96b",
+  waiting: "#e8c547",
+  timeout: "#e56b6b",
+  inactive: "#9b9b9b",
   unknown: "#9b9b9b",
 };
 
-function StatusCircle({ state }: { state: ConnectionState }) {
+function profileLabel(profile: Profile): string {
+  return profile.state === "connected" || profile.handshake === "timeout"
+    ? handshakeLabels[profile.handshake] : stateLabels[profile.state];
+}
+
+function StatusCircle({ state }: { state: HandshakeState }) {
   return (
     <span
       aria-hidden="true"
+      className="decky-wireguard-status"
       style={{
         backgroundColor: stateColors[state],
+        animation: state === "waiting" ? "decky-wireguard-pulse 1.6s ease-in-out infinite" : undefined,
         borderRadius: "50%",
         flexShrink: 0,
         height: 12,
@@ -72,7 +90,8 @@ function Content() {
           const next = result.profiles[index];
           return next !== undefined && profile.uuid === next.uuid &&
             profile.name === next.name && profile.device === next.device &&
-            profile.state === next.state;
+            profile.state === next.state && profile.handshake === next.handshake &&
+            profile.handshake_error === next.handshake_error;
         }) ? previous : result.profiles,
       );
     }
@@ -141,10 +160,27 @@ function Content() {
   const transitioning = selectedProfile?.state === "connecting" || selectedProfile?.state === "disconnecting";
   const selectedStatus = error ? "Status unavailable" : pendingUuid === selectedProfile?.uuid
     ? "Applying change..."
-    : selectedProfile ? stateLabels[selectedProfile.state] : "";
+    : selectedProfile ? profileLabel(selectedProfile) : "";
+
+  const indicatorState = (profile: Profile): HandshakeState => {
+    if (error) return "unknown";
+    if (pendingUuid === profile.uuid) {
+      return profile.state === "disconnected" ? "waiting" : "inactive";
+    }
+    return profile.handshake;
+  };
 
   return (
     <PanelSection title={selectedUuid === null ? "WireGuard connections" : "Manage connection"}>
+      <style>{`
+        @keyframes decky-wireguard-pulse {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.65; transform: scale(0.9); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .decky-wireguard-status { animation: none !important; }
+        }
+      `}</style>
       <PanelSectionRow>
         <ButtonItem
           layout="below"
@@ -174,12 +210,15 @@ function Content() {
         <PanelSectionRow key={profile.uuid}>
           <ButtonItem layout="below" onClick={() => setSelectedUuid(profile.uuid)}>
             <span style={{ display: "flex", alignItems: "center", gap: 10, width: "100%" }}>
-              <StatusCircle state={error || pendingUuid === profile.uuid ? "unknown" : profile.state} />
+              <StatusCircle state={indicatorState(profile)} />
               <span style={{ flex: 1, textAlign: "left", overflowWrap: "anywhere" }}>
                 {profile.name}
                 <span style={{ display: "block", fontSize: "0.8em", opacity: 0.75 }}>
                   {error ? "Status unavailable" : pendingUuid === profile.uuid
-                    ? "Applying change..." : stateLabels[profile.state]} · {profile.uuid.slice(0, 8)}
+                    ? "Applying change..." : profileLabel(profile)} · {profile.uuid.slice(0, 8)}
+                  {profile.handshake_error && <span role="alert" style={{ display: "block" }}>
+                    {profile.handshake_error}
+                  </span>}
                 </span>
               </span>
               <FaChevronRight aria-hidden="true" />
@@ -194,8 +233,11 @@ function Content() {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            label={selectedProfile.name}
-            description={`${selectedStatus}${selectedProfile.device ? ` on ${selectedProfile.device}` : ""} \u00b7 ${selectedProfile.uuid.slice(0, 8)}`}
+            label={<span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <StatusCircle state={indicatorState(selectedProfile)} />
+              {selectedProfile.name}
+            </span>}
+            description={`${selectedStatus}${selectedProfile.device ? ` on ${selectedProfile.device}` : ""} \u00b7 ${selectedProfile.uuid.slice(0, 8)}${selectedProfile.handshake_error ? ` \u00b7 ${selectedProfile.handshake_error}` : ""}`}
             disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
             onClick={() => void changeConnection(selectedProfile)}
           >
@@ -209,8 +251,9 @@ function Content() {
       )}
       <PanelSectionRow>
         <div style={{ fontSize: "0.85em", opacity: 0.75, paddingTop: 8 }}>
-          Status comes from NetworkManager and refreshes every 5 seconds while this panel is open.
-          Connected does not verify a peer handshake or internet access.
+          Status comes from NetworkManager and WireGuard and refreshes every 5 seconds while this panel is open.
+          Yellow waits up to 30 seconds for a peer handshake; red means none was observed.
+          Green confirms a handshake since activation, not internet access or ongoing peer health.
         </div>
       </PanelSectionRow>
     </PanelSection>
