@@ -157,8 +157,8 @@ directory), then restart Decky Loader.
   duplicate names are safe. Select a connection to open its management menu and
   connect or disconnect it; use Back to return to the list. The short UUID
   appears beside each status.
-- Select **Edit configuration** to edit the profile laid out like a WireGuard
-  `.conf` file: **Interface** (private key with its derived public key, addresses,
+- Select **Edit configuration** to open a full-screen editor that lays out the
+  profile like a WireGuard `.conf` file: **Interface** (private key with its derived public key, addresses,
   DNS servers and search domains) followed by each **Peer** (public key, preshared
   key, allowed IPs, endpoint, persistent keepalive). Peers can be added and
   removed. **Show advanced**, above Save, reveals listen port, MTU, and the
@@ -168,7 +168,8 @@ directory), then restart Decky Loader.
   WireGuard peers; peer options this editor does not show are preserved.
   Automatic connection is managed separately by the mutually exclusive startup
   controls. The editor displays secret values; changes are validated before
-  anything is saved and take effect the next time the tunnel connects.
+  anything is saved and take effect the next time the tunnel connects. Leaving
+  the editor with Back or the B button asks before discarding unsaved changes.
 - Every connection management page has two mutually exclusive startup checkboxes.
   **Connect during boot** sets NetworkManager's `connection.autoconnect` through
   `nmcli`; this can delay boot when the Deck is offline. **Connect after boot**
