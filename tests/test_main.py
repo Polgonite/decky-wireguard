@@ -908,6 +908,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         self.settings = {
             "connection": {
                 "id": v("s", "Home"), "uuid": v("s", HOME), "type": v("s", "wireguard"),
+                "interface-name": v("s", "wg0"),
                 "autoconnect": v("b", False), "timestamp": v("t", 1700000000),
             },
             "wireguard": {
@@ -1281,6 +1282,215 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.plugin.create_connection_config({**config, **changes}, advanced)
             self.assertFalse(result["success"])
             bus.assert_not_called()
+
+    async def test_unchanged_required_fields_and_secrets_are_validated_before_advanced_saves(self):
+        stored = copy.deepcopy(self.settings)
+        secrets = copy.deepcopy(self.secrets)
+        noncanonical = PRIVATE[:-2] + "B="
+        for field, value, message in [
+            ("name", "", "Name is required"),
+            ("private-key", "", "Private key is required"),
+            ("private-key", noncanonical, "Private key must be a 44-character"),
+            ("public-key", "", "Peer 1 public key is required"),
+            ("preshared-key", noncanonical, "Peer 1 preshared key must be a 44-character"),
+        ]:
+            with self.subTest(field=field, message=message):
+                self.settings = copy.deepcopy(stored)
+                self.secrets = copy.deepcopy(secrets)
+                if field == "name":
+                    self.settings["connection"]["id"] = v("s", value)
+                elif field == "private-key":
+                    self.secrets["wireguard"]["private-key"] = v("s", value)
+                elif field == "public-key":
+                    self.settings["wireguard"]["peers"]["data"][0]["public-key"] = v("s", value)
+                else:
+                    self.secrets["wireguard"]["peers"]["data"][0]["preshared-key"] = v("s", value)
+                config = await self.config()
+                self.calls.clear()
+                with self.assertLogs("decky-wireguard"):
+                    result = await self.plugin.set_connection_config(
+                        HOME, config, [{"key": "ipv4.dns-priority", "value": "-50"}],
+                    )
+                self.assertFalse(result["success"])
+                self.assertIn(message, result["error"])
+                self.assertNotIn(noncanonical, result["error"])
+                self.assertNotIn("nmcli modify", self.calls)
+                self.assertNotIn("Update", self.calls)
+
+    async def test_incompatible_advanced_settings_are_rejected_before_any_write(self):
+        config = await self.config()
+        cases = [
+            ("ipv4.method", "auto", "WireGuard supports only manual, disabled"),
+            ("ipv4.method", "shared", "WireGuard supports only manual, disabled"),
+            ("ipv4.method", "link-local", "WireGuard supports only manual, disabled"),
+            ("ipv4.method", "", "WireGuard supports only manual, disabled"),
+            ("ipv4.method", "disabled", "cannot be combined with static addresses"),
+            ("ipv6.method", "auto", "WireGuard supports only"),
+            ("ipv6.method", "shared", "WireGuard supports only"),
+            ("ipv6.method", "manual", "requires at least one IPv6 address"),
+            ("connection.interface-name", "", "Interface name must be"),
+            ("connection.interface-name", "wg" * 8, "Interface name must be"),
+            ("connection.interface-name", "\u00e9" * 8, "Interface name must be"),
+            ("connection.interface-name", "..", "Interface name must be"),
+            ("connection.interface-name", " wg0", "Interface name must be"),
+            ("connection.interface-name", "wg/0", "Interface name must be"),
+            ("connection.interface-name", "wg:0", "Interface name must be"),
+            ("wireguard.fwmark", "-1", "Firewall mark must be"),
+            ("wireguard.fwmark", "4294967296", "Firewall mark must be"),
+            ("wireguard.fwmark", "0x100000000", "Firewall mark must be"),
+            ("wireguard.fwmark", "0x", "Firewall mark must be"),
+            ("connection.type", "ethernet", "cannot be overridden"),
+            ("connection.uuid", WORK, "cannot be overridden"),
+            ("connection.t", "ethernet", "full property name"),
+            ("con.uuid", WORK, "full property name"),
+            ("ip4.method", "auto", "full property name"),
+            ("wireguard.f", "0x100000000", "full property name"),
+        ]
+        for key, value, message in cases:
+            with self.subTest(key=key, value=value):
+                self.calls.clear()
+                with self.assertLogs("decky-wireguard"):
+                    result = await self.plugin.set_connection_config(
+                        HOME, config, [{"key": key, "value": value}],
+                    )
+                self.assertFalse(result["success"])
+                self.assertIn(message, result["error"])
+                self.assertNotIn("nmcli modify", self.calls)
+                self.assertNotIn("Update", self.calls)
+
+    async def test_format_failures_block_both_creating_and_updating_profiles(self):
+        valid = await self.config()
+        valid["peers"][0]["original_public_key"] = None
+        cases = [
+            ({"name": "Bad\0name"}, {}, "Name is required"),
+            ({"private_key": PRIVATE + "="}, {}, "Private key must be"),
+            ({"addresses": "fd00::2/129"}, {}, "Address:"),
+            ({"addresses": "fe80::2%wg0/64"}, {}, "Address:"),
+            ({"dns": "999.1.1.1"}, {}, "DNS:"),
+            ({"dns": "bad/domain"}, {}, "DNS:"),
+            ({"listen_port": "65536"}, {}, "Listen port must be"),
+            ({"listen_port": "9" * 16000}, {}, "Listen port must be"),
+            ({"mtu": "4294967296"}, {}, "MTU must be"),
+            ({}, {"public_key": PEER[:-2] + "B="}, "Peer 1 public key must be"),
+            ({}, {"preshared_key": "secret-but-not-a-key"}, "Peer 1 preshared key must be"),
+            ({}, {"allowed_ips": "0.0.0.0/33"}, "Peer 1 allowed IPs:"),
+            ({}, {"allowed_ips": "fe80::%wg0/64"}, "Peer 1 allowed IPs:"),
+            ({}, {"endpoint": "999.1.1.1:51820"}, "Peer 1 must be host:port"),
+            ({}, {"endpoint": "[fd00::1]:65536"}, "Peer 1 must be host:port"),
+            ({}, {"endpoint": "vpn.example.com:0"}, "Peer 1 must be host:port"),
+            ({}, {"endpoint": "vpn.example.com:" + "9" * 15000}, "Peer 1 must be host:port"),
+            ({}, {"persistent_keepalive": "65536"}, "persistent keepalive must be"),
+            ({}, {"persistent_keepalive": "1.5"}, "persistent keepalive must be"),
+            ({}, {"persistent_keepalive": "\u0662\u0665"}, "persistent keepalive must be"),
+        ]
+        for index, (changes, peer_changes, message) in enumerate(cases):
+            for uuid in (None, HOME):
+                with self.subTest(case=index, creating=uuid is None):
+                    config = {**valid, **changes, "peers": [{**valid["peers"][0], **peer_changes}]}
+                    self.calls.clear()
+                    with self.assertLogs("decky-wireguard"):
+                        result = await self.plugin.set_connection_config(uuid, config, [])
+                    self.assertFalse(result["success"])
+                    self.assertIn(message, result["error"])
+                    self.assertNotIn("secret-but-not-a-key", result["error"])
+                    self.assertNotIn("AddConnectionUnsaved", self.calls)
+                    self.assertNotIn("nmcli modify", self.calls)
+                    self.assertNotIn("Update", self.calls)
+
+    async def test_valid_boundaries_and_server_style_optional_omissions_are_accepted(self):
+        valid = await self.config()
+        for port, keepalive, mtu in [("0", "off", "0"), ("65535", "65535", "4294967295")]:
+            with self.subTest(port=port, keepalive=keepalive, mtu=mtu):
+                config = {
+                    **valid, "listen_port": port, "mtu": mtu,
+                    "peers": [{
+                        **valid["peers"][0], "allowed_ips": "", "endpoint": "",
+                        "preshared_key": "", "persistent_keepalive": keepalive,
+                    }],
+                }
+                result = await self.plugin.set_connection_config(HOME, config, [])
+                self.assertTrue(result["success"], result)
+                update = self.updates[-1]
+                self.assertEqual(update["wireguard"]["listen-port"], v("u", int(port)))
+                self.assertEqual(update["wireguard"]["mtu"], v("u", int(mtu)))
+                peer = update["wireguard"]["peers"]["data"][0]
+                self.assertEqual(peer["persistent-keepalive"], v("u", 0 if keepalive == "off" else 65535))
+                self.assertEqual(peer["allowed-ips"], v("as", []))
+                self.assertNotIn("endpoint", peer)
+        result = await self.plugin.set_connection_config(
+            HOME, {**valid, "addresses": "", "dns": "", "peers": []}, [],
+        )
+        self.assertTrue(result["success"], result)
+
+    async def test_supported_advanced_values_and_firewall_mark_formats_are_accepted(self):
+        config = await self.config()
+        for key, value, normalized in [
+            ("connection.interface-name", "a" * 15, "a" * 15),
+            ("connection.interface-name", "\u00e9" * 7 + "a", "\u00e9" * 7 + "a"),
+            ("ipv4.method", "manual", "manual"),
+            ("ipv6.method", "disabled", "disabled"),
+            ("ipv6.method", "ignore", "ignore"),
+            ("ipv6.method", "link-local", "link-local"),
+            ("wireguard.fwmark", "off", "0"),
+            ("wireguard.fwmark", "0xffffffff", "4294967295"),
+            ("wireguard.fwmark", "000051820", "51820"),
+        ]:
+            with (
+                self.subTest(key=key, value=value),
+                patch("main._nmcli") as nmcli,
+                patch.object(self.plugin, "_profile", return_value={"uuid": HOME}),
+            ):
+                result = await self.plugin.set_connection_config(
+                    HOME, config, [{"key": key, "value": value}],
+                )
+                self.assertTrue(result["success"], result)
+                nmcli.assert_awaited_once_with(
+                    "connection", "modify", "uuid", HOME, key, normalized,
+                )
+
+    async def test_existing_dns_over_tls_settings_remain_editable(self):
+        self.settings["ipv4"]["dns-data"] = v("as", ["10.0.0.1#dns.example"])
+        config = await self.config()
+        config["name"] = "Renamed"
+        result = await self.plugin.set_connection_config(HOME, config, [])
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self.updates[-1]["ipv4"]["dns-data"], v("as", ["10.0.0.1#dns.example"]))
+        self.assertNotIn("dns", self.updates[-1]["ipv4"])
+
+    async def test_root_dns_routing_and_ip_prefix_boundaries_are_accepted(self):
+        config = await self.config()
+        config.update({
+            "addresses": "10.0.0.2/0, fd00::2/0, fd00::3/128",
+            "dns": "10.0.0.1, ~., ~example.com, .",
+        })
+        result = await self.plugin.set_connection_config(HOME, config, [])
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self.updates[-1]["ipv4"]["dns-search"], v("as", [
+            "~.", "~example.com", ".",
+        ]))
+        self.assertEqual(
+            self.updates[-1]["ipv4"]["address-data"]["data"][0]["prefix"], v("u", 0),
+        )
+        self.assertEqual(
+            self.updates[-1]["ipv6"]["address-data"]["data"][-1]["prefix"], v("u", 128),
+        )
+
+    async def test_name_and_private_key_are_enough_to_create_a_profile(self):
+        config = {
+            "name": "Private VPN \u0394", "private_key": PRIVATE, "addresses": "",
+            "dns": "", "listen_port": "", "mtu": "", "peers": [],
+        }
+        with patch("main._busctl", side_effect=[[CONNECTION_PATH], []]) as bus:
+            result = await self.plugin.create_connection_config(config, [])
+        self.assertTrue(result["success"], result)
+        added = bus.await_args_list[0].args
+        self.assertEqual(added[2], "AddConnectionUnsaved")
+        settings = decode_bus(added[3], list(added[4:]))
+        self.assertEqual(settings["connection"]["id"], v("s", config["name"]))
+        self.assertEqual(settings["wireguard"]["private-key"], v("s", PRIVATE))
+        self.assertEqual(settings["ipv4"]["method"], v("s", "disabled"))
+        self.assertEqual(settings["ipv6"]["method"], v("s", "disabled"))
+        self.assertEqual(bus.await_args_list[1].args[2], "Update")
 
     def test_bus_encoding_uses_busctl_container_syntax(self):
         self.assertEqual(

@@ -64,18 +64,21 @@ export function ConnectionEditor({ draft, onChange, disabled }: {
       <PanelSectionRow>
         <div style={{ fontSize: "0.85em", opacity: 0.8, padding: "8px 0" }}>
           Fields match the [Interface] and [Peer] sections of a WireGuard .conf file.
-          Separate multiple values with commas.
+          Separate multiple values with commas. A name and private key are required,
+          plus a public key for every peer. Save validates the entire configuration,
+          including unchanged fields.
         </div>
       </PanelSectionRow>
-      {configField("name", "Name", "Shown in the connection list.")}
+      {configField("name", "Name", "Required. Connection label; spaces and Unicode are allowed.")}
       <Heading>Interface</Heading>
       {configField("private_key", "Private key", (
         <span style={{ overflowWrap: "anywhere" }}>
-          {publicKey ? `Public key: ${publicKey}` : "This device's key. Its public key is shown here once valid."}
+          {publicKey ? `Public key: ${publicKey}`
+            : "Required. A 44-character base64 WireGuard key (32 bytes, ending in =)."}
         </span>
       ), true)}
-      {configField("addresses", "Address", "This device's tunnel IPs, e.g. 10.0.0.2/32, fd00::2/128.")}
-      {configField("dns", "DNS", "Optional DNS servers and search domains used while connected.")}
+      {configField("addresses", "Address", "Optional tunnel IPs: 10.0.0.2/32, fd00::2/128. Without a prefix, /32 or /128 is used.")}
+      {configField("dns", "DNS", "Optional DNS IPs and search domains. Prefix a routing domain with ~; ~. routes all DNS through the tunnel.")}
       {config.peers.map((peer, index) => (
         <div key={peer.id}>
           <Heading>
@@ -84,16 +87,16 @@ export function ConnectionEditor({ draft, onChange, disabled }: {
           </Heading>
           {[
             field("Public key", peer.public_key, (value) => setPeerField(peer.id, "public_key", value),
-              "The peer's (server's) public key."),
+              "Required for this peer. A 44-character base64 WireGuard key (32 bytes, ending in =)."),
             field("Preshared key", peer.preshared_key, (value) => setPeerField(peer.id, "preshared_key", value),
-              "Optional extra shared secret.", true),
+              "Optional. Same 44-character base64 format as the private key.", true),
             field("Allowed IPs", peer.allowed_ips, (value) => setPeerField(peer.id, "allowed_ips", value),
-              "Traffic sent through this peer. 0.0.0.0/0, ::/0 sends everything."),
+              "Optional IPs or CIDR networks. 0.0.0.0/0, ::/0 sends everything; empty allows no peer traffic."),
             field("Endpoint", peer.endpoint, (value) => setPeerField(peer.id, "endpoint", value),
-              "Server address and port, e.g. vpn.example.com:51820."),
+              "Optional hostname:port, IPv4:port or [IPv6]:port; port 1-65535. An initiating client normally needs one."),
             field("Persistent keepalive", peer.persistent_keepalive,
               (value) => setPeerField(peer.id, "persistent_keepalive", value),
-              "Seconds, e.g. 25 to keep NAT open. Empty turns it off."),
+              "Whole seconds, 1-65535. Empty, 0 or off disables it; 25 can keep NAT open."),
           ]}
           <PanelSectionRow>
             <ButtonItem
@@ -125,8 +128,8 @@ export function ConnectionEditor({ draft, onChange, disabled }: {
       {showAdvanced && (
         <>
           <Heading>Advanced interface</Heading>
-          {configField("listen_port", "Listen port", "Local UDP port. Empty picks one automatically.")}
-          {configField("mtu", "MTU", "Maximum packet size. Empty picks automatically.")}
+          {configField("listen_port", "Listen port", "Whole UDP port, 1-65535. Empty or 0 picks one automatically.")}
+          {configField("mtu", "MTU", "Maximum packet size as an unsigned 32-bit integer. Empty or 0 picks automatically; normally 1420.")}
           <Heading>NetworkManager properties</Heading>
           <PanelSectionRow>
             <div style={{ fontSize: "0.85em", opacity: 0.8, padding: "8px 0" }}>

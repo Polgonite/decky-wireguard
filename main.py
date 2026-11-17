@@ -51,6 +51,7 @@ STRUCTURED_PROPERTIES = frozenset({
     "wireguard.mtu", "wireguard.listen-port", "ipv4.addresses", "ipv6.addresses",
     "ipv4.dns", "ipv6.dns", "ipv4.dns-search", "ipv6.dns-search",
 })
+IDENTITY_PROPERTIES = frozenset({"connection.uuid", "connection.type"})
 Settings = dict[str, dict[str, dict[str, object]]]
 
 
@@ -420,7 +421,8 @@ def _wireguard_key(text: str, label: str, required: bool) -> str:
             raise NetworkManagerError(f"{label} is required.")
         return ""
     try:
-        valid = len(base64.b64decode(key, validate=True)) == 32
+        decoded = base64.b64decode(key, validate=True)
+        valid = len(decoded) == 32 and base64.b64encode(decoded).decode("ascii") == key
     except ValueError:
         valid = False
     if not valid:
@@ -428,13 +430,28 @@ def _wireguard_key(text: str, label: str, required: bool) -> str:
     return key
 
 
-def _number(text: str, label: str, maximum: int, off: bool = False) -> int:
+def _number(
+    text: str, label: str, maximum: int, off: bool = False, hexadecimal: bool = False,
+) -> int:
     value = text.strip()
     if not value or (off and value.lower() == "off"):
         return 0
-    if not value.isascii() or not value.isdecimal() or int(value) > maximum:
-        raise NetworkManagerError(f"{label} must be a whole number from 0 to {maximum}, or empty.")
-    return int(value)
+    base = 16 if hexadecimal and value.lower().startswith("0x") else 10
+    digits = value[2:] if base == 16 else value
+    pattern = r"[0-9a-fA-F]+" if base == 16 else r"[0-9]+"
+    significant = digits.lstrip("0") or "0"
+    # Bound conversion so long inputs cannot hit Python's integer-string limit.
+    if (
+        not re.fullmatch(pattern, digits)
+        or len(significant) > len(str(maximum))
+        or int(significant, base) > maximum
+    ):
+        formats = " (decimal or 0x hexadecimal)" if hexadecimal else ""
+        disabled = ', "off"' if off else ""
+        raise NetworkManagerError(
+            f"{label} must be a whole number from 0 to {maximum}{formats}{disabled}, or empty."
+        )
+    return int(significant, base)
 
 
 def _endpoint(text: str, label: str) -> str:
@@ -442,16 +459,22 @@ def _endpoint(text: str, label: str) -> str:
     if not endpoint:
         return ""
     host, separator, port = endpoint.rpartition(":")
-    valid = bool(separator and host) and port.isascii() and port.isdecimal() and (
-        1 <= int(port) <= 65535
-    )
+    valid = bool(separator and host) and bool(re.fullmatch(r"[0-9]+", port))
+    if valid:
+        try:
+            valid = 1 <= _number(port, f"{label} endpoint port", 65535)
+        except NetworkManagerError:
+            valid = False
     if valid and host.startswith("["):
         try:
             valid = host.endswith("]") and ip_address(host[1:-1]).version == 6
         except ValueError:
             valid = False
     elif valid:
-        valid = ":" not in host and _hostname(host)
+        try:
+            valid = ip_address(host).version == 4
+        except ValueError:
+            valid = ":" not in host and not re.fullmatch(r"[0-9.]+", host) and _hostname(host)
     if not valid:
         raise NetworkManagerError(
             f"{label} must be host:port, for example vpn.example.com:51820 or [2001:db8::1]:51820."
@@ -482,6 +505,8 @@ def _apply_peers(
         allowed: list[str] = []
         for entry in _entries(str(peer["allowed_ips"])):
             try:
+                if "%" in entry:
+                    raise ValueError("Scoped addresses are not allowed in networks")
                 allowed.append(str(ip_network(entry, strict=False)))
             except ValueError as error:
                 raise NetworkManagerError(
@@ -510,46 +535,148 @@ def _apply_peers(
     return result
 
 
-def _apply_wireguard_config(settings: Settings, config: dict[str, object]) -> bool:
-    """Apply changed editor fields to NetworkManager settings; return whether any changed."""
+def _config_addresses(text: str) -> dict[int, list[dict[str, object]]]:
+    addresses: dict[int, list[dict[str, object]]] = {4: [], 6: []}
+    for entry in _entries(text):
+        try:
+            if "%" in entry:
+                raise ValueError("Scoped addresses are not allowed on an interface")
+            interface = ip_interface(entry)
+        except ValueError as error:
+            raise NetworkManagerError(
+                f"Address: {entry!r} is not an IPv4 or IPv6 address with an optional CIDR prefix "
+                "(0-32 for IPv4, 0-128 for IPv6)."
+            ) from error
+        addresses[interface.version].append({
+            "address": _variant("s", str(interface.ip)),
+            "prefix": _variant("u", interface.network.prefixlen),
+        })
+    return addresses
+
+
+def _config_dns(text: str) -> tuple[dict[int, list[str]], list[str]]:
+    servers: dict[int, list[str]] = {4: [], 6: []}
+    domains: list[str] = []
+    for entry in _entries(text):
+        address, marker, server_name = entry.partition("#")
+        try:
+            server = ip_address(address)
+        except ValueError:
+            domain = entry.removeprefix("~")
+            if (
+                marker or (domain != "." and re.fullmatch(r"[0-9.]+", domain))
+                or (not _hostname(domain) and entry not in (".", "~", "~."))
+            ):
+                raise NetworkManagerError(
+                    f"DNS: {entry!r} is not an IP address or search domain."
+                ) from None
+            domains.append(entry)
+        else:
+            if "%" in address or (marker and not _hostname(server_name)):
+                raise NetworkManagerError("DNS: invalid server address or DNS-over-TLS server name.")
+            servers[server.version].append(entry)
+    return servers, domains
+
+
+def _validate_wireguard_settings(
+    settings: Settings, advanced: list[dict[str, str]],
+) -> None:
+    updates = {update["key"]: update["value"] for update in advanced}
+    name = updates.get(
+        "connection.interface-name",
+        str(_data(settings.get("connection", {}), "interface-name", "")),
+    )
+    try:
+        name_length = len(name.encode("utf-8"))
+    except UnicodeError as error:
+        raise NetworkManagerError("Interface name must be valid UTF-8.") from error
+    if (
+        not name or name_length > 15 or name in (".", "..")
+        or any(character.isspace() or character in "/:\0" for character in name)
+    ):
+        raise NetworkManagerError(
+            "Interface name must be 1-15 UTF-8 bytes, not '.' or '..', "
+            "and contain no whitespace, slash, colon or NUL."
+        )
+    for version, supported in (
+        (4, ("manual", "disabled")),
+        (6, ("manual", "disabled", "ignore", "link-local")),
+    ):
+        family = f"ipv{version}"
+        values = settings.get(family, {})
+        method = updates.get(f"{family}.method", _data(values, "method", "disabled"))
+        if method not in supported:
+            raise NetworkManagerError(
+                f"{family}.method: WireGuard supports only {', '.join(supported)}."
+            )
+        addresses = _data(values, "address-data", [])
+        if method == "manual" and not addresses:
+            raise NetworkManagerError(
+                f"{family}.method: manual requires at least one IPv{version} address in Address."
+            )
+        if method in NO_ADDRESS_METHODS:
+            if addresses:
+                raise NetworkManagerError(
+                    f"{family}.method: {method} cannot be combined with static addresses."
+                )
+            if _dns_servers(values, version) or _data(values, "dns-search", []):
+                raise NetworkManagerError(
+                    f"DNS: IPv{version} DNS servers need an IPv{version} tunnel address in Address. "
+                    f"Remove DNS/search domains or use {family}.method manual with an address."
+                )
+
+
+def _validate_advanced_names(keys: list[str]) -> None:
+    guarded = STRUCTURED_PROPERTIES | IDENTITY_PROPERTIES | {
+        "connection.interface-name", "ipv4.method", "ipv6.method", "wireguard.fwmark",
+    }
+    for key in keys:
+        if key in guarded:
+            continue
+        group, _, field = key.partition(".")
+        group = {"ip4": "ipv4", "ip6": "ipv6"}.get(group, group)
+        for full in sorted(guarded):
+            full_group, _, full_field = full.partition(".")
+            if full_group.startswith(group) and full_field.startswith(field):
+                raise NetworkManagerError(
+                    f"Use the full property name {full!r} instead of the abbreviation {key!r}."
+                )
+
+
+def _apply_wireguard_config(
+    settings: Settings, config: dict[str, object], advanced: list[dict[str, str]] | None = None,
+) -> bool:
+    """Validate the entire draft, but apply only changed fields to preserve other settings."""
     current = _wireguard_config(settings)
     changed = {field for field in CONFIG_FIELDS if config[field] != current[field]}
-    if not changed:
-        return False
+    name = str(config["name"]).strip()
+    if not name or "\0" in name:
+        raise NetworkManagerError("Name is required and must not contain NUL characters.")
+    try:
+        name.encode("utf-8")
+    except UnicodeError as error:
+        raise NetworkManagerError("Name must be valid UTF-8.") from error
+    private_key = _wireguard_key(str(config["private_key"]), "Private key", True)
+    mtu = _number(str(config["mtu"]), "MTU", 2**32 - 1)
+    port = _number(str(config["listen_port"]), "Listen port", 65535)
+    addresses = _config_addresses(str(config["addresses"]))
+    servers, domains = _config_dns(str(config["dns"]))
     connection = settings.setdefault("connection", {})
     wireguard = settings.setdefault("wireguard", {})
     families = {4: settings.setdefault("ipv4", {}), 6: settings.setdefault("ipv6", {})}
+    peers = _apply_peers(wireguard, config["peers"])
     if "name" in changed:
-        name = str(config["name"]).strip()
-        if not name:
-            raise NetworkManagerError("Name is required.")
         connection["id"] = _variant("s", name)
     if "private_key" in changed:
-        wireguard["private-key"] = _variant(
-            "s", _wireguard_key(str(config["private_key"]), "Private key", True),
-        )
+        wireguard["private-key"] = _variant("s", private_key)
         wireguard["private-key-flags"] = _variant("u", 0)
     if "mtu" in changed:
-        wireguard["mtu"] = _variant("u", _number(str(config["mtu"]), "MTU", 65535))
+        wireguard["mtu"] = _variant("u", mtu)
     if "listen_port" in changed:
-        wireguard["listen-port"] = _variant(
-            "u", _number(str(config["listen_port"]), "Listen port", 65535),
-        )
+        wireguard["listen-port"] = _variant("u", port)
     if "peers" in changed:
-        wireguard["peers"] = _variant("aa{sv}", _apply_peers(wireguard, config["peers"]))
+        wireguard["peers"] = _variant("aa{sv}", peers)
     if "addresses" in changed:
-        addresses: dict[int, list[dict[str, object]]] = {4: [], 6: []}
-        for entry in _entries(str(config["addresses"])):
-            try:
-                interface = ip_interface(entry)
-            except ValueError as error:
-                raise NetworkManagerError(
-                    f"Address: {entry!r} is not an IP address with an optional prefix."
-                ) from error
-            addresses[interface.version].append({
-                "address": _variant("s", str(interface.ip)),
-                "prefix": _variant("u", interface.network.prefixlen),
-            })
         for version, values in families.items():
             values["address-data"] = _variant("aa{sv}", addresses[version])
             method = _data(values, "method", None)
@@ -559,28 +686,21 @@ def _apply_wireguard_config(settings: Settings, config: dict[str, object]) -> bo
                 values["method"] = _variant("s", "disabled")
     # Address changes can disable a family, so search domains may need to move.
     if changed & {"addresses", "dns"}:
-        servers: dict[int, list[Address]] = {4: [], 6: []}
-        domains: list[str] = []
-        for entry in _entries(str(config["dns"])):
-            try:
-                server = ip_address(entry)
-            except ValueError:
-                if not _hostname(entry.removeprefix("~")) and entry != "~":
-                    raise NetworkManagerError(
-                        f"DNS: {entry!r} is not an IP address or search domain."
-                    ) from None
-                domains.append(entry)
-            else:
-                servers[server.version].append(server)
         for version, values in families.items():
             if "dns-data" in values:
-                values["dns-data"] = _variant("as", [str(server) for server in servers[version]])
+                values["dns-data"] = _variant("as", servers[version])
+            elif any("#" in server for server in servers[version]):
+                raise NetworkManagerError(
+                    "DNS-over-TLS server names require NetworkManager dns-data support."
+                )
             elif version == 4:
                 values["dns"] = _variant("au", [
-                    struct.unpack("=I", server.packed)[0] for server in servers[4]
+                    struct.unpack("=I", ip_address(server).packed)[0] for server in servers[4]
                 ])
             else:
-                values["dns"] = _variant("aay", [list(server.packed) for server in servers[6]])
+                values["dns"] = _variant("aay", [
+                    list(ip_address(server).packed) for server in servers[6]
+                ])
             values["dns-search"] = _variant("as", [])
         if domains:
             family = next((
@@ -590,15 +710,8 @@ def _apply_wireguard_config(settings: Settings, config: dict[str, object]) -> bo
             if family is None:
                 raise NetworkManagerError("DNS: search domains need a tunnel address in Address.")
             family["dns-search"] = _variant("as", domains)
-    if changed & {"addresses", "dns"}:
-        for version, values in families.items():
-            if _data(values, "method", None) in NO_ADDRESS_METHODS and (
-                _dns_servers(values, version) or _data(values, "dns-search", [])
-            ):
-                raise NetworkManagerError(
-                    f"DNS: IPv{version} DNS servers need an IPv{version} tunnel address in Address."
-                )
-    return True
+    _validate_wireguard_settings(settings, advanced or [])
+    return bool(changed)
 
 
 def _config_input(config: object) -> bool:
@@ -874,7 +987,7 @@ class Plugin:
             if len(fields) != 2 or not fields[0].islower():
                 continue
             key, value = fields
-            if "." in key and key not in STRUCTURED_PROPERTIES:
+            if "." in key and key not in STRUCTURED_PROPERTIES | IDENTITY_PROPERTIES:
                 properties.append({"key": key, "value": value})
         return properties
 
@@ -924,11 +1037,6 @@ class Plugin:
     async def _create_connection_config(
         self, config: dict[str, object], advanced: list[dict[str, str]],
     ) -> dict[str, object]:
-        if not str(config["name"]).strip():
-            raise NetworkManagerError("Name is required.")
-        _wireguard_key(str(config["private_key"]), "Private key", True)
-        if any(update["key"] in ("connection.uuid", "connection.type") for update in advanced):
-            raise NetworkManagerError("A new connection's UUID and type cannot be overridden.")
         uuid = str(uuid4())
         settings = {
             "connection": {
@@ -939,7 +1047,7 @@ class Plugin:
             "ipv4": {"method": _variant("s", "disabled")},
             "ipv6": {"method": _variant("s", "disabled")},
         }
-        _apply_wireguard_config(settings, config)
+        _apply_wireguard_config(settings, config, advanced)
         reply = await _busctl(
             NM_SETTINGS_PATH, "org.freedesktop.NetworkManager.Settings", "AddConnectionUnsaved",
             "a{sa{sv}}", *_encode_bus_value("a{sa{sv}}", settings),
@@ -980,6 +1088,11 @@ class Plugin:
         ):
             return self._failure(NetworkManagerError("Advanced properties must be key/value pairs."))
         keys = [update["key"] for update in advanced]
+        if IDENTITY_PROPERTIES.intersection(keys):
+            return self._failure(NetworkManagerError(
+                "A connection's UUID and type are managed by NetworkManager "
+                "and cannot be overridden."
+            ))
         if "connection.autoconnect" in keys:
             return self._failure(NetworkManagerError(
                 "connection.autoconnect is managed by the startup controls."
@@ -1000,17 +1113,26 @@ class Plugin:
                 or "." not in key
                 for key in keys
             )
-            or any(len(update["value"]) > 16384 for update in advanced)
+            or any(
+                len(update["value"]) > 16384 or "\0" in update["value"] for update in advanced
+            )
         ):
             return self._failure(NetworkManagerError("Invalid or duplicate advanced property."))
         try:
+            _validate_advanced_names(keys)
+            advanced = [
+                {**update, "value": str(_number(
+                    update["value"], "Firewall mark", 2**32 - 1, off=True, hexadecimal=True,
+                ))} if update["key"] == "wireguard.fwmark" else update
+                for update in advanced
+            ]
             async with self._lock:
                 if uuid is None:
                     return await self._create_connection_config(config, advanced)
                 profile = await self._profile(uuid)
                 path, settings = await _nm_connection(profile["uuid"])
                 # Validate before nmcli so invalid fields cannot leave a partial save.
-                changed = _apply_wireguard_config(settings, config)
+                changed = _apply_wireguard_config(settings, config, advanced)
                 if advanced:
                     arguments = ["connection", "modify", "uuid", profile["uuid"]]
                     for update in advanced:

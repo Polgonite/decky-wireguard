@@ -48,6 +48,60 @@ the panel returns to the connection list. Unsaved edits require confirmation
 before they are discarded. Back/B is unavailable while saving and reloading the
 saved configuration.
 
+## Configuration validation
+
+Saving a new or existing profile validates the entire configuration, including
+unchanged fields and imported values, before writing it. A failure leaves the
+draft available for correction and reports the affected field without echoing
+private or preshared keys.
+
+The minimum user-entered settings are a **nonempty name and private key**.
+Every peer you add also needs its own **public key**, unique within the profile.
+NetworkManager additionally requires a valid device interface name; the plugin
+generates one for new connections. The display name is not an interface name:
+it can contain spaces and Unicode.
+
+| Field | Accepted format |
+| --- | --- |
+| Private/public/preshared keys | Canonical base64 encoding of exactly 32 bytes: 44 characters ending in `=`. Private keys and each peer's public key are required; preshared keys are optional. |
+| Address | IPv4 or IPv6, optionally with a CIDR prefix (`0-32` or `0-128`). Bare addresses use `/32` or `/128`. No `%interface` zone IDs. |
+| Allowed IPs | IPv4/IPv6 addresses or CIDR networks, including `0.0.0.0/0` and `::/0`. Host bits are normalized to the network. No zone IDs. |
+| Endpoint | `hostname:port`, `IPv4:port`, or `[IPv6]:port`; decimal port `1-65535`. |
+| Listen port | Decimal integer `0-65535`; empty or `0` chooses automatically. |
+| Persistent keepalive | Decimal integer `0-65535` seconds; empty, `0`, or `off` disables it. |
+| MTU | Unsigned 32-bit decimal integer (`0-4294967295`); empty or `0` uses the default. Actual usable MTUs also depend on the kernel and IP version. |
+| DNS | IPv4/IPv6 server IPs and search domains; `~domain` is a routing domain and `~.` routes all DNS. Existing `dns-data` profiles also support `IP#TLS-server-name`. |
+| Firewall mark | Unsigned 32-bit decimal or `0x` hexadecimal; empty, `0`, or `off` disables it. |
+| Advanced interface name | `1-15` UTF-8 bytes, not `.` or `..`, with no whitespace, `/`, `:`, or NUL characters. |
+
+Separate lists with commas or whitespace. Addresses, DNS, peers, Allowed IPs,
+endpoints, preshared keys, and keepalive are not universally required by
+WireGuard, so they are not made mandatory. A normal VPN client still needs
+appropriate tunnel addresses, peer Allowed IPs, and an endpoint to initiate
+traffic. A profile without peers cannot exchange peer traffic; a peer without
+Allowed IPs cannot carry IP traffic. A listening peer can learn its endpoint
+from authenticated incoming packets.
+
+For native WireGuard, IPv4 methods are limited to `manual` or `disabled`; IPv6
+also permits `ignore` and `link-local`. `manual` requires at least one address
+of that family. Methods without static addressing cannot be combined with
+static addresses or DNS/search domains. DHCP/`auto` and `shared` are not
+supported. These combinations and interface names are checked before applying
+advanced edits. UUID and connection type are managed by NetworkManager and
+cannot be edited here; startup controls still own autoconnect.
+Use full property names for checked settings; shorthand names are rejected so
+they cannot bypass these checks.
+
+These are local compatibility checks, not a connectivity test: they cannot
+verify that the remote peer has matching keys, accepts the chosen addresses,
+or is reachable. Other advanced property values are still validated by
+NetworkManager itself.
+
+Sources: [WireGuard's configuration format (`wg(8)`)](https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8),
+[NetworkManager WireGuard settings](https://www.networkmanager.dev/docs/api/latest/settings-wireguard.html),
+[NetworkManager IPv4 settings](https://www.networkmanager.dev/docs/api/latest/settings-ipv4.html),
+and [NetworkManager's WireGuard verifier](https://github.com/NetworkManager/NetworkManager/blob/main/src/libnm-core-impl/nm-setting-wireguard.c).
+
 ## Build
 
 Use Node.js 22.13+ with npm and Python 3.10+:
