@@ -5,6 +5,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
 import { CONFIG_ROUTE, ConfigPage, configPath } from "./config-page";
+import { UpdateButton } from "./updater";
 
 type ConnectionState = "connected" | "connecting" | "disconnecting" | "disconnected" | "unknown";
 type HandshakeState = "inactive" | "waiting" | "established" | "timeout" | "unknown";
@@ -445,6 +446,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
           )}
         </>
       )}
+      {selectedUuid === null && <UpdateButton />}
       <PanelSectionRow>
         <div style={{ fontSize: "0.85em", opacity: 0.75, paddingTop: 8 }}>
           Status refreshes every second while verifying, otherwise every 5 seconds while this panel is open.
