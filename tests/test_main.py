@@ -1162,6 +1162,126 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(message, result["error"])
         self.assertNotIn("nmcli modify", self.calls)
 
+    async def test_create_saves_keys_and_peers_without_autoconnect_or_activation(self):
+        config = await self.config()
+        config["peers"][0]["original_public_key"] = None
+        config["peers"][0]["preshared_key"] = ""
+        created = {}
+        methods = []
+
+        async def bus(path, interface, method, signature="", *arguments):
+            methods.append(method)
+            if method == "AddConnectionUnsaved":
+                created.update(decode_bus(signature, list(arguments)))
+                return [CONNECTION_PATH]
+            if method == "Update":
+                self.assertEqual(decode_bus(signature, list(arguments)), created)
+                return []
+            self.fail(f"Unexpected method: {method}")
+
+        with patch("main._busctl", side_effect=bus), patch("main._nmcli") as nmcli:
+            result = await self.plugin.create_connection_config(config, [])
+        self.assertTrue(result["success"], result)
+        self.assertEqual(methods, ["AddConnectionUnsaved", "Update"])
+        self.assertEqual(created["connection"]["uuid"], v("s", result["uuid"]))
+        self.assertEqual(created["connection"]["id"], v("s", "Home"))
+        self.assertEqual(created["connection"]["type"], v("s", "wireguard"))
+        self.assertEqual(created["connection"]["autoconnect"], v("b", False))
+        self.assertRegex(created["connection"]["interface-name"]["data"], r"^wg-[0-9a-f]{12}$")
+        self.assertEqual(created["wireguard"]["private-key"], v("s", PRIVATE))
+        self.assertEqual(created["ipv4"]["method"], v("s", "manual"))
+        [peer] = created["wireguard"]["peers"]["data"]
+        self.assertEqual(peer["public-key"], v("s", PEER))
+        self.assertEqual(peer["preshared-key-flags"], v("u", 4))
+        self.assertNotIn("preshared-key", peer)
+        nmcli.assert_not_called()
+
+    async def test_new_profile_advanced_properties_are_temporary_until_saved(self):
+        config = await self.config()
+        config["peers"] = []
+        created = {}
+        methods = []
+
+        async def bus(path, interface, method, signature="", *arguments):
+            methods.append(method)
+            if method == "AddConnectionUnsaved":
+                created.update(decode_bus(signature, list(arguments)))
+                return [CONNECTION_PATH]
+            if method == "Update":
+                stored = decode_bus(signature, list(arguments))
+                self.assertEqual(stored["ipv4"]["dns-priority"], v("i", -50))
+                self.assertEqual(stored["wireguard"]["private-key"], v("s", PRIVATE))
+                return []
+            self.fail(f"Unexpected method: {method}")
+
+        async def modify(*arguments):
+            self.assertEqual(arguments, (
+                "connection", "modify", "--temporary", "uuid",
+                created["connection"]["uuid"]["data"], "ipv4.dns-priority", "-50",
+            ))
+            created["ipv4"]["dns-priority"] = v("i", -50)
+
+        with (
+            patch("main._busctl", side_effect=bus),
+            patch("main._nmcli", side_effect=modify),
+            patch("main._nm_connection", return_value=(CONNECTION_PATH, created)) as reload,
+        ):
+            result = await self.plugin.create_connection_config(
+                config, [{"key": "ipv4.dns-priority", "value": "-50"}],
+            )
+        self.assertTrue(result["success"], result)
+        reload.assert_awaited_once_with(result["uuid"])
+        self.assertEqual(methods, ["AddConnectionUnsaved", "Update"])
+
+    async def test_failed_creation_removes_the_unsaved_profile(self):
+        config = await self.config()
+        config["peers"] = []
+        for failure in ("advanced", "save"):
+            methods = []
+
+            async def bus(path, interface, method, *arguments):
+                methods.append(method)
+                if method == "AddConnectionUnsaved":
+                    return [CONNECTION_PATH]
+                if method == "Update":
+                    raise NetworkManagerError("Could not save")
+                if method == "Delete":
+                    return []
+                self.fail(f"Unexpected method: {method}")
+
+            with (
+                self.subTest(failure=failure),
+                patch("main._busctl", side_effect=bus),
+                patch("main._nmcli", side_effect=NetworkManagerError("Invalid advanced value")),
+                self.assertLogs("decky-wireguard"),
+            ):
+                result = await self.plugin.create_connection_config(
+                    config, [{"key": "ipv4.dns-priority", "value": "invalid"}]
+                    if failure == "advanced" else [],
+                )
+            self.assertFalse(result["success"])
+            self.assertEqual(methods[0], "AddConnectionUnsaved")
+            self.assertEqual(methods[-1], "Delete")
+
+    async def test_invalid_new_profiles_are_rejected_before_creation(self):
+        config = await self.config()
+        config["peers"] = []
+        for changes, advanced in [
+            ({"name": ""}, []), ({"private_key": ""}, []),
+            ({"addresses": "invalid"}, []),
+            ({}, [{"key": "connection.uuid", "value": WORK}]),
+            ({}, [{"key": "connection.type", "value": "ethernet"}]),
+            ({}, [{"key": "connection.autoconnect", "value": "yes"}]),
+        ]:
+            with (
+                self.subTest(changes=changes, advanced=advanced),
+                patch("main._busctl") as bus,
+                self.assertLogs("decky-wireguard"),
+            ):
+                result = await self.plugin.create_connection_config({**config, **changes}, advanced)
+            self.assertFalse(result["success"])
+            bus.assert_not_called()
+
     def test_bus_encoding_uses_busctl_container_syntax(self):
         self.assertEqual(
             _encode_bus_value("a{sv}", {"on": v("b", True), "pair": v("(su)", ["-x", 7])}),
@@ -1170,6 +1290,36 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         for signature, value in [("as", "text"), ("v", {"type": "su", "data": 1}), ("u", True)]:
             with self.subTest(signature=signature), self.assertRaises((TypeError, ValueError)):
                 _encode_bus_value(signature, value)
+
+
+class ConfFileTests(unittest.IsolatedAsyncioTestCase):
+    async def test_read_only_import_returns_utf8_contents_without_networkmanager_calls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vpn.conf"
+            path.write_text("\ufeff[Interface]\nPrivateKey = test\n", encoding="utf-8")
+            with patch("main._command") as command, patch("main._nmcli") as nmcli:
+                result = await Plugin().read_conf_file(str(path))
+            self.assertEqual(result, {"success": True, "text": "[Interface]\nPrivateKey = test\n"})
+            command.assert_not_called()
+            nmcli.assert_not_called()
+
+    async def test_import_rejects_missing_nonregular_oversized_and_non_utf8_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "large.conf").write_bytes(b"x" * (1024 * 1024 + 1))
+            (root / "binary.conf").write_bytes(b"\xffPrivateKey")
+            (root / "folder.conf").mkdir()
+            os.mkfifo(root / "pipe.conf")
+            for path in [
+                root / "missing.conf", root / "large.conf", root / "binary.conf",
+                root / "folder.conf", root / "pipe.conf", root / "wrong.txt",
+                "relative.conf", None,
+            ]:
+                with self.subTest(path=path), self.assertLogs("decky-wireguard") as logs:
+                    result = await Plugin().read_conf_file(str(path) if path is not None else None)
+                self.assertFalse(result["success"])
+                self.assertNotIn("PrivateKey", result["error"])
+                self.assertNotIn("PrivateKey", "\n".join(logs.output))
 
 
 class ProbeTests(unittest.IsolatedAsyncioTestCase):

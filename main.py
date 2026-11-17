@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import socket
+import stat
 import struct
 import tempfile
 import time
@@ -21,7 +22,7 @@ from ipaddress import (
 )
 from pathlib import Path
 from typing import Literal, TypedDict
-from uuid import UUID
+from uuid import UUID, uuid4
 
 
 logger = logging.getLogger("decky-wireguard")
@@ -890,8 +891,83 @@ class Plugin:
         except NetworkManagerError as error:
             return self._failure(error)
 
+    async def read_conf_file(self, path: str) -> dict[str, object]:
+        try:
+            if (
+                not isinstance(path, str) or not Path(path).is_absolute()
+                or Path(path).suffix.lower() != ".conf"
+            ):
+                raise NetworkManagerError("Select a WireGuard .conf file.")
+            # Nonblocking open also lets us reject pipes/devices without waiting on them.
+            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise NetworkManagerError("Select a regular .conf file.")
+                content = source.read(1024 * 1024 + 1)
+            if len(content) > 1024 * 1024:
+                raise NetworkManagerError("Configuration files must be at most 1 MiB.")
+            return {"success": True, "text": content.decode("utf-8-sig")}
+        except NetworkManagerError as error:
+            return self._failure(error)
+        except (OSError, UnicodeError, ValueError):
+            # File contents, names and decoding errors can contain private keys.
+            return self._failure(NetworkManagerError(
+                "Unable to import configuration. Select a readable UTF-8 .conf file "
+                "of at most 1 MiB."
+            ))
+
+    async def create_connection_config(
+        self, config: dict[str, object], advanced: list[dict[str, str]],
+    ) -> dict[str, object]:
+        return await self.set_connection_config(None, config, advanced)
+
+    async def _create_connection_config(
+        self, config: dict[str, object], advanced: list[dict[str, str]],
+    ) -> dict[str, object]:
+        if not str(config["name"]).strip():
+            raise NetworkManagerError("Name is required.")
+        _wireguard_key(str(config["private_key"]), "Private key", True)
+        if any(update["key"] in ("connection.uuid", "connection.type") for update in advanced):
+            raise NetworkManagerError("A new connection's UUID and type cannot be overridden.")
+        uuid = str(uuid4())
+        settings = {
+            "connection": {
+                "id": _variant("s", ""), "uuid": _variant("s", uuid),
+                "type": _variant("s", "wireguard"), "autoconnect": _variant("b", False),
+                "interface-name": _variant("s", f"wg-{uuid.replace('-', '')[:12]}"),
+            },
+            "ipv4": {"method": _variant("s", "disabled")},
+            "ipv6": {"method": _variant("s", "disabled")},
+        }
+        _apply_wireguard_config(settings, config)
+        reply = await _busctl(
+            NM_SETTINGS_PATH, "org.freedesktop.NetworkManager.Settings", "AddConnectionUnsaved",
+            "a{sa{sv}}", *_encode_bus_value("a{sa{sv}}", settings),
+        )
+        path = reply[0] if len(reply) == 1 else None
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise NetworkManagerError("NetworkManager returned an unexpected connection path.")
+        try:
+            if advanced:
+                arguments = ["connection", "modify", "--temporary", "uuid", uuid]
+                for update in advanced:
+                    arguments.extend((update["key"], update["value"]))
+                await _nmcli(*arguments)
+                _, settings = await _nm_connection(uuid)
+            await _nm_update(path, settings)
+        except (NetworkManagerError, asyncio.CancelledError):
+            try:
+                await _busctl(path, NM_CONNECTION_INTERFACE, "Delete")
+            except NetworkManagerError as cleanup:
+                raise NetworkManagerError(
+                    "Saving failed and the new profile could not be removed. "
+                    "Refresh the connection list before retrying."
+                ) from cleanup
+            raise
+        return {"success": True, "uuid": uuid}
+
     async def set_connection_config(
-        self, uuid: str, config: dict[str, object], advanced: list[dict[str, str]],
+        self, uuid: str | None, config: dict[str, object], advanced: list[dict[str, str]],
     ) -> dict[str, object]:
         if not _config_input(config):
             return self._failure(NetworkManagerError("Invalid WireGuard configuration."))
@@ -929,6 +1005,8 @@ class Plugin:
             return self._failure(NetworkManagerError("Invalid or duplicate advanced property."))
         try:
             async with self._lock:
+                if uuid is None:
+                    return await self._create_connection_config(config, advanced)
                 profile = await self._profile(uuid)
                 path, settings = await _nm_connection(profile["uuid"])
                 # Validate before nmcli so invalid fields cannot leave a partial save.

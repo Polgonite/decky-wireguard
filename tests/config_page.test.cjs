@@ -7,7 +7,7 @@ const ts = require("typescript");
 
 function compile(file) {
   return ts.transpileModule(readFileSync(resolve(__dirname, "../src", file), "utf8"), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2020 },
   }).outputText;
 }
 
@@ -28,8 +28,9 @@ function deferred() {
   return { promise, resolve };
 }
 
-function page(draft = saved, backend = () => assert.fail("Unexpected backend call")) {
-  const hooks = [draft, saved];
+function page(draft = saved, backend = () => assert.fail("Unexpected backend call"), options = {}) {
+  const hooks = [draft, options.saved === undefined ? saved : options.saved];
+  const effects = [];
   const modals = [];
   const openedPanels = [];
   let cursor = 0;
@@ -38,10 +39,13 @@ function page(draft = saved, backend = () => assert.fail("Unexpected backend cal
   const context = {
     exports: {},
     require: (name) => {
-      if (name === "@decky/api") return { callable: (route) => (...args) => backend(route, ...args) };
+      if (name === "@decky/api") return {
+        callable: (route) => (...args) => backend(route, ...args),
+        openFilePicker: (...args) => options.pick(...args),
+      };
       if (name === "@decky/ui") return {
         staticClasses: { Title: "title" },
-        useParams: () => ({ uuid: "test" }),
+        useParams: () => ({ uuid: options.uuid ?? "test" }),
         Navigation: {
           NavigateBack: () => { navigations++; },
           OpenQuickAccessMenu: (tab) => {
@@ -68,7 +72,7 @@ function page(draft = saved, backend = () => assert.fail("Unexpected backend cal
           return hooks[index] ??= { current: initial };
         },
         useCallback: (callback) => callback,
-        useEffect: () => {},
+        useEffect: (effect) => effects.push(effect),
         useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
       };
       if (name === "./connection-editor") return { ConnectionEditor: "ConnectionEditor" };
@@ -97,6 +101,14 @@ function page(draft = saved, backend = () => assert.fail("Unexpected backend cal
       back: () => find(tree, "ButtonItem").props.onClick(),
       backDisabled: find(tree, "ButtonItem").props.disabled,
       save: () => find(tree, "ButtonItem", (node) => node.props.children === "Save changes").props.onClick(),
+      importFile: () => find(tree, "ButtonItem", (node) => node.props.children === "Import .conf file").props.onClick(),
+      draft: find(tree, "ConnectionEditor")?.props.draft,
+      messages: (function collect(node) {
+        if (!node || typeof node !== "object") return [];
+        const children = node.props?.children;
+        if (typeof node.type === "function" && typeof children === "string") return [children];
+        return (Array.isArray(children) ? children : [children]).flatMap(collect);
+      })(tree),
       cancel: () => {
         let prevented = false;
         let stopped = false;
@@ -109,7 +121,15 @@ function page(draft = saved, backend = () => assert.fail("Unexpected backend cal
       change: (update) => find(tree, "ConnectionEditor").props.onChange(update),
     };
   }
-  return { render, modals, openedPanels, get navigations() { return navigations; } };
+  return {
+    render, modals, openedPanels,
+    mount: async () => {
+      render();
+      effects.splice(0).forEach((effect) => effect());
+      await flush();
+    },
+    get navigations() { return navigations; },
+  };
 }
 
 for (const input of ["back", "cancel"]) {
@@ -204,4 +224,87 @@ test("B leaves without confirmation after edits are reverted", () => {
   editor.render().cancel();
   assert.equal(editor.navigations, 1);
   assert.equal(editor.modals.length, 0);
+});
+
+test("import browses folders and only updates the draft until Save is pressed", async () => {
+  const calls = [];
+  const editor = page(saved, (route, ...args) => {
+    calls.push([route, ...args]);
+    if (route === "read_conf_file") return { success: true, text: "[Interface]\nPrivateKey = imported\n" };
+    if (route === "set_connection_config") return { success: true };
+    if (route === "get_profiles") return { success: true, profiles: [{ uuid: "test", state: "disconnected" }] };
+    if (route === "get_connection_config") return { success: true, config: saved.config, advanced: [] };
+    assert.fail(`Unexpected call: ${route}`);
+  }, {
+    pick: async (type, _start, files, folders, _filter, extensions) => {
+      assert.equal(type, 0);
+      assert.equal(files, true);
+      assert.equal(folders, true, "Users must be able to browse into directories");
+      assert.deepEqual(Array.from(extensions), ["conf"]);
+      return { path: "/home/deck/VPN.conf", realpath: "/home/deck/VPN.conf" };
+    },
+  });
+  editor.render().importFile();
+  await flush();
+  assert.deepEqual(calls.map(([route]) => route), ["read_conf_file"]);
+  const draft = editor.render().draft;
+  assert.equal(draft.config.name, "Home");
+  assert.equal(draft.config.private_key, "imported");
+  assert.equal(draft.config.addresses, "");
+  assert.deepEqual(Array.from(draft.config.peers), []);
+  editor.render().save();
+  await flush();
+  assert.equal(calls[1][0], "set_connection_config");
+  assert.equal(calls[1][1], "test");
+  assert.equal(calls[1][2].private_key, "imported");
+});
+
+for (const failure of ["User canceled", new Error("Picker unavailable")]) {
+  test(`file picker ${typeof failure === "string" ? "cancellation" : "failure"} leaves the draft unchanged`, async () => {
+    const editor = page(saved, undefined, { pick: () => Promise.reject(failure) });
+    editor.render().importFile();
+    await flush();
+    const view = editor.render();
+    assert.equal(view.draft, saved);
+    assert.equal(view.backDisabled, false);
+    assert.equal(view.messages.some((message) => message.includes("Picker unavailable")), typeof failure !== "string");
+    assert.equal(view.messages.includes("User canceled"), false);
+  });
+}
+
+test("new connections start locally, create only on Save, and use the created UUID thereafter", async () => {
+  const calls = [];
+  const blank = config.emptyDraft();
+  const draft = { ...blank, config: { ...blank.config, name: "New VPN", private_key: "key" } };
+  const editor = page(null, (route, ...args) => {
+    calls.push([route, ...args]);
+    if (route === "create_connection_config") return { success: true, uuid: "created" };
+    if (route === "set_connection_config") return { success: true };
+    if (route === "get_profiles") return { success: true, profiles: [{ uuid: "created", state: "disconnected" }] };
+    if (route === "get_connection_config") return { success: true, config: draft.config, advanced: [] };
+    assert.fail(`Unexpected call: ${route}`);
+  }, { uuid: "new", saved: null });
+  await editor.mount();
+  assert.equal(calls.length, 0, "Opening a new editor must not create or load a profile");
+  assert.equal(editor.render().draft.config.name, "");
+  editor.render().change(draft);
+  editor.render().save();
+  await flush();
+  assert.equal(calls[0][0], "create_connection_config");
+  assert.equal(calls.find(([route]) => route === "get_connection_config")[1], "created");
+  editor.render().change({ ...draft, config: { ...draft.config, name: "Renamed" } });
+  editor.render().save();
+  await flush();
+  assert.equal(calls.filter(([route]) => route === "create_connection_config").length, 1);
+  assert.equal(calls.find(([route]) => route === "set_connection_config")[1], "created");
+  editor.render().back();
+  assert.deepEqual(editor.openedPanels, [{ tab: 999, uuid: "created" }]);
+});
+
+test("an untouched new connection can be closed without creating a profile", async () => {
+  const editor = page(null, undefined, { uuid: "new", saved: null });
+  await editor.mount();
+  editor.render().back();
+  assert.equal(editor.modals.length, 0);
+  assert.deepEqual(editor.openedPanels, [{ tab: 999, uuid: null }]);
 });

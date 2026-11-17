@@ -1,4 +1,4 @@
-import { callable } from "@decky/api";
+import { callable, openFilePicker } from "@decky/api";
 import {
   ButtonItem, ConfirmModal, DialogBody, Focusable, GamepadEvent, PanelSectionRow, showModal,
   staticClasses, useParams,
@@ -7,7 +7,7 @@ import { SetStateAction, useCallback, useEffect, useRef, useState } from "react"
 import { ConnectionEditor } from "./connection-editor";
 import { returnToPlugin } from "./plugin-navigation";
 import {
-  AdvancedProperty, draftChanged, EditorDraft, fromDraft, toDraft, WireGuardConfig,
+  AdvancedProperty, draftChanged, EditorDraft, emptyDraft, fromDraft, importConf, toDraft, WireGuardConfig,
 } from "./wireguard-config";
 
 type Result<T> = ({ success: true } & T) | { success: false; error: string };
@@ -19,6 +19,10 @@ const setConnectionConfig = callable<
   [uuid: string, config: WireGuardConfig, advanced: AdvancedProperty[]], Result<object>
 >("set_connection_config");
 const getProfiles = callable<[], Result<{ profiles: { uuid: string; state: string }[] }>>("get_profiles");
+const createConnectionConfig = callable<
+  [config: WireGuardConfig, advanced: AdvancedProperty[]], Result<{ uuid: string }>
+>("create_connection_config");
+const readConfFile = callable<[path: string], Result<{ text: string }>>("read_conf_file");
 
 export const CONFIG_ROUTE = "/decky-wireguard/config/:uuid";
 
@@ -55,6 +59,9 @@ export function ConfigPage() {
   const mounted = useRef(true);
   const request = useRef(0);
   const savingRef = useRef(false);
+  const connectionUuid = useRef<string | null>(uuid === "new" ? null : uuid);
+  const [importing, setImporting] = useState(false);
+  const importingRef = useRef(false);
 
   useEffect(() => {
     mounted.current = true;
@@ -72,7 +79,13 @@ export function ConfigPage() {
       setSaved(null);
     }
     try {
-      const result = await getConnectionConfig(uuid);
+      if (connectionUuid.current === null) {
+        const blank = emptyDraft();
+        setDraft(blank);
+        setSaved(blank);
+        return true;
+      }
+      const result = await getConnectionConfig(connectionUuid.current);
       if (!result.success) throw new Error(result.error);
       if (mounted.current && id === request.current) {
         const loaded = toDraft(result.config, result.advanced);
@@ -93,7 +106,7 @@ export function ConfigPage() {
   }, [load]);
 
   const save = async () => {
-    if (!draft || savingRef.current) return;
+    if (!draft || savingRef.current || importingRef.current) return;
     let changes: ReturnType<typeof fromDraft>;
     try {
       changes = fromDraft(draft);
@@ -106,12 +119,18 @@ export function ConfigPage() {
     setError(null);
     setNotice(null);
     try {
-      const result = await setConnectionConfig(uuid, changes.config, changes.advanced);
-      if (!result.success) throw new Error(result.error);
+      if (connectionUuid.current === null) {
+        const result = await createConnectionConfig(changes.config, changes.advanced);
+        if (!result.success) throw new Error(result.error);
+        connectionUuid.current = result.uuid;
+      } else {
+        const result = await setConnectionConfig(connectionUuid.current, changes.config, changes.advanced);
+        if (!result.success) throw new Error(result.error);
+      }
       let state: string | undefined;
       try {
         const profiles = await getProfiles();
-        if (profiles.success) state = profiles.profiles.find((profile) => profile.uuid === uuid)?.state;
+        if (profiles.success) state = profiles.profiles.find((profile) => profile.uuid === connectionUuid.current)?.state;
       } catch {
         // The save succeeded; only the reconnect hint depends on the current state.
       }
@@ -138,15 +157,39 @@ export function ConfigPage() {
     setDraft((current) => current && (typeof update === "function" ? update(current) : update));
   }, []);
 
+  const importFile = async () => {
+    if (savingRef.current || importingRef.current) return;
+    importingRef.current = true;
+    setImporting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      // FILE = 0; Decky's ambient const enum cannot be used with isolatedModules.
+      const file = await openFilePicker(0, "/home", true, true, undefined, ["conf"], false, false);
+      if (!mounted.current) return;
+      const result = await readConfFile(file.realpath);
+      if (!result.success) throw new Error(result.error);
+      if (!mounted.current || !draft) return;
+      const imported = importConf(draft, result.text, file.path.split("/").pop() ?? "");
+      change(imported);
+      setNotice("Imported into the editor only. Save to apply. Omitted keys, addresses, DNS and peers were cleared; omitted advanced settings were kept.");
+    } catch (failure) {
+      if (mounted.current && failure !== "User canceled") setError(errorMessage(failure));
+    } finally {
+      importingRef.current = false;
+      if (mounted.current) setImporting(false);
+    }
+  };
+
   const dirty = draft !== null && saved !== null && draftChanged(draft, saved);
   const dirtyRef = useRef(dirty);
   dirtyRef.current = dirty;
   const confirming = useRef(false);
 
   const leave = useCallback(() => {
-    if (savingRef.current) return;
+    if (savingRef.current || importingRef.current) return;
     if (!dirtyRef.current) {
-      returnToPlugin(uuid);
+      returnToPlugin(connectionUuid.current);
       return;
     }
     if (confirming.current) return;
@@ -159,7 +202,7 @@ export function ConfigPage() {
         strCancelButtonText="Keep editing"
         bDestructiveWarning
         onOK={() => {
-          if (mounted.current) returnToPlugin(uuid);
+          if (mounted.current) returnToPlugin(connectionUuid.current);
         }}
       />,
       undefined,
@@ -182,10 +225,11 @@ export function ConfigPage() {
       <Focusable onCancelButton={cancelButton}>
         <DialogBody style={{ maxWidth: 900, margin: "0 auto", padding: "16px 24px 48px" }}>
           <div className={staticClasses.Title} style={{ fontSize: 24, padding: "8px 0" }}>
-            {saved ? `Edit ${saved.config.name}` : "Edit WireGuard connection"}
+            {connectionUuid.current === null ? "New WireGuard connection"
+              : saved ? `Edit ${saved.config.name}` : "Edit WireGuard connection"}
           </div>
           <PanelSectionRow>
-            <ButtonItem layout="below" disabled={saving} onClick={leave}>Back</ButtonItem>
+            <ButtonItem layout="below" disabled={saving || importing} onClick={leave}>Back</ButtonItem>
           </PanelSectionRow>
           {loading && draft === null && <Message error={false}>Loading configuration...</Message>}
           {error && draft === null && (
@@ -200,12 +244,21 @@ export function ConfigPage() {
           )}
           {draft && (
             <>
-              <ConnectionEditor draft={draft} onChange={change} disabled={saving} />
+              <PanelSectionRow>
+                <ButtonItem
+                  layout="below"
+                  disabled={saving || loading || importing}
+                  onClick={() => void importFile()}
+                >
+                  {importing ? "Importing..." : "Import .conf file"}
+                </ButtonItem>
+              </PanelSectionRow>
+              <ConnectionEditor draft={draft} onChange={change} disabled={saving || importing} />
               {(error || notice) && <Message error={error !== null}>{error ?? notice ?? ""}</Message>}
               <PanelSectionRow>
                 <ButtonItem
                   layout="below"
-                  disabled={saving || loading || !dirty}
+                  disabled={saving || loading || importing || !dirty}
                   onClick={() => void save()}
                 >
                   {saving ? "Saving..." : dirty ? "Save changes" : "No unsaved changes"}

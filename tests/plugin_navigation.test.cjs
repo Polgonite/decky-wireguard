@@ -24,6 +24,7 @@ function plugin(profiles) {
   let cursor = 0;
   let effects = [];
   let pluginExits = 0;
+  const navigations = [];
   const subscriptions = [];
   const element = (type, props) => ({ type, props });
   const context = {
@@ -63,12 +64,18 @@ function plugin(profiles) {
         },
       };
       if (name === "@decky/ui") return {
-        staticClasses: { Title: "title" }, Navigation: { NavigateBack: () => {}, OpenQuickAccessMenu: () => {} },
+        staticClasses: { Title: "title" },
+        Navigation: {
+          NavigateBack: () => {}, OpenQuickAccessMenu: () => {},
+          Navigate: (path) => navigations.push(path), CloseSideMenus: () => navigations.push("close"),
+        },
         QuickAccessTab: { Decky: 999 }, PanelSection: "PanelSection", Focusable: "Focusable",
         ButtonItem: "ButtonItem",
       };
       if (name === "./plugin-navigation") return navigation.exports;
-      if (name === "./config-page" || name === "./updater" || name === "react-icons/fa") return {};
+      if (name === "./config-page") return { configPath: (uuid) => `/config/${uuid}` };
+      if (name === "./updater") return { UpdateButton: "UpdateButton" };
+      if (name === "react-icons/fa") return {};
       throw new Error(`Unexpected module: ${name}`);
     },
   };
@@ -78,6 +85,7 @@ function plugin(profiles) {
   const content = context.exports.default().content.type;
   return {
     navigation: navigation.exports,
+    navigations,
     subscribe: (listener) => subscriptions.at(-1)(listener),
     render: () => {
       cursor = 0;
@@ -188,4 +196,23 @@ test("the Back button returns from connection settings to the list", async () =>
   backRow.props.children.props.onClick();
   assert.equal(panel.navigation.useSelectedConnection()[0], null);
   assert.equal(panel.render().props.children.props.title, "WireGuard connections");
+});
+
+test("the new connection button is above Update and opens the configuration page", async () => {
+  const panel = plugin([]);
+  await panel.mount();
+  const elements = [];
+  function collect(node) {
+    if (!node || typeof node !== "object") return;
+    elements.push(node);
+    const children = node.props?.children;
+    (Array.isArray(children) ? children : [children]).forEach(collect);
+  }
+  collect(panel.render());
+  const add = elements.findIndex((node) =>
+    node.type === "ButtonItem" && node.props.children === "Add new connection");
+  const update = elements.findIndex((node) => node.type === "UpdateButton");
+  assert.ok(add >= 0 && update > add);
+  elements[add].props.onClick();
+  assert.deepEqual(panel.navigations, ["/config/new", "close"]);
 });

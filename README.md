@@ -1,7 +1,7 @@
 # WireGuard for Decky
 
-A Decky Loader plugin for listing, connecting, and disconnecting **existing
-NetworkManager WireGuard profiles** from Steam Deck Gaming Mode.
+A Decky Loader plugin for creating, configuring, connecting, and disconnecting
+**NetworkManager WireGuard profiles** from Steam Deck Gaming Mode.
 
 ## Requirements
 
@@ -11,18 +11,35 @@ NetworkManager WireGuard profiles** from Steam Deck Gaming Mode.
   The internet readiness option requires NetworkManager's connectivity check
   to be configured and enabled.
 - `wg` from `wireguard-tools` available to the backend for handshake status.
-- At least one native NetworkManager WireGuard profile, with its keys already
-  saved. Connections requiring an interactive password prompt are not supported.
+- Connections requiring an interactive password prompt are not supported;
+  keys must be saved in the profile.
 
-Profiles created only with `wg-quick` are not shown. In Desktop Mode, import a
-trusted configuration using NetworkManager's connection editor, or:
+Profiles created only with `wg-quick` are not shown. Select **Add new connection**
+above the update button to open the same editor used by **Edit configuration**.
+Enter a name and configuration manually, or select **Import .conf file** to
+browse for a trusted WireGuard configuration. A new connection uses the filename
+as its name if no name has been entered. New profiles are created disconnected,
+with automatic startup disabled.
+
+Import only fills the editor: **Save changes** is required to create or update
+the NetworkManager profile. Import replaces the private key, addresses, DNS and
+entire peer list, clearing omitted values (including preshared keys). The name
+and omitted advanced settings, including MTU, listen port, firewall mark and
+other NetworkManager properties, are preserved. Values present in the file
+override their fields. The importer supports `[Interface]` PrivateKey, Address,
+DNS, MTU, ListenPort and FwMark, plus all standard `[Peer]` fields. Unsupported
+directives (such as wg-quick hooks or Table), malformed files and duplicate
+single-value fields are rejected without changing the draft. Files must be
+UTF-8 and at most 1 MiB.
+
+Alternatively, import using NetworkManager's Desktop Mode editor, or:
 
 ```sh
 nmcli connection import type wireguard file /absolute/path/to/wg0.conf
 ```
 
-Keep configuration files and private keys out of this repository. Importing may
-enable NetworkManager autoconnect; review the imported profile's settings in
+Keep configuration files and private keys out of this repository. Desktop Mode
+imports may enable NetworkManager autoconnect; review the imported profile's settings in
 Desktop Mode or use the plugin's startup checkboxes before rebooting.
 
 Closing the full-screen configuration editor reopens the WireGuard plugin panel

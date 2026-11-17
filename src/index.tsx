@@ -386,7 +386,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
       )}
       {selectedUuid === null && profiles?.length === 0 && (
         <PanelSectionRow>
-          No WireGuard profiles found. Import a profile into NetworkManager in Desktop Mode first.
+          No WireGuard profiles found. Add a connection below to configure or import one.
         </PanelSectionRow>
       )}
       {selectedUuid === null && profiles?.map((profile) => (
@@ -560,7 +560,22 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
           )}
         </>
       )}
-      {selectedUuid === null && <UpdateButton />}
+      {selectedUuid === null && (
+        <>
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              onClick={() => {
+                Navigation.Navigate(configPath("new"));
+                Navigation.CloseSideMenus();
+              }}
+            >
+              Add new connection
+            </ButtonItem>
+          </PanelSectionRow>
+          <UpdateButton />
+        </>
+      )}
       <PanelSectionRow>
         <div style={{ fontSize: "0.85em", opacity: 0.75, paddingTop: 8 }}>
           Status refreshes every second while verifying, otherwise every 5 seconds while this panel is open.

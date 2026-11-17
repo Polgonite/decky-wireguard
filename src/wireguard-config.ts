@@ -37,6 +37,78 @@ export interface EditorDraft {
   advanced: EditableProperty[];
 }
 
+export function emptyDraft(): EditorDraft {
+  return toDraft({
+    name: "", private_key: "", addresses: "", dns: "", mtu: "", listen_port: "", peers: [],
+  }, []);
+}
+
+/** Import tunnel identity and peers, but retain unrelated NetworkManager policy. */
+export function importConf(draft: EditorDraft, text: string, filename: string): EditorDraft {
+  const config: EditorDraft["config"] = {
+    ...draft.config, private_key: "", addresses: "", dns: "", peers: [],
+    name: draft.config.name || filename.replace(/\.conf$/i, ""),
+  };
+  let section: "Interface" | "Peer" | null = null;
+  let hasInterface = false;
+  let peer: EditablePeer | undefined;
+  let seen = new Set<string>();
+  let advanced = draft.advanced;
+  const interfaceFields = {
+    PrivateKey: "private_key", Address: "addresses", DNS: "dns", MTU: "mtu", ListenPort: "listen_port",
+  } as const;
+  const peerFields = {
+    PublicKey: "public_key", PresharedKey: "preshared_key", AllowedIPs: "allowed_ips",
+    Endpoint: "endpoint", PersistentKeepalive: "persistent_keepalive",
+  } as const;
+  for (const [index, raw] of text.replace(/^\uFEFF/, "").split(/\r?\n/).entries()) {
+    const line = raw.replace(/#.*/, "").trim();
+    if (!line) continue;
+    function fail(message: string): never { throw new Error(`Line ${index + 1}: ${message}`); }
+    if (line === "[Interface]") {
+      if (hasInterface || section === "Peer") fail("Expected a single [Interface] before peers.");
+      hasInterface = true;
+      section = "Interface";
+      seen = new Set();
+      continue;
+    }
+    if (line === "[Peer]") {
+      if (!hasInterface) fail("[Peer] must follow [Interface].");
+      if (config.peers.length >= 64) fail("At most 64 peers are supported.");
+      section = "Peer";
+      peer = newPeer(`import-peer-${config.peers.length}`);
+      config.peers.push(peer);
+      seen = new Set();
+      continue;
+    }
+    const match = /^([A-Za-z]+)\s*=\s*(.*)$/.exec(line);
+    if (!match || !section) fail("Expected a setting inside [Interface] or [Peer].");
+    const key = match[1]!;
+    const value = match[2]!;
+    const multiple = section === "Interface" ? key === "Address" || key === "DNS" : key === "AllowedIPs";
+    if (seen.has(key) && !multiple) fail(`Duplicate ${key} setting.`);
+    seen.add(key);
+    if (section === "Interface" && Object.prototype.hasOwnProperty.call(interfaceFields, key)) {
+      const field = interfaceFields[key as keyof typeof interfaceFields];
+      config[field] = multiple && config[field] ? `${config[field]}, ${value}` : value;
+    } else if (section === "Interface" && key === "FwMark") {
+      const property = advanced.find((entry) => entry.key === "wireguard.fwmark");
+      advanced = property
+        ? advanced.map((entry) => entry === property ? { ...entry, value } : entry)
+        : [...advanced, {
+          id: "import-fwmark", key: "wireguard.fwmark", value, originalValue: "", isNew: true,
+        }];
+    } else if (section === "Peer" && peer && Object.prototype.hasOwnProperty.call(peerFields, key)) {
+      const field = peerFields[key as keyof typeof peerFields];
+      peer[field] = multiple && peer[field] ? `${peer[field]}, ${value}` : value;
+    } else {
+      fail(`Unsupported ${section} setting: ${key}. No fields were imported.`);
+    }
+  }
+  if (!hasInterface) throw new Error("The file must contain an [Interface] section.");
+  return { ...draft, config, advanced };
+}
+
 export function newPeer(id: string): EditablePeer {
   return {
     id, original_public_key: null, public_key: "", preshared_key: "",

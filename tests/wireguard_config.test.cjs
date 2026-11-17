@@ -10,7 +10,7 @@ const context = { exports: {} };
 runInNewContext(ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 }).outputText, context);
-const { advancedSettingLabel, draftChanged, fromDraft, publicKeyFromPrivate, toDraft } = context.exports;
+const { advancedSettingLabel, draftChanged, emptyDraft, fromDraft, importConf, publicKeyFromPrivate, toDraft } = context.exports;
 const key = (hex) => Buffer.from(hex, "hex").toString("base64");
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
@@ -69,4 +69,85 @@ test("unsaved changes include peer removal and named new properties, not blank r
 test("advanced property labels are readable", () => {
   assert.equal(advancedSettingLabel("ipv4.dns-search"), "IPv4: DNS Search");
   assert.equal(advancedSettingLabel("future.custom-property"), "Future: Custom Property");
+});
+
+test("import replaces tunnel identity and peers without retaining old secrets or advanced settings loss", () => {
+  const saved = toDraft({
+    ...config, private_key: "old private", mtu: "1380", listen_port: "51821",
+    peers: [{ ...peer, preshared_key: "old psk" }, { ...peer, public_key: "old second peer" }],
+  }, [{ key: "ipv4.dns-priority", value: "-50" }]);
+  const before = plain(saved);
+  const draft = importConf(saved, "\uFEFF[Interface]\r\n# comment\r\n[Peer]\r\nPublicKey = imported\r\n", "other.conf");
+  assert.deepEqual(plain(draft.config), {
+    name: "Home", private_key: "", addresses: "", dns: "", mtu: "1380", listen_port: "51821",
+    peers: [{
+      id: "import-peer-0", original_public_key: null, public_key: "imported", preshared_key: "",
+      allowed_ips: "", endpoint: "", persistent_keepalive: "",
+    }],
+  });
+  assert.equal(draft.advanced, saved.advanced);
+  assert.deepEqual(plain(saved), before, "Import must not mutate the existing draft");
+  assert.equal(draftChanged(draft, saved), true);
+  assert.deepEqual(plain(fromDraft(draft).advanced), []);
+});
+
+test("import populates new profiles, repeated lists, interface options and multiple peers", () => {
+  const draft = importConf(emptyDraft(), `
+    [Interface]
+    PrivateKey = private==
+    Address = 10.1.0.2/32, fd00::2/128
+    Address = 10.2.0.2/32 # another address
+    DNS = 10.1.0.1
+    DNS = home.lan
+    MTU = 1420
+    ListenPort = 51820
+    [Peer]
+    PublicKey = public==
+    PresharedKey = shared==
+    AllowedIPs = 0.0.0.0/0
+    AllowedIPs = ::/0
+    Endpoint = vpn.example.com:51820
+    PersistentKeepalive = 25
+    [Peer]
+    PublicKey = second==
+  `, "Office.conf");
+  assert.deepEqual(plain(fromDraft(draft).config), {
+    name: "Office", private_key: "private==", addresses: "10.1.0.2/32, fd00::2/128, 10.2.0.2/32",
+    dns: "10.1.0.1, home.lan", mtu: "1420", listen_port: "51820",
+    peers: [
+      { original_public_key: null, public_key: "public==", preshared_key: "shared==",
+        allowed_ips: "0.0.0.0/0, ::/0", endpoint: "vpn.example.com:51820", persistent_keepalive: "25" },
+      { original_public_key: null, public_key: "second==", preshared_key: "",
+        allowed_ips: "", endpoint: "", persistent_keepalive: "" },
+    ],
+  });
+  assert.equal(importConf(draft, "[Interface]\nPrivateKey = replacement", "other.conf").config.peers.length, 0);
+});
+
+test("invalid or unsupported imports fail atomically without exposing values", () => {
+  const saved = toDraft(config, []);
+  const before = plain(saved);
+  for (const text of [
+    "", "[Peer]\nPublicKey = secret", "PrivateKey = secret", "[Something]",
+    "[Interface]\n[Interface]", "[Interface]\nPrivateKey=one\nPrivateKey=secret",
+    "[Interface]\nPostUp = secret", "[Interface]\nPrivateKey = new\n[Peer]\nUnknown = secret",
+    "[Interface]\n" + "[Peer]\n".repeat(65),
+  ]) {
+    assert.throws(() => importConf(saved, text, "file.conf"), (error) => {
+      assert.equal(error.message.includes("secret"), false);
+      return true;
+    });
+
+    assert.deepEqual(plain(saved), before);
+  }
+});
+
+test("FwMark overrides only its advanced property and is retained when omitted", () => {
+  for (const properties of [[], [{ key: "wireguard.fwmark", value: "0" }]]) {
+    const saved = toDraft(config, [...properties, { key: "ipv4.dns-priority", value: "-50" }]);
+    const imported = importConf(saved, "[Interface]\nFwMark = 0xca6c", "file.conf");
+    assert.deepEqual(plain(fromDraft(imported).advanced), [{ key: "wireguard.fwmark", value: "0xca6c" }]);
+    assert.equal(imported.advanced.find((property) => property.key === "ipv4.dns-priority").value, "-50");
+    assert.equal(importConf(imported, "[Interface]", "file.conf").advanced, imported.advanced);
+  }
 });
