@@ -28,7 +28,8 @@ Desktop Mode or use the plugin's startup checkboxes before rebooting.
 Closing the full-screen configuration editor reopens the WireGuard plugin panel
 with the edited connection selected. If that connection is no longer available,
 the panel returns to the connection list. Unsaved edits require confirmation
-before they are discarded.
+before they are discarded. Back/B is unavailable while saving and reloading the
+saved configuration.
 
 ## Build
 
@@ -174,7 +175,8 @@ directory), then restart Decky Loader.
   Names with colons and backslashes are supported, and actions use UUIDs so
   duplicate names are safe. Select a connection to open its management menu and
   connect or disconnect it; press B or select Back to return to the list without
-  closing the sidebar. B on the connection list exits the plugin as usual.
+  closing the sidebar. B on the connection list returns to Decky's plugin list,
+  including while profiles are loading or when no profiles are available.
   The short UUID appears beside each status.
 - Select **Edit configuration** to open a full-screen editor that lays out the
   profile like a WireGuard `.conf` file: **Interface** (private key with its derived public key, addresses,

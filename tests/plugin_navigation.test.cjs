@@ -23,6 +23,7 @@ function plugin(profiles) {
   let hooks = [];
   let cursor = 0;
   let effects = [];
+  let pluginExits = 0;
   const subscriptions = [];
   const element = (type, props) => ({ type, props });
   const context = {
@@ -82,6 +83,18 @@ function plugin(profiles) {
       cursor = 0;
       return content();
     },
+    cancel: () => {
+      cursor = 0;
+      const view = content();
+      const handler = view.props.onCancelButton;
+      if (handler) {
+        handler({ preventDefault() {}, stopPropagation() {} });
+      } else {
+        // Steam dispatches B to the nearest registered handler, not every ancestor.
+        pluginExits++;
+      }
+    },
+    get pluginExits() { return pluginExits; },
     mount: async () => {
       hooks = [];
       effects = [];
@@ -141,10 +154,27 @@ test("B returns from connection settings to the list without closing the sidebar
   assert.equal(panel.navigation.useSelectedConnection()[0], null);
   assert.equal(panel.render().props.children.props.title, "WireGuard connections");
 
-  panel.render().props.onCancelButton({
-    preventDefault: () => assert.fail("B must still exit from the connection list"),
-    stopPropagation: () => assert.fail("B must still bubble from the connection list"),
+  panel.cancel();
+  assert.equal(panel.pluginExits, 1);
+});
+
+for (const profiles of [[], [profile]]) {
+  test(`B exits the plugin from the ${profiles.length ? "populated" : "empty"} connection list`, async () => {
+    const panel = plugin(profiles);
+    panel.cancel();
+    assert.equal(panel.pluginExits, 1, "B must exit while profiles are still loading");
+    await panel.mount();
+    panel.cancel();
+    assert.equal(panel.pluginExits, 2, "B must reach Decky's leave-plugin handler");
   });
+}
+
+test("B exits after a deleted connection falls back to the list", async () => {
+  const panel = plugin([]);
+  panel.navigation.returnToPlugin("deleted");
+  await panel.mount();
+  panel.cancel();
+  assert.equal(panel.pluginExits, 1);
 });
 
 test("the Back button returns from connection settings to the list", async () => {

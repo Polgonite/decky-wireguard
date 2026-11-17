@@ -54,6 +54,7 @@ export function ConfigPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const mounted = useRef(true);
   const request = useRef(0);
+  const savingRef = useRef(false);
 
   useEffect(() => {
     mounted.current = true;
@@ -92,7 +93,7 @@ export function ConfigPage() {
   }, [load]);
 
   const save = async () => {
-    if (!draft || saving) return;
+    if (!draft || savingRef.current) return;
     let changes: ReturnType<typeof fromDraft>;
     try {
       changes = fromDraft(draft);
@@ -100,35 +101,34 @@ export function ConfigPage() {
       setError(errorMessage(failure));
       return;
     }
+    savingRef.current = true;
     setSaving(true);
     setError(null);
     setNotice(null);
     try {
       const result = await setConnectionConfig(uuid, changes.config, changes.advanced);
       if (!result.success) throw new Error(result.error);
-    } catch (failure) {
-      if (mounted.current) {
-        setError(errorMessage(failure));
-        setSaving(false);
+      let state: string | undefined;
+      try {
+        const profiles = await getProfiles();
+        if (profiles.success) state = profiles.profiles.find((profile) => profile.uuid === uuid)?.state;
+      } catch {
+        // The save succeeded; only the reconnect hint depends on the current state.
       }
-      return;
-    }
-    let state: string | undefined;
-    try {
-      const profiles = await getProfiles();
-      if (profiles.success) state = profiles.profiles.find((profile) => profile.uuid === uuid)?.state;
-    } catch {
-      // The save succeeded; only the reconnect hint depends on the current state.
-    }
-    if (!mounted.current) return;
-    setSaving(false);
-    // Reload in place so the editor stays mounted and gamepad focus stays on Save.
-    if (await load(false)) {
-      setNotice(state === "disconnected"
-        ? "Saved."
-        : state === undefined
-          ? "Saved. If the tunnel is connected, disconnect and reconnect to apply the changes."
-          : "Saved. Disconnect and reconnect to apply the changes.");
+      if (!mounted.current) return;
+      // Reload in place so the editor stays mounted and gamepad focus stays on Save.
+      if (await load(false)) {
+        setNotice(state === "disconnected"
+          ? "Saved."
+          : state === undefined
+            ? "Saved. If the tunnel is connected, disconnect and reconnect to apply the changes."
+            : "Saved. Disconnect and reconnect to apply the changes.");
+      }
+    } catch (failure) {
+      if (mounted.current) setError(errorMessage(failure));
+    } finally {
+      savingRef.current = false;
+      if (mounted.current) setSaving(false);
     }
   };
 
@@ -144,6 +144,7 @@ export function ConfigPage() {
   const confirming = useRef(false);
 
   const leave = useCallback(() => {
+    if (savingRef.current) return;
     if (!dirtyRef.current) {
       returnToPlugin(uuid);
       return;
@@ -184,7 +185,7 @@ export function ConfigPage() {
             {saved ? `Edit ${saved.config.name}` : "Edit WireGuard connection"}
           </div>
           <PanelSectionRow>
-            <ButtonItem layout="below" onClick={leave}>Back</ButtonItem>
+            <ButtonItem layout="below" disabled={saving} onClick={leave}>Back</ButtonItem>
           </PanelSectionRow>
           {loading && draft === null && <Message error={false}>Loading configuration...</Message>}
           {error && draft === null && (

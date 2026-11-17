@@ -332,7 +332,6 @@ function Content() {
   };
 
   const cancelButton = (event: GamepadEvent) => {
-    if (selectedUuid === null) return;
     event.preventDefault();
     event.stopPropagation();
     setSelectedUuid(null);
@@ -576,7 +575,8 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
     </PanelSection>
   );
 
-  return <Focusable onCancelButton={cancelButton}>{panel}</Focusable>;
+  // Even a no-op cancel handler consumes B instead of letting Decky close the plugin.
+  return <Focusable {...(selectedUuid === null ? {} : { onCancelButton: cancelButton })}>{panel}</Focusable>;
 }
 
 export default definePlugin(() => {
