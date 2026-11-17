@@ -1,7 +1,7 @@
 import { callable, definePlugin, routerHook } from "@decky/api";
 import {
-  ButtonItem, DialogCheckbox, Focusable, GamepadEvent, Navigation, PanelSection, PanelSectionRow,
-  staticClasses,
+  ButtonItem, Focusable, GamepadEvent, Navigation, PanelSection, PanelSectionRow, staticClasses,
+  ToggleField,
 } from "@decky/ui";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
@@ -500,8 +500,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
             </PanelSectionRow>
           )}
           <PanelSectionRow>
-            <DialogCheckbox
-              controlled
+            <ToggleField
               label="Connect during boot"
               description="Use NetworkManager autoconnect. May delay boot when offline."
               checked={selectedStartup?.on_boot ?? false}
@@ -513,8 +512,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
             />
           </PanelSectionRow>
           <PanelSectionRow>
-            <DialogCheckbox
-              controlled
+            <ToggleField
               label="Connect after boot"
               description="From next boot, connect once when the plugin loads and boot has finished. Disables NetworkManager autoconnect; reloads do not reconnect."
               checked={selectedStartup?.after_boot ?? false}
@@ -526,8 +524,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
             />
           </PanelSectionRow>
           <PanelSectionRow>
-            <DialogCheckbox
-              controlled
+            <ToggleField
               label="Wait for Steam login"
               description="For plugin-managed startup, wait until Steam finishes logging in, including Offline Mode."
               checked={selectedStartup?.wait_for_steam ?? true}
@@ -541,8 +538,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
             />
           </PanelSectionRow>
           <PanelSectionRow>
-            <DialogCheckbox
-              controlled
+            <ToggleField
               label="Wait for internet"
               description="For plugin-managed startup, wait for NetworkManager to verify internet on Wi-Fi, Ethernet, or mobile data, not a VPN."
               checked={selectedStartup?.wait_for_internet ?? true}
