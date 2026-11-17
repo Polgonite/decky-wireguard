@@ -1,13 +1,10 @@
-import { callable, definePlugin } from "@decky/api";
+import { callable, definePlugin, routerHook } from "@decky/api";
 import {
-  ButtonItem, DialogCheckbox, PanelSection, PanelSectionRow, staticClasses,
+  ButtonItem, DialogCheckbox, Navigation, PanelSection, PanelSectionRow, staticClasses,
 } from "@decky/ui";
-import { SetStateAction, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
-import { ConnectionEditor } from "./connection-editor";
-import {
-  AdvancedProperty, draftChanged, EditorDraft, fromDraft, toDraft, WireGuardConfig,
-} from "./wireguard-config";
+import { CONFIG_ROUTE, ConfigPage, configPath } from "./config-page";
 
 type ConnectionState = "connected" | "connecting" | "disconnecting" | "disconnected" | "unknown";
 type HandshakeState = "inactive" | "waiting" | "established" | "timeout" | "unknown";
@@ -38,12 +35,6 @@ const setStartup = callable<[uuid: string, mode: StartupMode], Result<object>>("
 const setStartupRequirements = callable<
   [uuid: string, waitForSteam: boolean, waitForInternet: boolean], Result<object>
 >("set_startup_requirements");
-const getConnectionConfig = callable<
-  [uuid: string], Result<{ config: WireGuardConfig; advanced: AdvancedProperty[] }>
->("get_connection_config");
-const setConnectionConfig = callable<
-  [uuid: string, config: WireGuardConfig, advanced: AdvancedProperty[]], Result<object>
->("set_connection_config");
 const setSteamReadiness = callable<[ready: boolean, error: string | null], Result<object>>("set_steam_readiness");
 
 function monitorSteamReadiness(): () => void {
@@ -148,13 +139,6 @@ function Content() {
   const [busy, setBusy] = useState(false);
   const [pendingUuid, setPendingUuid] = useState<string | null>(null);
   const [selectedUuid, setSelectedUuid] = useState<string | null>(null);
-  const [editingConfig, setEditingConfig] = useState(false);
-  const [configDraft, setConfigDraft] = useState<EditorDraft | null>(null);
-  const [configSaved, setConfigSaved] = useState<EditorDraft | null>(null);
-  const [configLoading, setConfigLoading] = useState(false);
-  const [configError, setConfigError] = useState<string | null>(null);
-  const [configNotice, setConfigNotice] = useState<string | null>(null);
-  const configRequest = useRef(0);
   const [startup, setStartupSettings] = useState<(StartupSettings & { uuid: string }) | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [startupSettingsError, setStartupSettingsError] = useState<string | null>(null);
@@ -229,11 +213,8 @@ function Content() {
     return () => window.clearInterval(timer);
   }, [refresh, refreshInterval]);
 
-  const applyChange = async (
-    profile: Profile, action: () => Promise<Result<object>>,
-    reportError: (message: string) => void = setError,
-  ) => {
-    if (inFlight.current) return false;
+  const applyChange = async (profile: Profile, action: () => Promise<Result<object>>) => {
+    if (inFlight.current) return;
     inFlight.current = true;
     setBusy(true);
     setPendingUuid(profile.uuid);
@@ -241,17 +222,14 @@ function Content() {
     await refreshing.current;
     if (!mounted.current) {
       inFlight.current = false;
-      return false;
+      return;
     }
     let failure: string | null = null;
-    let succeeded = false;
     try {
       const result = await action();
       if (!result.success) throw new Error(result.error);
-      succeeded = true;
     } catch (error) {
-      if (reportError === setError) failure = errorMessage(error);
-      else if (mounted.current) reportError(errorMessage(error));
+      failure = errorMessage(error);
     }
     try {
       await loadProfiles();
@@ -266,68 +244,9 @@ function Content() {
         setPendingUuid(null);
       }
     }
-    return succeeded;
   };
-
-  const loadConfig = async (uuid: string, reset = true) => {
-    const request = ++configRequest.current;
-    setConfigLoading(true);
-    setConfigError(null);
-    if (reset) {
-      setConfigDraft(null);
-      setConfigSaved(null);
-    }
-    try {
-      const result = await getConnectionConfig(uuid);
-      if (!result.success) throw new Error(result.error);
-      if (mounted.current && request === configRequest.current) {
-        const draft = toDraft(result.config, result.advanced);
-        setConfigDraft(draft);
-        setConfigSaved(draft);
-        return true;
-      }
-    } catch (failure) {
-      if (mounted.current && request === configRequest.current) {
-        setConfigError(errorMessage(failure));
-      }
-    } finally {
-      if (mounted.current && request === configRequest.current) setConfigLoading(false);
-    }
-    return false;
-  };
-
-  const saveConfig = async (profile: Profile) => {
-    if (!configDraft) return;
-    let request: ReturnType<typeof fromDraft>;
-    try {
-      request = fromDraft(configDraft);
-    } catch (failure) {
-      setConfigError(errorMessage(failure));
-      return;
-    }
-    setConfigNotice(null);
-    const requestId = configRequest.current;
-    const saved = await applyChange(
-      profile, () => setConnectionConfig(profile.uuid, request.config, request.advanced),
-      setConfigError,
-    );
-    // Skip reloading if the user left the editor while saving.
-    if (!saved || !mounted.current || configRequest.current !== requestId) return;
-    // Keep the editor mounted so gamepad focus stays on the Save button.
-    if (await loadConfig(profile.uuid, false)) {
-      setConfigNotice(profile.state === "disconnected"
-        ? "Saved." : "Saved. Disconnect and reconnect to apply the changes.");
-    }
-  };
-
-  const changeConfig = useCallback((update: SetStateAction<EditorDraft>) => {
-    setConfigError(null);
-    setConfigNotice(null);
-    setConfigDraft((current) => current && (typeof update === "function" ? update(current) : update));
-  }, []);
 
   const selectedProfile = profiles?.find((profile) => profile.uuid === selectedUuid);
-  const configDirty = configDraft !== null && configSaved !== null && draftChanged(configDraft, configSaved);
   const selectedStartup = startup?.uuid === selectedUuid ? startup : null;
   const transitioning = selectedProfile?.state === "connecting" || selectedProfile?.state === "disconnecting";
   const selectedStatus = error ? "Status unavailable" : pendingUuid === selectedProfile?.uuid
@@ -344,7 +263,7 @@ function Content() {
 
   return (
     <PanelSection title={
-      selectedUuid === null ? "WireGuard connections" : editingConfig ? "Edit connection" : "Manage connection"
+selectedUuid === null ? "WireGuard connections" : "Manage connection"
     }>
       <style>{`
         @keyframes decky-wireguard-pulse {
@@ -359,15 +278,7 @@ function Content() {
         <ButtonItem
           layout="below"
           onClick={() => {
-            if (editingConfig) {
-              configRequest.current++;
-              setEditingConfig(false);
-              setConfigDraft(null);
-              setConfigSaved(null);
-              setConfigError(null);
-              setConfigNotice(null);
-              setError(null);
-            } else if (selectedUuid === null) {
+            if (selectedUuid === null) {
               void refresh();
             } else {
               setSelectedUuid(null);
@@ -376,7 +287,7 @@ function Content() {
           disabled={selectedUuid === null && busy}
         >
           {selectedUuid === null ? (busy ? "Working..." : "Refresh")
-            : editingConfig ? "Back to connection" : "Back to connections"}
+            : "Back to connections"}
         </ButtonItem>
       </PanelSectionRow>
       {error && (
@@ -425,7 +336,7 @@ function Content() {
       {selectedUuid !== null && !selectedProfile && profiles !== null && (
         <PanelSectionRow>Profile no longer available. Return to the connection list.</PanelSectionRow>
       )}
-      {selectedProfile && !editingConfig && (
+      {selectedProfile && (
         <PanelSectionRow>
           <ButtonItem
             layout="below"
@@ -448,18 +359,15 @@ function Content() {
           </ButtonItem>
         </PanelSectionRow>
       )}
-      {selectedProfile && !editingConfig && (
+      {selectedProfile && (
         <>
           <PanelSectionRow>
             <ButtonItem
               layout="below"
-              disabled={busy || error !== null}
+              description="Opens a full-screen editor."
               onClick={() => {
-                setError(null);
-                setConfigError(null);
-                setConfigNotice(null);
-                setEditingConfig(true);
-                void loadConfig(selectedProfile.uuid);
+                Navigation.Navigate(configPath(selectedProfile.uuid));
+                Navigation.CloseSideMenus();
               }}
             >
               Edit configuration
@@ -537,50 +445,6 @@ function Content() {
           )}
         </>
       )}
-      {selectedProfile && editingConfig && (
-        <>
-          {configLoading && <PanelSectionRow>Loading configuration...</PanelSectionRow>}
-          {configError && configDraft === null && (
-            <>
-              <PanelSectionRow>
-                <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
-                  Configuration unavailable: {configError}
-                </div>
-              </PanelSectionRow>
-              <PanelSectionRow>
-                <ButtonItem layout="below" disabled={configLoading}
-                  onClick={() => void loadConfig(selectedProfile.uuid)}>
-                  Retry
-                </ButtonItem>
-              </PanelSectionRow>
-            </>
-          )}
-          {configDraft && (
-            <>
-              <ConnectionEditor draft={configDraft} onChange={changeConfig} disabled={busy} />
-              {(configError || configNotice) && (
-                <PanelSectionRow>
-                  <div
-                    role={configError ? "alert" : "status"}
-                    style={{ color: configError ? "#ffb5b5" : undefined, overflowWrap: "anywhere", padding: "8px 0" }}
-                  >
-                    {configError ?? configNotice}
-                  </div>
-                </PanelSectionRow>
-              )}
-              <PanelSectionRow>
-                <ButtonItem
-                  layout="below"
-                  disabled={busy || configLoading || !configDirty}
-                  onClick={() => void saveConfig(selectedProfile)}
-                >
-                  {busy ? "Saving..." : configDirty ? "Save changes" : "No unsaved changes"}
-                </ButtonItem>
-              </PanelSectionRow>
-            </>
-          )}
-        </>
-      )}
       <PanelSectionRow>
         <div style={{ fontSize: "0.85em", opacity: 0.75, paddingTop: 8 }}>
           Status refreshes every second while verifying, otherwise every 5 seconds while this panel is open.
@@ -594,11 +458,15 @@ function Content() {
 
 export default definePlugin(() => {
   const stopMonitoring = monitorSteamReadiness();
+  routerHook.addRoute(CONFIG_ROUTE, ConfigPage, { exact: true });
   return {
     name: "WireGuard",
     titleView: <div className={staticClasses.Title}>WireGuard</div>,
     content: <Content />,
     icon: <FaShieldAlt />,
-    onDismount: stopMonitoring,
+    onDismount: () => {
+      routerHook.removeRoute(CONFIG_ROUTE);
+      stopMonitoring();
+    },
   };
 });

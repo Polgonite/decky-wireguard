@@ -10,11 +10,13 @@ const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
 }).outputText;
 
+const configPage = () => null;
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 function monitor(app) {
   const reports = [];
   const errors = [];
+  const routes = new Set();
   let interval;
   const context = {
     exports: {},
@@ -27,6 +29,13 @@ function monitor(app) {
     require: (name) => {
       if (name === "@decky/api") return {
         definePlugin: (factory) => factory,
+        routerHook: {
+          addRoute: (path, component) => {
+            assert.equal(component, configPage);
+            routes.add(path);
+          },
+          removeRoute: (path) => routes.delete(path),
+        },
         callable: (route) => async (...args) => {
           assert.equal(route, "set_steam_readiness");
           reports.push(args);
@@ -35,7 +44,7 @@ function monitor(app) {
       };
       if (name === "@decky/ui") return { staticClasses: { Title: "title" } };
       if (name === "react/jsx-runtime") return { jsx: () => ({}), jsxs: () => ({}) };
-      if (name === "./connection-editor" || name === "./wireguard-config") return {};
+      if (name === "./config-page") return { CONFIG_ROUTE: "/config/:uuid", ConfigPage: configPage };
       if (name === "react" || name === "react-icons/fa") return {};
       throw new Error(`Unexpected module: ${name}`);
     },
@@ -43,7 +52,7 @@ function monitor(app) {
   runInNewContext(compiled, context);
   const plugin = context.exports.default();
   return {
-    reports, errors, context,
+    reports, errors, context, routes,
     tick: async () => { interval?.(); await flush(); },
     stop: async () => { plugin.onDismount(); await flush(); },
   };
@@ -118,15 +127,17 @@ test("missing and failing Steam APIs fail closed, report the error, and recover"
   }
 });
 
-test("monitor works without mounting the panel and revokes readiness when unloaded", async () => {
+test("monitor works without mounting the panel; unloading revokes readiness and the editor route", async () => {
   const check = monitor({
     BHasCurrentUser: () => true,
     GetServicesInitialized: () => true,
   });
   await flush();
   assert.equal(check.reports.at(-1)[0], true);
+  assert.deepEqual([...check.routes], ["/config/:uuid"]);
   await check.stop();
   assert.equal(check.reports.at(-1)[0], false);
+  assert.equal(check.routes.size, 0);
   const count = check.reports.length;
   await check.tick();
   assert.equal(check.reports.length, count);
