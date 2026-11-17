@@ -170,8 +170,6 @@ export function ConfigPage() {
   }, []);
 
   const cancelButton = useCallback((event: GamepadEvent) => {
-    // Without unsaved changes, let Steam handle B as a normal back navigation.
-    if (!dirtyRef.current) return;
     event.preventDefault();
     event.stopPropagation();
     leave();
