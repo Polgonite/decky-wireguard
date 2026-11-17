@@ -15,6 +15,7 @@ const configContext = { exports: {} };
 runInNewContext(compile("wireguard-config.ts"), configContext);
 const config = configContext.exports;
 const compiled = compile("config-page.tsx");
+const navigationCompiled = compile("plugin-navigation.ts");
 const saved = config.toDraft({
   name: "Home", private_key: "", addresses: "10.0.0.2/32", dns: "", mtu: "",
   listen_port: "", peers: [],
@@ -23,6 +24,7 @@ const saved = config.toDraft({
 function page(draft = saved) {
   const hooks = [draft, saved];
   const modals = [];
+  const openedPanels = [];
   let cursor = 0;
   let navigations = 0;
   const element = (type, props) => ({ type, props });
@@ -33,7 +35,14 @@ function page(draft = saved) {
       if (name === "@decky/ui") return {
         staticClasses: { Title: "title" },
         useParams: () => ({ uuid: "test" }),
-        Navigation: { NavigateBack: () => { navigations++; } },
+        Navigation: {
+          NavigateBack: () => { navigations++; },
+          OpenQuickAccessMenu: (tab) => {
+            assert.equal(navigations, 1, "Close the editor before reopening the panel");
+            openedPanels.push({ tab, uuid: navigation.exports.useSelectedConnection()[0] });
+          },
+        },
+        QuickAccessTab: { Decky: 999 },
         showModal: (modal, _parent, options) => modals.push({ ...modal, options }),
         ...Object.fromEntries(["ButtonItem", "ConfirmModal", "DialogBody", "Focusable", "PanelSectionRow"]
           .map((name) => [name, name])),
@@ -53,12 +62,16 @@ function page(draft = saved) {
         },
         useCallback: (callback) => callback,
         useEffect: () => {},
+        useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
       };
       if (name === "./connection-editor") return { ConnectionEditor: "ConnectionEditor" };
       if (name === "./wireguard-config") return config;
+      if (name === "./plugin-navigation") return navigation.exports;
       throw new Error(`Unexpected module: ${name}`);
     },
   };
+  const navigation = { exports: {}, require: context.require };
+  runInNewContext(navigationCompiled, navigation);
   runInNewContext(compiled, context);
 
   function render() {
@@ -87,7 +100,7 @@ function page(draft = saved) {
       change: (update) => find(tree, "ConnectionEditor").props.onChange(update),
     };
   }
-  return { render, modals, get navigations() { return navigations; } };
+  return { render, modals, openedPanels, get navigations() { return navigations; } };
 }
 
 for (const input of ["back", "cancel"]) {
@@ -95,6 +108,7 @@ for (const input of ["back", "cancel"]) {
     const editor = page();
     editor.render()[input]();
     assert.equal(editor.navigations, 1);
+    assert.deepEqual(editor.openedPanels, [{ tab: 999, uuid: "test" }]);
     assert.equal(editor.modals.length, 0);
   });
 
@@ -104,6 +118,7 @@ for (const input of ["back", "cancel"]) {
     view[input]();
     view[input]();
     assert.equal(editor.navigations, 0);
+    assert.equal(editor.openedPanels.length, 0);
     assert.equal(editor.modals.length, 1);
     editor.modals[0].options.fnOnClose();
     assert.equal(editor.navigations, 0);
@@ -111,6 +126,7 @@ for (const input of ["back", "cancel"]) {
     assert.equal(editor.modals.length, 2);
     editor.modals[1].props.onOK();
     assert.equal(editor.navigations, 1);
+    assert.deepEqual(editor.openedPanels, [{ tab: 999, uuid: "test" }]);
   });
 }
 

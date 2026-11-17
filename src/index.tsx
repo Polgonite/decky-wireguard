@@ -5,6 +5,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
 import { CONFIG_ROUTE, ConfigPage, configPath } from "./config-page";
+import { useSelectedConnection } from "./plugin-navigation";
 import { UpdateButton } from "./updater";
 
 type ConnectionState = "connected" | "connecting" | "disconnecting" | "disconnected" | "unknown";
@@ -139,7 +140,7 @@ function Content() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [pendingUuid, setPendingUuid] = useState<string | null>(null);
-  const [selectedUuid, setSelectedUuid] = useState<string | null>(null);
+  const [selectedUuid, setSelectedUuid] = useSelectedConnection();
   const [startup, setStartupSettings] = useState<(StartupSettings & { uuid: string }) | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [startupSettingsError, setStartupSettingsError] = useState<string | null>(null);
@@ -162,6 +163,9 @@ function Content() {
       }
     }
     if (mounted.current) {
+      if (selectedUuid && !result.profiles.some((profile) => profile.uuid === selectedUuid)) {
+        setSelectedUuid(null);
+      }
       setStartupError(result.startup_error ?? null);
       setStartupSettingsError(settingsError);
       setStartupSettings(settings && selectedUuid
@@ -177,7 +181,7 @@ function Content() {
         }) ? previous : result.profiles,
       );
     }
-  }, [selectedUuid]);
+  }, [selectedUuid, setSelectedUuid]);
 
   const refresh = useCallback(() => {
     if (inFlight.current) return;
