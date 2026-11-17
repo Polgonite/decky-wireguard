@@ -25,6 +25,11 @@ Keep configuration files and private keys out of this repository. Importing may
 enable NetworkManager autoconnect; review the imported profile's settings in
 Desktop Mode or use the plugin's startup checkboxes before rebooting.
 
+Closing the full-screen configuration editor reopens the WireGuard plugin panel
+with the edited connection selected. If that connection is no longer available,
+the panel returns to the connection list. Unsaved edits require confirmation
+before they are discarded.
+
 ## Build
 
 Use Node.js 22.13+ with npm and Python 3.10+:

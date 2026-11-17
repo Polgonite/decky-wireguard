@@ -1,10 +1,11 @@
 import { callable } from "@decky/api";
 import {
-  ButtonItem, ConfirmModal, DialogBody, Focusable, GamepadEvent, Navigation, PanelSectionRow, showModal,
+  ButtonItem, ConfirmModal, DialogBody, Focusable, GamepadEvent, PanelSectionRow, showModal,
   staticClasses, useParams,
 } from "@decky/ui";
 import { SetStateAction, useCallback, useEffect, useRef, useState } from "react";
 import { ConnectionEditor } from "./connection-editor";
+import { returnToPlugin } from "./plugin-navigation";
 import {
   AdvancedProperty, draftChanged, EditorDraft, fromDraft, toDraft, WireGuardConfig,
 } from "./wireguard-config";
@@ -144,7 +145,7 @@ export function ConfigPage() {
 
   const leave = useCallback(() => {
     if (!dirtyRef.current) {
-      Navigation.NavigateBack();
+      returnToPlugin(uuid);
       return;
     }
     if (confirming.current) return;
@@ -157,7 +158,7 @@ export function ConfigPage() {
         strCancelButtonText="Keep editing"
         bDestructiveWarning
         onOK={() => {
-          if (mounted.current) Navigation.NavigateBack();
+          if (mounted.current) returnToPlugin(uuid);
         }}
       />,
       undefined,
@@ -167,7 +168,7 @@ export function ConfigPage() {
         },
       },
     );
-  }, []);
+  }, [uuid]);
 
   const cancelButton = useCallback((event: GamepadEvent) => {
     event.preventDefault();
