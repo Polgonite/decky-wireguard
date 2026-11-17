@@ -145,6 +145,19 @@ status means the working tree is clean.
    the code: the backend requests root privileges to control NetworkManager.
 3. Open **WireGuard** in the Decky quick-access panel.
 
+For subsequent updates, select **Update to latest build** below the connection
+list, then approve Decky's installation dialog. The button checks the repository's
+100 most recent GitHub releases, including development prereleases, and selects
+the most recently published installable ZIP. It shows the installed version and
+does not reinstall the same version. GitHub's SHA-256 asset digest is required
+and passed to Decky for verification. Decky downloads, installs, and reloads the
+plugin; NetworkManager profiles and persistent startup settings are not changed.
+An internet connection is required; API limits, missing digests, and download
+errors are reported instead of falling back to an older build. Installation
+progress and installation errors appear in Decky's dialog. This uses Decky's
+internal native installer because `@decky/api` has no public installation API;
+if unavailable, update Decky Loader or install the release ZIP manually.
+
 Do not install the source directory without building it first. If your Decky
 version does not offer ZIP installation, extract the archive so the plugin is
 at `~/homebrew/plugins/decky-wireguard/` (or your Decky's configured plugins
