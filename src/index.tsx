@@ -21,6 +21,13 @@ interface Profile {
   handshake_error: string | null;
 }
 
+interface PeerHealth {
+  public_key: string;
+  last_handshake: number | null;
+  received_bytes: number;
+  sent_bytes: number;
+}
+
 type Result<T> = ({ success: true } & T) | { success: false; error: string };
 type StartupMode = "off" | "on_boot" | "after_boot";
 interface StartupSettings {
@@ -32,6 +39,7 @@ interface StartupSettings {
 }
 
 const getProfiles = callable<[], Result<{ profiles: Profile[]; startup_error?: string }>>("get_profiles");
+const getPeerHealth = callable<[uuid: string], Result<{ peers: PeerHealth[] }>>("get_peer_health");
 const setConnection = callable<[uuid: string, connected: boolean], Result<object>>("set_connection");
 const getStartupSettings = callable<[uuid: string], Result<StartupSettings>>("get_startup_settings");
 const setStartup = callable<[uuid: string, mode: StartupMode], Result<object>>("set_startup");
@@ -136,6 +144,27 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function formatHandshakeAge(timestamp: number | null): string {
+  if (timestamp === null) return "Never";
+  const age = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
+  if (age < 60) return `${age}s ago`;
+  if (age < 3600) return `${Math.floor(age / 60)}m ago`;
+  if (age < 86400) return `${Math.floor(age / 3600)}h ago`;
+  return `${Math.floor(age / 86400)}d ago`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let value = bytes;
+  let unit = -1;
+  do {
+    value /= 1024;
+    unit += 1;
+  } while (value >= 1024 && unit < units.length - 1);
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
 function Content() {
   const [profiles, setProfiles] = useState<Profile[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -145,6 +174,8 @@ function Content() {
   const [startup, setStartupSettings] = useState<(StartupSettings & { uuid: string }) | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [startupSettingsError, setStartupSettingsError] = useState<string | null>(null);
+  const [peerHealth, setPeerHealth] = useState<{ uuid: string; peers: PeerHealth[] } | null>(null);
+  const [peerHealthError, setPeerHealthError] = useState<string | null>(null);
   const inFlight = useRef(false);
   const refreshing = useRef<Promise<void> | null>(null);
   const mounted = useRef(false);
@@ -253,6 +284,39 @@ function Content() {
   };
 
   const selectedProfile = profiles?.find((profile) => profile.uuid === selectedUuid);
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    setPeerHealth(null);
+    setPeerHealthError(null);
+    if (!selectedUuid || selectedProfile?.state !== "connected") {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const load = async () => {
+      if (inFlight || cancelled) return;
+      inFlight = true;
+      try {
+        const result = await getPeerHealth(selectedUuid);
+        if (!result.success) throw new Error(result.error);
+        if (!cancelled) {
+          setPeerHealth({ uuid: selectedUuid, peers: result.peers });
+          setPeerHealthError(null);
+        }
+      } catch (failure) {
+        if (!cancelled) setPeerHealthError(errorMessage(failure));
+      } finally {
+        inFlight = false;
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [selectedProfile?.state, selectedUuid]);
   const selectedStartup = startup?.uuid === selectedUuid ? startup : null;
   const transitioning = selectedProfile?.state === "connecting" || selectedProfile?.state === "disconnecting";
   const selectedStatus = error ? "Status unavailable" : pendingUuid === selectedProfile?.uuid
@@ -374,6 +438,49 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
       )}
       {selectedProfile && (
         <>
+          <PanelSectionRow>
+            <div style={{ fontSize: "0.85em", opacity: 0.75, padding: "8px 0" }}>
+              Peer health
+            </div>
+          </PanelSectionRow>
+          {selectedProfile.state !== "connected" ? (
+            <PanelSectionRow>
+              <div style={{ fontSize: "0.85em", opacity: 0.75, padding: "8px 0" }}>
+                Peer details are available while connected.
+              </div>
+            </PanelSectionRow>
+          ) : peerHealthError ? (
+            <PanelSectionRow>
+              <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
+                Peer details unavailable: {peerHealthError}
+              </div>
+            </PanelSectionRow>
+          ) : peerHealth?.uuid !== selectedProfile.uuid ? (
+            <PanelSectionRow>Loading peer details...</PanelSectionRow>
+          ) : peerHealth.peers.length === 0 ? (
+            <PanelSectionRow>No peer statistics available.</PanelSectionRow>
+          ) : (
+            <>
+              {peerHealth.peers.map((peer, index) => (
+                <PanelSectionRow key={peer.public_key}>
+                  <div style={{ fontSize: "0.85em", overflowWrap: "anywhere", padding: "8px 0", width: "100%" }}>
+                    <div>Peer {index + 1} · {peer.public_key.slice(0, 12)}...</div>
+                    <div style={{ opacity: 0.75 }}>
+                      Last handshake: {formatHandshakeAge(peer.last_handshake)}
+                    </div>
+                    <div style={{ opacity: 0.75 }}>
+                      Received: {formatBytes(peer.received_bytes)} · Sent: {formatBytes(peer.sent_bytes)}
+                    </div>
+                  </div>
+                </PanelSectionRow>
+              ))}
+              <PanelSectionRow>
+                <div style={{ fontSize: "0.8em", opacity: 0.7, padding: "4px 0" }}>
+                  Traffic totals are cumulative interface counters. Handshake age is historical, not a live health guarantee.
+                </div>
+              </PanelSectionRow>
+            </>
+          )}
           <PanelSectionRow>
             <ButtonItem
               layout="below"

@@ -19,6 +19,7 @@ from main import (
     _nmcli,
     _probe_targets,
     _received_bytes,
+    _transfer_counters,
     _encode_bus_value,
     _send_probe,
     _split_signature,
@@ -534,6 +535,45 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_list_is_success(self):
         self.nmcli.return_value = ""
         self.assertEqual(await self.plugin.get_profiles(), {"success": True, "profiles": []})
+
+    async def test_peer_health_returns_per_peer_handshakes_and_traffic_counters(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        with patch(
+            "main._handshakes", new_callable=AsyncMock,
+            return_value={"peer1": 1234, "peer2": 0},
+        ), patch(
+            "main._transfer_counters", new_callable=AsyncMock,
+            return_value={"peer1": (2048, 4096), "peer3": (0, 0)},
+        ):
+            result = await self.plugin.get_peer_health(HOME)
+        self.assertEqual(result, {
+            "success": True,
+            "peers": [
+                {
+                    "public_key": "peer1", "last_handshake": 1234,
+                    "received_bytes": 2048, "sent_bytes": 4096,
+                },
+                {
+                    "public_key": "peer2", "last_handshake": None,
+                    "received_bytes": 0, "sent_bytes": 0,
+                },
+                {
+                    "public_key": "peer3", "last_handshake": None,
+                    "received_bytes": 0, "sent_bytes": 0,
+                },
+            ],
+        })
+
+    async def test_peer_health_does_not_query_interface_when_disconnected(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:--:deactivated:--\n"
+        with patch("main._handshakes", new_callable=AsyncMock) as handshakes, patch(
+            "main._transfer_counters", new_callable=AsyncMock,
+        ) as counters:
+            self.assertEqual(
+                await self.plugin.get_peer_health(HOME), {"success": True, "peers": []},
+            )
+        handshakes.assert_not_awaited()
+        counters.assert_not_awaited()
 
     async def test_transient_and_unrecognized_states(self):
         for raw, expected in [
@@ -1269,12 +1309,16 @@ class SubprocessTests(unittest.IsolatedAsyncioTestCase):
         ) as command:
             self.assertEqual(await _received_bytes("wg0"), {"peer": 123})
         command.assert_awaited_once_with("wg", "show", "wg0", "transfer")
+        with patch(
+            "main._command", new_callable=AsyncMock, return_value="peer\t123\t999999\n",
+        ):
+            self.assertEqual(await _transfer_counters("wg0"), {"peer": (123, 999999)})
         for output in ["peer\t-1\t0\n", "peer\t1\n", "peer\tx\t10\n", "peer\t1\tbad\n"]:
             with self.subTest(output=output), patch(
                 "main._command", new_callable=AsyncMock, return_value=output,
             ):
                 with self.assertRaisesRegex(NetworkManagerError, "unexpected transfer data"):
-                    await _received_bytes("wg0")
+                    await _transfer_counters("wg0")
 
     async def test_handshake_query_only_requests_timestamps_without_secrets(self):
         process = Mock(

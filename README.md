@@ -241,6 +241,10 @@ directory), then restart Decky Loader.
   update profiles when the response changes; connection actions still show a
   busy state. Unavailable status disables actions until a successful refresh,
   rather than treating an error as a disconnected profile.
+- A selected connected profile shows per-peer last-handshake age and cumulative
+  received/sent traffic counters, refreshed every five seconds. Public keys are
+  abbreviated. These are historical diagnostics: traffic totals are interface
+  counters, and a recent handshake does not guarantee ongoing peer health.
 - All mutations are serialized and restricted to WireGuard profiles. No shell is
   used. Missing tools, authorization failures, and NetworkManager errors appear
   in the panel. Actions have a 30-second NetworkManager wait limit; if an action

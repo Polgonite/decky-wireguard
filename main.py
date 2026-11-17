@@ -631,17 +631,24 @@ async def _handshakes(device: str) -> dict[str, int]:
     return handshakes
 
 
-async def _received_bytes(device: str) -> dict[str, int]:
+async def _transfer_counters(device: str) -> dict[str, tuple[int, int]]:
     output = await _command("wg", "show", device, "transfer")
-    received: dict[str, int] = {}
+    counters: dict[str, tuple[int, int]] = {}
     for line in output.splitlines():
         fields = line.split()
         if len(fields) != 3 or any(
             not value.isascii() or not value.isdecimal() for value in fields[1:]
         ):
             raise NetworkManagerError("WireGuard returned unexpected transfer data.")
-        received[fields[0]] = int(fields[1])
-    return received
+        counters[fields[0]] = (int(fields[1]), int(fields[2]))
+    return counters
+
+
+async def _received_bytes(device: str) -> dict[str, int]:
+    return {
+        peer: received
+        for peer, (received, _) in (await _transfer_counters(device)).items()
+    }
 
 
 def _unicast(address: Address) -> bool:
@@ -1162,6 +1169,29 @@ class Plugin:
                 if self._startup_error is not None:
                     result["startup_error"] = self._startup_error
                 return result
+        except NetworkManagerError as error:
+            return self._failure(error)
+
+    async def get_peer_health(self, uuid: str) -> dict[str, object]:
+        try:
+            async with self._lock:
+                profile = await self._profile(uuid)
+                if profile["state"] != "connected":
+                    return {"success": True, "peers": []}
+                if not profile["device"]:
+                    raise NetworkManagerError("NetworkManager did not report a WireGuard interface.")
+                handshakes = await _handshakes(profile["device"])
+                counters = await _transfer_counters(profile["device"])
+                peers = [
+                    {
+                        "public_key": peer,
+                        "last_handshake": handshakes.get(peer) or None,
+                        "received_bytes": counters.get(peer, (0, 0))[0],
+                        "sent_bytes": counters.get(peer, (0, 0))[1],
+                    }
+                    for peer in sorted(handshakes.keys() | counters.keys())
+                ]
+                return {"success": True, "peers": peers}
         except NetworkManagerError as error:
             return self._failure(error)
 
