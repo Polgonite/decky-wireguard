@@ -1,6 +1,7 @@
 import { callable, definePlugin, routerHook } from "@decky/api";
 import {
-  ButtonItem, DialogCheckbox, Navigation, PanelSection, PanelSectionRow, staticClasses,
+  ButtonItem, DialogCheckbox, Focusable, GamepadEvent, Navigation, PanelSection, PanelSectionRow,
+  staticClasses,
 } from "@decky/ui";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
@@ -266,7 +267,14 @@ function Content() {
     return profile.handshake;
   };
 
-  return (
+  const cancelButton = (event: GamepadEvent) => {
+    if (selectedUuid === null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setSelectedUuid(null);
+  };
+
+  const panel = (
     <PanelSection title={
 selectedUuid === null ? "WireGuard connections" : "Manage connection"
     }>
@@ -460,6 +468,8 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
       </PanelSectionRow>
     </PanelSection>
   );
+
+  return <Focusable onCancelButton={cancelButton}>{panel}</Focusable>;
 }
 
 export default definePlugin(() => {

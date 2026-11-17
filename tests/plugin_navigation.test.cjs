@@ -63,7 +63,8 @@ function plugin(profiles) {
       };
       if (name === "@decky/ui") return {
         staticClasses: { Title: "title" }, Navigation: { NavigateBack: () => {}, OpenQuickAccessMenu: () => {} },
-        QuickAccessTab: { Decky: 999 }, PanelSection: "PanelSection",
+        QuickAccessTab: { Decky: 999 }, PanelSection: "PanelSection", Focusable: "Focusable",
+        ButtonItem: "ButtonItem",
       };
       if (name === "./plugin-navigation") return navigation.exports;
       if (name === "./config-page" || name === "./updater" || name === "react-icons/fa") return {};
@@ -96,9 +97,9 @@ test("returning to the plugin retains the edited connection across panel remount
   const panel = plugin([profile]);
   panel.navigation.returnToPlugin("home");
   await panel.mount();
-  assert.equal(panel.render().props.title, "Manage connection");
+  assert.equal(panel.render().props.children.props.title, "Manage connection");
   await panel.mount();
-  assert.equal(panel.render().props.title, "Manage connection");
+  assert.equal(panel.render().props.children.props.title, "Manage connection");
   assert.equal(panel.navigation.useSelectedConnection()[0], "home");
 });
 
@@ -106,7 +107,7 @@ test("a missing connection falls back to the plugin landing page", async () => {
   const panel = plugin([]);
   panel.navigation.returnToPlugin("deleted");
   await panel.mount();
-  assert.equal(panel.render().props.title, "WireGuard connections");
+  assert.equal(panel.render().props.children.props.title, "WireGuard connections");
   assert.equal(panel.navigation.useSelectedConnection()[0], null);
 });
 
@@ -118,8 +119,43 @@ test("returning without a saved connection opens the landing page and notifies a
   const unsubscribe = panel.subscribe(() => { updates++; });
   panel.navigation.returnToPlugin(null);
   assert.equal(updates, 1);
-  assert.equal(panel.render().props.title, "WireGuard connections");
+  assert.equal(panel.render().props.children.props.title, "WireGuard connections");
   unsubscribe();
   panel.navigation.returnToPlugin("home");
   assert.equal(updates, 1);
+});
+
+test("B returns from connection settings to the list without closing the sidebar", async () => {
+  const panel = plugin([profile]);
+  panel.navigation.returnToPlugin("home");
+  await panel.mount();
+  const event = {
+    preventDefault: () => { event.prevented = true; },
+    stopPropagation: () => { event.stopped = true; },
+  };
+  const view = panel.render();
+  assert.equal(view.type, "Focusable");
+  view.props.onCancelButton(event);
+  assert.equal(event.prevented, true);
+  assert.equal(event.stopped, true);
+  assert.equal(panel.navigation.useSelectedConnection()[0], null);
+  assert.equal(panel.render().props.children.props.title, "WireGuard connections");
+
+  panel.render().props.onCancelButton({
+    preventDefault: () => assert.fail("B must still exit from the connection list"),
+    stopPropagation: () => assert.fail("B must still bubble from the connection list"),
+  });
+});
+
+test("the Back button returns from connection settings to the list", async () => {
+  const panel = plugin([profile]);
+  panel.navigation.returnToPlugin("home");
+  await panel.mount();
+  const section = panel.render().props.children;
+  const backRow = section.props.children[1];
+  assert.equal(backRow.props.children.type, "ButtonItem");
+  assert.equal(backRow.props.children.props.children, "Back to connections");
+  backRow.props.children.props.onClick();
+  assert.equal(panel.navigation.useSelectedConnection()[0], null);
+  assert.equal(panel.render().props.children.props.title, "WireGuard connections");
 });

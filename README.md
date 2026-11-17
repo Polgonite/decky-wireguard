@@ -173,8 +173,9 @@ directory), then restart Decky Loader.
 - Every native WireGuard profile is listed, including disconnected profiles.
   Names with colons and backslashes are supported, and actions use UUIDs so
   duplicate names are safe. Select a connection to open its management menu and
-  connect or disconnect it; use Back to return to the list. The short UUID
-  appears beside each status.
+  connect or disconnect it; press B or select Back to return to the list without
+  closing the sidebar. B on the connection list exits the plugin as usual.
+  The short UUID appears beside each status.
 - Select **Edit configuration** to open a full-screen editor that lays out the
   profile like a WireGuard `.conf` file: **Interface** (private key with its derived public key, addresses,
   DNS servers and search domains) followed by each **Peer** (public key, preshared
