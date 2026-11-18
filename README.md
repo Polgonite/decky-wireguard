@@ -272,7 +272,9 @@ directory), then restart Decky Loader.
 - Two independent per-connection checkboxes control plugin-managed startup:
   **Wait for Steam login** and **Wait for internet**. Both default to enabled,
   including for connections configured before these options were added. They
-  do not affect NetworkManager boot autoconnect or manual Connect actions.
+  only appear when **Connect after boot** is enabled, and their saved values
+  are preserved when it is turned off and on again. They do not affect
+  NetworkManager boot autoconnect or manual Connect actions.
   Turn off the internet requirement for private/offline-only VPNs if needed.
 - Steam readiness is monitored from plugin initialization, even with the panel
   closed. It uses Steam's `BHasCurrentUser()` login-completion predicate and

@@ -19,7 +19,7 @@ const profile = {
   handshake: "inactive", handshake_error: null,
 };
 
-function plugin(profiles) {
+function plugin(profiles, backend) {
   let hooks = [];
   let cursor = 0;
   let effects = [];
@@ -55,8 +55,9 @@ function plugin(profiles) {
       if (name === "@decky/api") return {
         definePlugin: (factory) => factory,
         routerHook: { addRoute: () => {}, removeRoute: () => {} },
-        callable: (route) => async () => {
+        callable: (route) => async (...args) => {
           if (route === "get_profiles") return { success: true, profiles };
+          if (backend && route !== "set_steam_readiness") return backend(route, ...args);
           if (route === "get_startup_settings" || route === "set_steam_readiness") {
             return { success: true };
           }
@@ -70,7 +71,7 @@ function plugin(profiles) {
           Navigate: (path) => navigations.push(path), CloseSideMenus: () => navigations.push("close"),
         },
         QuickAccessTab: { Decky: 999 }, PanelSection: "PanelSection", Focusable: "Focusable",
-        ButtonItem: "ButtonItem",
+        ButtonItem: "ButtonItem", ToggleField: "ToggleField",
       };
       if (name === "./plugin-navigation") return navigation.exports;
       if (name === "./config-page") return { configPath: (uuid) => `/config/${uuid}` };
@@ -215,4 +216,74 @@ test("the new connection button is above Update and opens the configuration page
   assert.ok(add >= 0 && update > add);
   elements[add].props.onClick();
   assert.deepEqual(panel.navigations, ["/config/new", "close"]);
+});
+
+function toggles(panel) {
+  const fields = {};
+  function collect(node) {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "ToggleField") fields[node.props.label] = node.props;
+    const children = node.props?.children;
+    (Array.isArray(children) ? children : [children]).forEach(collect);
+  }
+  collect(panel.render());
+  return fields;
+}
+
+for (const mode of ["off", "on_boot", "after_boot"]) {
+  test(`startup wait switches are ${mode === "after_boot" ? "visible" : "hidden"} in ${mode} mode`, async () => {
+    const panel = plugin([profile], (route) => {
+      assert.equal(route, "get_startup_settings");
+      return {
+        success: true, on_boot: mode === "on_boot", after_boot: mode === "after_boot",
+        wait_for_steam: true, wait_for_internet: true, waiting: null,
+      };
+    });
+    panel.navigation.returnToPlugin("home");
+    await panel.mount();
+    const fields = toggles(panel);
+    for (const label of ["Wait for Steam login", "Wait for internet"]) {
+      assert.equal(fields[label] !== undefined, mode === "after_boot");
+      if (mode === "after_boot") {
+        assert.equal(fields[label].checked, true);
+        assert.equal(fields[label].disabled, false);
+      }
+    }
+  });
+}
+
+test("startup wait choices survive hiding, showing, and remounting the panel", async () => {
+  const settings = {
+    on_boot: false, after_boot: true,
+    wait_for_steam: true, wait_for_internet: true, waiting: null,
+  };
+  const panel = plugin([profile], (route, uuid, first, second) => {
+    assert.equal(uuid, "home");
+    if (route === "get_startup_settings") return { success: true, ...settings };
+    if (route === "set_startup_requirements") {
+      settings.wait_for_steam = first;
+      settings.wait_for_internet = second;
+    } else {
+      assert.equal(route, "set_startup");
+      settings.on_boot = first === "on_boot";
+      settings.after_boot = first === "after_boot";
+    }
+    return { success: true };
+  });
+  panel.navigation.returnToPlugin("home");
+  await panel.mount();
+  for (const label of ["Wait for Steam login", "Wait for internet"]) {
+    toggles(panel)[label].onChange(false);
+    await flush();
+    assert.equal(toggles(panel)[label].checked, false);
+  }
+  toggles(panel)["Connect after boot"].onChange(false);
+  await flush();
+  assert.equal(toggles(panel)["Wait for Steam login"], undefined);
+  assert.equal(toggles(panel)["Wait for internet"], undefined);
+  toggles(panel)["Connect after boot"].onChange(true);
+  await flush();
+  await panel.mount();
+  assert.equal(toggles(panel)["Wait for Steam login"].checked, false);
+  assert.equal(toggles(panel)["Wait for internet"].checked, false);
 });

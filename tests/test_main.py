@@ -301,6 +301,17 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.activations())
         self.assertTrue(self.autoconnect[HOME])
 
+    async def test_requirements_survive_startup_mode_changes(self):
+        for steam, internet in [(False, True), (True, False), (False, False)]:
+            await self.plugin.set_startup_requirements(HOME, steam, internet)
+            for mode in ["after_boot", "off", "after_boot", "on_boot", "after_boot"]:
+                with self.subTest(steam=steam, internet=internet, mode=mode):
+                    self.assertEqual(await self.plugin.set_startup(HOME, mode), {"success": True})
+                    result = await Plugin().get_startup_settings(HOME)
+                    self.assertTrue(result["success"])
+                    self.assertEqual(result["wait_for_steam"], steam)
+                    self.assertEqual(result["wait_for_internet"], internet)
+
     async def test_invalid_requirements_do_not_write_or_modify_networkmanager(self):
         for uuid, steam, internet in [
             (HOME, "yes", True), (HOME, True, 1), (WIFI, False, False), ("--help", True, True),

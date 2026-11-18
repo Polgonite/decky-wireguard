@@ -523,34 +523,38 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
               )}
             />
           </PanelSectionRow>
-          <PanelSectionRow>
-            <ToggleField
-              label="Wait for Steam login"
-              description="For plugin-managed startup, wait until Steam finishes logging in, including Offline Mode."
-              checked={selectedStartup?.wait_for_steam ?? true}
-              disabled={busy || error !== null || selectedStartup === null}
-              onChange={(checked) => selectedStartup && void applyChange(
-                selectedProfile,
-                () => setStartupRequirements(
-                  selectedProfile.uuid, checked, selectedStartup.wait_for_internet,
-                ),
-              )}
-            />
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <ToggleField
-              label="Wait for internet"
-              description="For plugin-managed startup, wait for NetworkManager to verify internet on Wi-Fi, Ethernet, or mobile data, not a VPN."
-              checked={selectedStartup?.wait_for_internet ?? true}
-              disabled={busy || error !== null || selectedStartup === null}
-              onChange={(checked) => selectedStartup && void applyChange(
-                selectedProfile,
-                () => setStartupRequirements(
-                  selectedProfile.uuid, selectedStartup.wait_for_steam, checked,
-                ),
-              )}
-            />
-          </PanelSectionRow>
+          {selectedStartup?.after_boot && (
+            <>
+              <PanelSectionRow>
+                <ToggleField
+                  label="Wait for Steam login"
+                  description="For plugin-managed startup, wait until Steam finishes logging in, including Offline Mode."
+                  checked={selectedStartup.wait_for_steam}
+                  disabled={busy || error !== null}
+                  onChange={(checked) => void applyChange(
+                    selectedProfile,
+                    () => setStartupRequirements(
+                      selectedProfile.uuid, checked, selectedStartup.wait_for_internet,
+                    ),
+                  )}
+                />
+              </PanelSectionRow>
+              <PanelSectionRow>
+                <ToggleField
+                  label="Wait for internet"
+                  description="For plugin-managed startup, wait for NetworkManager to verify internet on Wi-Fi, Ethernet, or mobile data, not a VPN."
+                  checked={selectedStartup.wait_for_internet}
+                  disabled={busy || error !== null}
+                  onChange={(checked) => void applyChange(
+                    selectedProfile,
+                    () => setStartupRequirements(
+                      selectedProfile.uuid, selectedStartup.wait_for_steam, checked,
+                    ),
+                  )}
+                />
+              </PanelSectionRow>
+            </>
+          )}
           {selectedStartup?.waiting && (
             <PanelSectionRow>
               <div role="status" style={{ fontSize: "0.85em", padding: "8px 0" }}>
