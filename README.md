@@ -14,14 +14,14 @@ A Decky Loader plugin for creating, configuring, connecting, and disconnecting
 - Connections requiring an interactive password prompt are not supported;
   keys must be saved in the profile.
 
-Profiles created only with `wg-quick` are not shown. Select **Add new connection**
+Profiles created only with `wg-quick` are not shown. Select **Add connection**
 above the update button to open the same editor used by **Edit configuration**.
 Enter a name and configuration manually, or select **Import .conf file** to
 browse for a trusted WireGuard configuration. A new connection uses the filename
 as its name if no name has been entered. New profiles are created disconnected,
 with automatic startup disabled.
 
-Import only fills the editor: **Save changes** is required to create or update
+Import only fills the editor: **Save** is required to create or update
 the NetworkManager profile. Import replaces the private key, addresses, DNS and
 entire peer list, clearing omitted values (including preshared keys). The name
 and omitted advanced settings, including MTU, listen port, firewall mark and
@@ -384,7 +384,7 @@ that the tunnel stopped passing traffic. A tunnel that stayed green may simply
 have been verified before sleep. If it happens again, try reaching a service
 behind the affected tunnel before switching modes or reconnecting.
 
-In the WireGuard connections list, turn on **Diagnostic logging** for
+In the connections list, turn on **Diagnostic logging** for
 NetworkManager activation and verification changes, including detected resumes.
 Then turn on **Debug logging** for probe outcomes, handshake ages, whether
 receive/send counters changed, and whether a peer's endpoint changed or was

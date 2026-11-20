@@ -63,22 +63,19 @@ export function ConnectionEditor({ draft, onChange, disabled }: {
     <>
       <PanelSectionRow>
         <div style={{ fontSize: "0.85em", opacity: 0.8, padding: "8px 0" }}>
-          Fields match the [Interface] and [Peer] sections of a WireGuard .conf file.
-          Separate multiple values with commas. A name and private key are required,
-          plus a public key for every peer. Save validates the entire configuration,
-          including unchanged fields.
+          Separate addresses, DNS entries and allowed IPs with commas or spaces.
         </div>
       </PanelSectionRow>
-      {configField("name", "Name", "Required. Connection label; spaces and Unicode are allowed.")}
+      {configField("name", "Name", "Required.")}
       <Heading>Interface</Heading>
       {configField("private_key", "Private key", (
         <span style={{ overflowWrap: "anywhere" }}>
           {publicKey ? `Public key: ${publicKey}`
-            : "Required. A 44-character base64 WireGuard key (32 bytes, ending in =)."}
+            : "Required. 44-character base64 key ending in =."}
         </span>
       ), true)}
-      {configField("addresses", "Address", "Optional tunnel IPs: 10.0.0.2/32, fd00::2/128. Without a prefix, /32 or /128 is used.")}
-      {configField("dns", "DNS", "Optional DNS IPs and search domains. Prefix a routing domain with ~; ~. routes all DNS through the tunnel.")}
+      {configField("addresses", "Addresses", "e.g. 10.0.0.2/32, fd00::2/128. Bare addresses use /32 or /128.")}
+      {configField("dns", "DNS", "Server IPs or search domains; ~ marks routing domains, ~. routes all DNS.")}
       {config.peers.map((peer, index) => (
         <div key={peer.id}>
           <Heading>
@@ -87,16 +84,16 @@ export function ConnectionEditor({ draft, onChange, disabled }: {
           </Heading>
           {[
             field("Public key", peer.public_key, (value) => setPeerField(peer.id, "public_key", value),
-              "Required for this peer. A 44-character base64 WireGuard key (32 bytes, ending in =)."),
+              "Required. 44-character base64 key ending in =."),
             field("Preshared key", peer.preshared_key, (value) => setPeerField(peer.id, "preshared_key", value),
-              "Optional. Same 44-character base64 format as the private key.", true),
+              "Optional.", true),
             field("Allowed IPs", peer.allowed_ips, (value) => setPeerField(peer.id, "allowed_ips", value),
-              "Optional IPs or CIDR networks. 0.0.0.0/0, ::/0 sends everything; empty allows no peer traffic."),
+              "0.0.0.0/0, ::/0 for all traffic; empty allows none."),
             field("Endpoint", peer.endpoint, (value) => setPeerField(peer.id, "endpoint", value),
-              "Optional hostname:port, IPv4:port or [IPv6]:port; port 1-65535. An initiating client normally needs one."),
+              "host:port or [IPv6]:port; usually needed to initiate a connection."),
             field("Persistent keepalive", peer.persistent_keepalive,
               (value) => setPeerField(peer.id, "persistent_keepalive", value),
-              "Whole seconds, 1-65535. Empty, 0 or off disables it; 25 can keep NAT open."),
+              "Seconds (1-65535); empty, 0 or off disables it. 25 can keep NAT open."),
           ]}
           <PanelSectionRow>
             <ButtonItem
@@ -109,13 +106,6 @@ export function ConnectionEditor({ draft, onChange, disabled }: {
           </PanelSectionRow>
         </div>
       ))}
-      {config.peers.length === 0 && (
-        <PanelSectionRow>
-          <div style={{ fontSize: "0.85em", padding: "8px 0" }}>
-            No peers. Add the server this device connects to.
-          </div>
-        </PanelSectionRow>
-      )}
       <PanelSectionRow>
         <ButtonItem
           layout="below"
@@ -128,12 +118,12 @@ export function ConnectionEditor({ draft, onChange, disabled }: {
       {showAdvanced && (
         <>
           <Heading>Advanced interface</Heading>
-          {configField("listen_port", "Listen port", "Whole UDP port, 1-65535. Empty or 0 picks one automatically.")}
-          {configField("mtu", "MTU", "Maximum packet size as an unsigned 32-bit integer. Empty or 0 picks automatically; normally 1420.")}
+          {configField("listen_port", "Listen port", "UDP port; empty or 0 selects one automatically.")}
+          {configField("mtu", "MTU", "Empty or 0 selects automatically; typical: 1420.")}
           <Heading>NetworkManager properties</Heading>
           <PanelSectionRow>
             <div style={{ fontSize: "0.85em", opacity: 0.8, padding: "8px 0" }}>
-              Other profile properties in nmcli syntax. Clear a value to reset it.
+              nmcli syntax; clear a value to reset it.
             </div>
           </PanelSectionRow>
           {draft.advanced.map((property) => (
@@ -141,7 +131,7 @@ export function ConnectionEditor({ draft, onChange, disabled }: {
               {property.isNew && (
                 <TextField
                   label="Property name"
-                  description="For example ipv4.dns-priority."
+                  description="e.g. ipv4.dns-priority"
                   value={property.key}
                   disabled={disabled}
                   onChange={(event) => setProperty(property.id, { key: event.target.value })}

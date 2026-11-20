@@ -129,7 +129,7 @@ test("a missing connection falls back to the plugin landing page", async () => {
   const panel = plugin([]);
   panel.navigation.returnToPlugin("deleted");
   await panel.mount();
-  assert.equal(panel.render().props.children.props.title, "WireGuard connections");
+  assert.equal(panel.render().props.children.props.title, "Connections");
   assert.equal(panel.navigation.useSelectedConnection()[0], null);
 });
 
@@ -141,7 +141,7 @@ test("returning without a saved connection opens the landing page and notifies a
   const unsubscribe = panel.subscribe(() => { updates++; });
   panel.navigation.returnToPlugin(null);
   assert.equal(updates, 1);
-  assert.equal(panel.render().props.children.props.title, "WireGuard connections");
+  assert.equal(panel.render().props.children.props.title, "Connections");
   unsubscribe();
   panel.navigation.returnToPlugin("home");
   assert.equal(updates, 1);
@@ -161,7 +161,7 @@ test("B returns from connection settings to the list without closing the sidebar
   assert.equal(event.prevented, true);
   assert.equal(event.stopped, true);
   assert.equal(panel.navigation.useSelectedConnection()[0], null);
-  assert.equal(panel.render().props.children.props.title, "WireGuard connections");
+  assert.equal(panel.render().props.children.props.title, "Connections");
 
   panel.cancel();
   assert.equal(panel.pluginExits, 1);
@@ -196,7 +196,7 @@ test("the Back button returns from connection settings to the list", async () =>
   assert.equal(backRow.props.children.props.children, "Back to connections");
   backRow.props.children.props.onClick();
   assert.equal(panel.navigation.useSelectedConnection()[0], null);
-  assert.equal(panel.render().props.children.props.title, "WireGuard connections");
+  assert.equal(panel.render().props.children.props.title, "Connections");
 });
 
 test("the new connection button is above Update and opens the configuration page", async () => {
@@ -211,7 +211,7 @@ test("the new connection button is above Update and opens the configuration page
   }
   collect(panel.render());
   const add = elements.findIndex((node) =>
-    node.type === "ButtonItem" && node.props.children === "Add new connection");
+    node.type === "ButtonItem" && node.props.children === "Add connection");
   const update = elements.findIndex((node) => node.type === "UpdateButton");
   assert.ok(add >= 0 && update > add);
   elements[add].props.onClick();

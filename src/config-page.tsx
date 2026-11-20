@@ -140,8 +140,8 @@ export function ConfigPage() {
         setNotice(state === "disconnected"
           ? "Saved."
           : state === undefined
-            ? "Saved. If the tunnel is connected, disconnect and reconnect to apply the changes."
-            : "Saved. Disconnect and reconnect to apply the changes.");
+            ? "Saved. If connected, reconnect to apply changes."
+            : "Saved. Reconnect to apply changes.");
       }
     } catch (failure) {
       if (mounted.current) setError(errorMessage(failure));
@@ -172,7 +172,7 @@ export function ConfigPage() {
       if (!mounted.current || !draft) return;
       const imported = importConf(draft, result.text, file.path.split("/").pop() ?? "");
       change(imported);
-      setNotice("Imported into the editor only. Save to apply. Omitted keys, addresses, DNS and peers were cleared; omitted advanced settings were kept.");
+      setNotice("Imported. Save to apply. Omitted keys, addresses, DNS and peers were cleared; omitted advanced settings were kept.");
     } catch (failure) {
       if (mounted.current && failure !== "User canceled") setError(errorMessage(failure));
     } finally {
@@ -197,7 +197,6 @@ export function ConfigPage() {
     showModal(
       <ConfirmModal
         strTitle="Discard unsaved changes?"
-        strDescription="Your changes to this connection have not been saved."
         strOKButtonText="Discard changes"
         strCancelButtonText="Keep editing"
         bDestructiveWarning
@@ -261,7 +260,7 @@ export function ConfigPage() {
                   disabled={saving || loading || importing || !dirty}
                   onClick={() => void save()}
                 >
-                  {saving ? "Saving..." : dirty ? "Save changes" : "No unsaved changes"}
+                  {saving ? "Saving..." : "Save"}
                 </ButtonItem>
               </PanelSectionRow>
             </>

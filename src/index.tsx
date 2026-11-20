@@ -214,7 +214,7 @@ function LoggingControls({ onChange }: { onChange: () => void }) {
       <PanelSectionRow>
         <ToggleField
           label="Diagnostic logging"
-          description="Record anonymized tunnel status and resume events in wireguard-diagnostics.log."
+          description="Anonymized tunnel status and resume events in wireguard-diagnostics.log."
           checked={settings?.enabled ?? false}
           disabled={saving || settings === null}
           onChange={(checked) => void save(checked, false)}
@@ -224,7 +224,7 @@ function LoggingControls({ onChange }: { onChange: () => void }) {
         <PanelSectionRow>
           <ToggleField
             label="Debug logging"
-            description="Also record peer and probe details while the WireGuard panel is open."
+            description="Peer and probe details while the panel is open."
             checked={settings.debug}
             disabled={saving}
             onChange={(checked) => void save(true, checked)}
@@ -416,9 +416,7 @@ function Content() {
   };
 
   const panel = (
-    <PanelSection title={
-selectedUuid === null ? "WireGuard connections" : "Manage connection"
-    }>
+    <PanelSection title={selectedUuid === null ? "Connections" : "Manage connection"}>
       <style>{`
         @keyframes decky-wireguard-pulse {
           0%, 100% { opacity: 1; transform: scale(1); }
@@ -455,7 +453,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
       )}
       {selectedUuid === null && profiles?.length === 0 && (
         <PanelSectionRow>
-          No WireGuard profiles found. Add a connection below to configure or import one.
+          No profiles found.
         </PanelSectionRow>
       )}
       {selectedUuid === null && profiles?.map((profile) => (
@@ -480,7 +478,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
         </PanelSectionRow>
       ))}
       {selectedUuid !== null && !selectedProfile && profiles !== null && (
-        <PanelSectionRow>Profile no longer available. Return to the connection list.</PanelSectionRow>
+        <PanelSectionRow>Profile no longer available.</PanelSectionRow>
       )}
       {selectedProfile && (
         <PanelSectionRow>
@@ -515,7 +513,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
           {selectedProfile.state !== "connected" ? (
             <PanelSectionRow>
               <div style={{ fontSize: "0.85em", opacity: 0.75, padding: "8px 0" }}>
-                Peer details are available while connected.
+                Available when connected.
               </div>
             </PanelSectionRow>
           ) : peerHealthError ? (
@@ -545,7 +543,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
               ))}
               <PanelSectionRow>
                 <div style={{ fontSize: "0.8em", opacity: 0.7, padding: "4px 0" }}>
-                  Traffic totals are cumulative interface counters. Handshake age is historical, not a live health guarantee.
+                  Traffic counters are cumulative for this interface.
                 </div>
               </PanelSectionRow>
             </>
@@ -553,7 +551,6 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
           <PanelSectionRow>
             <ButtonItem
               layout="below"
-              description="Opens a full-screen editor."
               onClick={() => {
                 Navigation.Navigate(configPath(selectedProfile.uuid));
                 Navigation.CloseSideMenus();
@@ -572,7 +569,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
           <PanelSectionRow>
             <ToggleField
               label="Connect during boot"
-              description="Use NetworkManager autoconnect. May delay boot when offline."
+              description="Uses NetworkManager autoconnect; may delay boot when offline."
               checked={selectedStartup?.on_boot ?? false}
               disabled={busy || error !== null || selectedStartup === null}
               onChange={(checked) => void applyChange(
@@ -584,7 +581,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
           <PanelSectionRow>
             <ToggleField
               label="Connect after boot"
-              description="From next boot, connect once when the plugin loads and boot has finished. Disables NetworkManager autoconnect; reloads do not reconnect."
+              description="From next boot, attempts once per boot after plugin load; disables NetworkManager autoconnect."
               checked={selectedStartup?.after_boot ?? false}
               disabled={busy || error !== null || selectedStartup === null}
               onChange={(checked) => void applyChange(
@@ -598,7 +595,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
               <PanelSectionRow>
                 <ToggleField
                   label="Wait for Steam login"
-                  description="For plugin-managed startup, wait until Steam finishes logging in, including Offline Mode."
+                  description="Includes Offline Mode."
                   checked={selectedStartup.wait_for_steam}
                   disabled={busy || error !== null}
                   onChange={(checked) => void applyChange(
@@ -612,7 +609,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
               <PanelSectionRow>
                 <ToggleField
                   label="Wait for internet"
-                  description="For plugin-managed startup, wait for NetworkManager to verify internet on Wi-Fi, Ethernet, or mobile data, not a VPN."
+                  description="NetworkManager checks internet on Wi-Fi, Ethernet or mobile data, not VPNs."
                   checked={selectedStartup.wait_for_internet}
                   disabled={busy || error !== null}
                   onChange={(checked) => void applyChange(
@@ -644,7 +641,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
                 Navigation.CloseSideMenus();
               }}
             >
-              Add new connection
+              Add connection
             </ButtonItem>
           </PanelSectionRow>
           <LoggingControls onChange={() => void refresh()} />
@@ -653,9 +650,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
       )}
       <PanelSectionRow>
         <div style={{ fontSize: "0.85em", opacity: 0.75, paddingTop: 8 }}>
-          Status refreshes every second while verifying, otherwise every 5 seconds while this panel is open.
-          Yellow waits up to 30 seconds for a new handshake or authenticated incoming traffic.
-          Green confirms a peer response, not internet access or ongoing peer health.
+          A peer response does not guarantee internet access or ongoing health.
         </div>
       </PanelSectionRow>
     </PanelSection>

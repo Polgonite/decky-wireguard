@@ -113,7 +113,7 @@ export function UpdateButton() {
     <PanelSectionRow>
       <ButtonItem
         layout="below"
-        description={`Installed: ${installedVersion}. Downloads from GitHub, including development prereleases. Decky asks before installing.`}
+        description={`Installed: ${installedVersion}. Includes GitHub development prereleases.`}
         disabled={busy}
         onClick={() => void update()}
       >
