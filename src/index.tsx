@@ -248,6 +248,7 @@ function Content() {
   const [busy, setBusy] = useState(false);
   const [pendingUuid, setPendingUuid] = useState<string | null>(null);
   const [selectedUuid, setSelectedUuid] = useSelectedConnection();
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [startup, setStartupSettings] = useState<(StartupSettings & { uuid: string }) | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [startupSettingsError, setStartupSettingsError] = useState<string | null>(null);
@@ -414,6 +415,26 @@ function Content() {
     event.stopPropagation();
     setSelectedUuid(null);
   };
+
+  if (settingsOpen) {
+    return (
+      <Focusable onCancelButton={(event: GamepadEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setSettingsOpen(false);
+      }}>
+        <PanelSection title="Settings">
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={() => setSettingsOpen(false)}>
+              Back to connections
+            </ButtonItem>
+          </PanelSectionRow>
+          <LoggingControls onChange={() => void refresh()} />
+          <UpdateButton />
+        </PanelSection>
+      </Focusable>
+    );
+  }
 
   const panel = (
     <PanelSection title={selectedUuid === null ? "Connections" : "Manage connection"}>
@@ -644,8 +665,11 @@ function Content() {
               Add connection
             </ButtonItem>
           </PanelSectionRow>
-          <LoggingControls onChange={() => void refresh()} />
-          <UpdateButton />
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={() => setSettingsOpen(true)}>
+              Settings
+            </ButtonItem>
+          </PanelSectionRow>
         </>
       )}
       <PanelSectionRow>

@@ -15,7 +15,7 @@ A Decky Loader plugin for creating, configuring, connecting, and disconnecting
   keys must be saved in the profile.
 
 Profiles created only with `wg-quick` are not shown. Select **Add connection**
-above the update button to open the same editor used by **Edit configuration**.
+to open the same editor used by **Edit configuration**.
 Enter a name and configuration manually, or select **Import .conf file** to
 browse for a trusted WireGuard configuration. A new connection uses the filename
 as its name if no name has been entered. New profiles are created disconnected,
@@ -227,9 +227,9 @@ status means the working tree is clean.
    the code: the backend requests root privileges to control NetworkManager.
 3. Open **WireGuard** in the Decky quick-access panel.
 
-For subsequent updates, select **Update to latest build** below the connection
-list, then approve Decky's installation dialog. The button checks the repository's
-100 most recent GitHub releases, including development prereleases, and selects
+For subsequent updates, open **Settings** from the connection list, select
+**Update to latest build**, then approve Decky's installation dialog. The button
+checks the repository's 100 most recent GitHub releases, including development prereleases, and selects
 the most recently published installable ZIP. It shows the installed version and
 does not reinstall the same version. GitHub's SHA-256 asset digest is required
 and passed to Decky for verification. Decky downloads, installs, and reloads the
@@ -253,7 +253,8 @@ directory), then restart Decky Loader.
   connect or disconnect it; press B or select Back to return to the list without
   closing the sidebar. B on the connection list returns to Decky's plugin list,
   including while profiles are loading or when no profiles are available.
-  The short UUID appears beside each status.
+  The short UUID appears beside each status. **Settings** opens the logging and
+  update controls; press B or select Back to return to the connection list.
 - Select **Edit configuration** to open a full-screen editor that lays out the
   profile like a WireGuard `.conf` file: **Interface** (private key with its derived public key, addresses,
   DNS servers and search domains) followed by each **Peer** (public key, preshared
@@ -384,7 +385,7 @@ that the tunnel stopped passing traffic. A tunnel that stayed green may simply
 have been verified before sleep. If it happens again, try reaching a service
 behind the affected tunnel before switching modes or reconnecting.
 
-In the connections list, turn on **Diagnostic logging** for
+Open **Settings** from the connections list and turn on **Diagnostic logging** for
 NetworkManager activation and verification changes, including detected resumes.
 Then turn on **Debug logging** for probe outcomes, handshake ages, whether
 receive/send counters changed, and whether a peer's endpoint changed or was

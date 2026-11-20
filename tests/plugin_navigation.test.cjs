@@ -199,24 +199,61 @@ test("the Back button returns from connection settings to the list", async () =>
   assert.equal(panel.render().props.children.props.title, "Connections");
 });
 
-test("the new connection button is above Update and opens the configuration page", async () => {
-  const panel = plugin([]);
-  await panel.mount();
+function elementsIn(node) {
   const elements = [];
-  function collect(node) {
-    if (!node || typeof node !== "object") return;
-    elements.push(node);
-    const children = node.props?.children;
+  function collect(child) {
+    if (!child || typeof child !== "object") return;
+    elements.push(child);
+    const children = child.props?.children;
     (Array.isArray(children) ? children : [children]).forEach(collect);
   }
-  collect(panel.render());
-  const add = elements.findIndex((node) =>
+  collect(node);
+  return elements;
+}
+
+test("the new connection button opens the configuration page", async () => {
+  const panel = plugin([]);
+  await panel.mount();
+  const add = elementsIn(panel.render()).find((node) =>
     node.type === "ButtonItem" && node.props.children === "Add connection");
-  const update = elements.findIndex((node) => node.type === "UpdateButton");
-  assert.ok(add >= 0 && update > add);
-  elements[add].props.onClick();
+  assert.ok(add);
+  add.props.onClick();
   assert.deepEqual(panel.navigations, ["/config/new", "close"]);
 });
+
+for (const back of ["button", "controller"]) {
+  test(`settings contains logging and update controls; ${back} returns to connections`, async () => {
+    const panel = plugin([profile]);
+    await panel.mount();
+    const list = elementsIn(panel.render());
+    const settings = list.find((node) => node.type === "ButtonItem" && node.props.children === "Settings");
+    assert.ok(settings);
+    assert.equal(list.some((node) => node.type === "UpdateButton" || node.type?.name === "LoggingControls"), false);
+    settings.props.onClick();
+
+    const view = panel.render();
+    assert.equal(view.props.children.props.title, "Settings");
+    const elements = elementsIn(view);
+    assert.ok(elements.some((node) => node.type === "UpdateButton"));
+    assert.ok(elements.some((node) => node.type?.name === "LoggingControls"));
+    assert.equal(elements.some((node) => node.type === "ButtonItem" && node.props.children === "Add connection"), false);
+
+    if (back === "button") {
+      elements.find((node) => node.type === "ButtonItem" && node.props.children === "Back to connections").props.onClick();
+    } else {
+      const event = {
+        preventDefault: () => { event.prevented = true; },
+        stopPropagation: () => { event.stopped = true; },
+      };
+      view.props.onCancelButton(event);
+      assert.equal(event.prevented, true);
+      assert.equal(event.stopped, true);
+    }
+    assert.equal(panel.render().props.children.props.title, "Connections");
+    panel.cancel();
+    assert.equal(panel.pluginExits, 1);
+  });
+}
 
 function toggles(panel) {
   const fields = {};

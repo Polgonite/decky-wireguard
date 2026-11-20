@@ -100,7 +100,7 @@ function page(draft = saved, backend = () => assert.fail("Unexpected backend cal
     return {
       back: () => find(tree, "ButtonItem").props.onClick(),
       backDisabled: find(tree, "ButtonItem").props.disabled,
-      save: () => find(tree, "ButtonItem", (node) => node.props.children === "Save changes").props.onClick(),
+      save: () => find(tree, "ButtonItem", (node) => node.props.children === "Save").props.onClick(),
       importFile: () => find(tree, "ButtonItem", (node) => node.props.children === "Import .conf file").props.onClick(),
       draft: find(tree, "ConnectionEditor")?.props.draft,
       messages: (function collect(node) {
