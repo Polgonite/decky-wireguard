@@ -19,6 +19,7 @@ interface Profile {
   state: ConnectionState;
   handshake: HandshakeState;
   handshake_error: string | null;
+  diagnostic_ref?: string;
 }
 
 interface PeerHealth {
@@ -37,8 +38,17 @@ interface StartupSettings {
   wait_for_internet: boolean;
   waiting: string | null;
 }
+interface LoggingSettings {
+  enabled: boolean;
+  debug: boolean;
+  logging_error: string | null;
+}
 
 const getProfiles = callable<[], Result<{ profiles: Profile[]; startup_error?: string }>>("get_profiles");
+const getLoggingSettings = callable<[], Result<LoggingSettings>>("get_logging_settings");
+const setLoggingSettings = callable<[enabled: boolean, debug: boolean], Result<LoggingSettings>>(
+  "set_logging_settings",
+);
 const getPeerHealth = callable<[uuid: string], Result<{ peers: PeerHealth[] }>>("get_peer_health");
 const setConnection = callable<[uuid: string, connected: boolean], Result<object>>("set_connection");
 const getStartupSettings = callable<[uuid: string], Result<StartupSettings>>("get_startup_settings");
@@ -165,6 +175,73 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(1)} ${units[unit]}`;
 }
 
+function LoggingControls({ onChange }: { onChange: () => void }) {
+  const [settings, setSettings] = useState<LoggingSettings | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const result = await getLoggingSettings();
+        if (!result.success) throw new Error(result.error);
+        if (active) setSettings(result);
+      } catch (failure) {
+        if (active) setError(errorMessage(failure));
+      }
+    })();
+    return () => { active = false; };
+  }, []);
+
+  const save = async (enabled: boolean, debug: boolean) => {
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await setLoggingSettings(enabled, debug);
+      if (!result.success) throw new Error(result.error);
+      setSettings(result);
+      onChange();
+    } catch (failure) {
+      setError(errorMessage(failure));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <PanelSectionRow>
+        <ToggleField
+          label="Diagnostic logging"
+          description="Record anonymized tunnel status and resume events in wireguard-diagnostics.log."
+          checked={settings?.enabled ?? false}
+          disabled={saving || settings === null}
+          onChange={(checked) => void save(checked, false)}
+        />
+      </PanelSectionRow>
+      {settings?.enabled && (
+        <PanelSectionRow>
+          <ToggleField
+            label="Debug logging"
+            description="Also record peer and probe details while the WireGuard panel is open."
+            checked={settings.debug}
+            disabled={saving}
+            onChange={(checked) => void save(true, checked)}
+          />
+        </PanelSectionRow>
+      )}
+      {(error || settings?.logging_error) && (
+        <PanelSectionRow>
+          <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
+            Diagnostics: {error ?? settings?.logging_error}
+          </div>
+        </PanelSectionRow>
+      )}
+    </>
+  );
+}
+
 function Content() {
   const [profiles, setProfiles] = useState<Profile[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -209,7 +286,8 @@ function Content() {
           return next !== undefined && profile.uuid === next.uuid &&
             profile.name === next.name && profile.device === next.device &&
             profile.state === next.state && profile.handshake === next.handshake &&
-            profile.handshake_error === next.handshake_error;
+            profile.handshake_error === next.handshake_error &&
+            profile.diagnostic_ref === next.diagnostic_ref;
         }) ? previous : result.profiles,
       );
     }
@@ -399,6 +477,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
                 <span style={{ display: "block", fontSize: "0.8em", opacity: 0.75 }}>
                   {error ? "Status unavailable" : pendingUuid === profile.uuid
                     ? "Applying change..." : profileLabel(profile)} · {profile.uuid.slice(0, 8)}
+                  {profile.diagnostic_ref && ` · ${profile.diagnostic_ref}`}
                   {profile.handshake_error && <span role="alert" style={{ display: "block" }}>
                     {profile.handshake_error}
                   </span>}
@@ -420,7 +499,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
               <StatusCircle state={indicatorState(selectedProfile)} />
               {selectedProfile.name}
             </span>}
-            description={`${selectedStatus}${selectedProfile.device ? ` on ${selectedProfile.device}` : ""} \u00b7 ${selectedProfile.uuid.slice(0, 8)}${selectedProfile.handshake_error ? ` \u00b7 ${selectedProfile.handshake_error}` : ""}`}
+            description={`${selectedStatus}${selectedProfile.device ? ` on ${selectedProfile.device}` : ""} \u00b7 ${selectedProfile.uuid.slice(0, 8)}${selectedProfile.diagnostic_ref ? ` \u00b7 ${selectedProfile.diagnostic_ref}` : ""}${selectedProfile.handshake_error ? ` \u00b7 ${selectedProfile.handshake_error}` : ""}`}
             disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
             onClick={() => void applyChange(
               selectedProfile,
@@ -577,6 +656,7 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
               Add new connection
             </ButtonItem>
           </PanelSectionRow>
+          <LoggingControls onChange={() => void refresh()} />
           <UpdateButton />
         </>
       )}

@@ -20,10 +20,10 @@ from ipaddress import (
     ip_interface,
     ip_network,
 )
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID, uuid4
-
 
 logger = logging.getLogger("decky-wireguard")
 
@@ -34,6 +34,7 @@ PROBE_INTERVAL = 10
 Address = IPv4Address | IPv6Address
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 STEAM_READINESS_MAX_AGE = 10
+DIAGNOSTIC_LOG = "wireguard-diagnostics.log"
 NM_SERVICE = "org.freedesktop.NetworkManager"
 NM_SETTINGS_PATH = "/org/freedesktop/NetworkManager/Settings"
 NM_CONNECTION_INTERFACE = "org.freedesktop.NetworkManager.Settings.Connection"
@@ -68,6 +69,11 @@ class StartupSettings(TypedDict):
     after_boot: list[str]
     last_boot_id: str | None
     requirements: dict[str, StartupRequirements]
+
+
+class LoggingSettings(TypedDict):
+    enabled: bool
+    debug: bool
 
 
 class Profile(TypedDict):
@@ -145,7 +151,7 @@ async def _command(executable: str, *arguments: str, wait: int = 10) -> str:
 
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=wait + 5)
-    except (asyncio.TimeoutError, asyncio.CancelledError) as error:
+    except (TimeoutError, asyncio.CancelledError) as error:
         if process.returncode is None:
             try:
                 process.kill()
@@ -765,6 +771,17 @@ async def _received_bytes(device: str) -> dict[str, int]:
     }
 
 
+async def _endpoints(device: str) -> dict[str, str]:
+    output = await _command("wg", "show", device, "endpoints")
+    endpoints: dict[str, str] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            raise NetworkManagerError("WireGuard returned unexpected endpoint data.")
+        endpoints[fields[0]] = fields[1]
+    return endpoints
+
+
 def _unicast(address: Address) -> bool:
     return not (
         address.is_unspecified or address.is_loopback or address.is_multicast
@@ -840,7 +857,7 @@ async def _probe_targets(device: str) -> list[ProbeTarget]:
     return targets
 
 
-async def _send_probe(device: str, targets: list[ProbeTarget]) -> None:
+async def _send_probe(device: str, targets: list[ProbeTarget]) -> int:
     sent = False
     failures: list[str] = []
     for target in targets:
@@ -877,10 +894,11 @@ async def _send_probe(device: str, targets: list[ProbeTarget]) -> None:
                 sent = True
         except OSError as error:
             detail = f"Unable to send tunnel probe on {device} to {target.address}: {error}"
-            logger.warning("%s", detail)
+            logger.warning("Tunnel probe send failed (errno=%s).", error.errno)
             failures.append(detail)
     if not sent:
         raise NetworkManagerError("; ".join(failures) or "No tunnel probe targets available.")
+    return len(failures)
 
 
 class Plugin:
@@ -896,12 +914,26 @@ class Plugin:
         self._steam_ready = False
         self._steam_reported_at: float | None = None
         self._steam_error: str | None = None
+        self._logging: LoggingSettings = {"enabled": False, "debug": False}
+        self._logging_error: str | None = None
+        self._log_session = uuid4().hex[:12]
+        self._diagnostics = logging.getLogger(f"wireguard-diagnostics.{self._log_session}")
+        self._diagnostics.propagate = False
+        self._log_handler: RotatingFileHandler | None = None
+        self._suspended_time: float | None = None
+        self._profile_refs: dict[str, int] = {}
+        self._peer_refs: dict[str, dict[str, int]] = {}
+        self._logged_statuses: dict[str, tuple[State, HandshakeState]] = {}
+        self._debug_samples: dict[str, float] = {}
+        self._peer_samples: dict[
+            str, tuple[dict[str, str], dict[str, tuple[int, int]]]
+        ] = {}
 
-    def _settings_path(self) -> Path:
+    def _settings_path(self, filename: str = "startup.json") -> Path:
         directory = os.environ.get("DECKY_PLUGIN_SETTINGS_DIR")
         if not directory:
             raise NetworkManagerError("Decky's plugin settings directory is unavailable.")
-        return Path(directory) / "startup.json"
+        return Path(directory) / filename
 
     def _read_settings(self) -> StartupSettings:
         path = self._settings_path()
@@ -939,7 +971,10 @@ class Plugin:
             raise NetworkManagerError(f"Unable to read startup settings: {error}") from error
 
     def _write_settings(self, settings: StartupSettings) -> None:
-        path = self._settings_path()
+        self._write_json(self._settings_path(), settings, "startup")
+
+    @staticmethod
+    def _write_json(path: Path, settings: StartupSettings | LoggingSettings, label: str) -> None:
         temporary: str | None = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -954,7 +989,158 @@ class Plugin:
                 if temporary is not None:
                     Path(temporary).unlink(missing_ok=True)
         except OSError as error:
-            raise NetworkManagerError(f"Unable to save startup settings: {error}") from error
+            raise NetworkManagerError(f"Unable to save {label} settings: {error}") from error
+
+    def _open_diagnostic_log(self) -> RotatingFileHandler:
+        directory = os.environ.get("DECKY_PLUGIN_LOG_DIR")
+        if not directory:
+            raise NetworkManagerError("Decky's plugin log directory is unavailable.")
+        try:
+            path = Path(directory) / DIAGNOSTIC_LOG
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(path, maxBytes=256 * 1024, backupCount=1, encoding="utf-8")
+        except OSError as error:
+            raise NetworkManagerError("Unable to open the WireGuard diagnostics log.") from error
+        formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%S")
+        formatter.converter = time.gmtime
+        handler.setFormatter(formatter)
+        return handler
+
+    def _configure_logging(
+        self, settings: LoggingSettings, handler: RotatingFileHandler | None,
+    ) -> None:
+        if not settings["enabled"]:
+            self._log(logging.INFO, "logging_disabled")
+        if handler is not self._log_handler:
+            if self._log_handler is not None:
+                self._diagnostics.removeHandler(self._log_handler)
+                self._log_handler.close()
+            self._log_handler = handler
+            if handler is not None:
+                self._diagnostics.addHandler(handler)
+        self._logging = settings
+        self._logging_error = None
+        self._diagnostics.setLevel(logging.DEBUG if settings["debug"] else logging.INFO)
+        self._logged_statuses.clear()
+        self._debug_samples.clear()
+        self._peer_samples.clear()
+        self._suspended_time = None
+        if settings["enabled"]:
+            self._log(logging.INFO, "logging_enabled debug=%s", settings["debug"])
+            self._observe_resume()
+
+    def _load_logging(self) -> None:
+        try:
+            try:
+                settings = json.loads(self._settings_path("logging.json").read_text())
+            except FileNotFoundError:
+                return
+            if (
+                not isinstance(settings, dict)
+                or any(not isinstance(settings.get(key), bool) for key in ("enabled", "debug"))
+                or (settings["debug"] and not settings["enabled"])
+            ):
+                raise ValueError("Invalid logging settings")
+            self._logging = {"enabled": settings["enabled"], "debug": settings["debug"]}
+            handler = self._open_diagnostic_log() if settings["enabled"] else None
+            self._configure_logging(self._logging, handler)
+        except (OSError, ValueError, NetworkManagerError):
+            self._logging_error = "Unable to load WireGuard diagnostics settings or open the log."
+            logger.warning("%s", self._logging_error)
+
+    async def get_logging_settings(self) -> dict[str, object]:
+        return {"success": True, **self._logging, "logging_error": self._logging_error}
+
+    async def set_logging_settings(self, enabled: bool, debug: bool) -> dict[str, object]:
+        if not isinstance(enabled, bool) or not isinstance(debug, bool):
+            return self._failure(NetworkManagerError("Logging settings must be booleans."))
+        settings: LoggingSettings = {"enabled": enabled, "debug": enabled and debug}
+        handler = self._log_handler if enabled else None
+        try:
+            if enabled and handler is None:
+                handler = self._open_diagnostic_log()
+            self._write_json(self._settings_path("logging.json"), settings, "logging")
+        except NetworkManagerError as error:
+            if handler is not None and handler is not self._log_handler:
+                handler.close()
+            return self._failure(error)
+        self._configure_logging(settings, handler)
+        return await self.get_logging_settings()
+
+    def _log(self, level: int, message: str, *args: object) -> None:
+        if self._log_handler is not None:
+            self._diagnostics.log(level, "session=%s " + message, self._log_session, *args)
+
+    def _profile_ref(self, uuid: str) -> str:
+        return f"tunnel-{self._profile_refs.setdefault(uuid, len(self._profile_refs) + 1)}"
+
+    def _peer_ref(self, uuid: str, peer: str) -> str:
+        refs = self._peer_refs.setdefault(uuid, {})
+        return f"{self._profile_ref(uuid)}-peer-{refs.setdefault(peer, len(refs) + 1)}"
+
+    def _observe_resume(self) -> None:
+        if self._log_handler is None or not hasattr(time, "CLOCK_BOOTTIME"):
+            return
+        # BOOTTIME includes suspend; monotonic time (used for verification) does not.
+        suspended = time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+        if self._suspended_time is None or suspended - self._suspended_time >= 1:
+            if self._suspended_time is not None:
+                self._log(logging.INFO, "resume_detected suspended_seconds=%.0f",
+                          suspended - self._suspended_time)
+                self._debug_samples.clear()
+            self._suspended_time = suspended
+
+    async def _debug_peer_snapshot(self, profile: Profile) -> None:
+        handler = self._log_handler
+        if handler is None or not self._logging["debug"] or profile["state"] != "connected":
+            return
+        uuid, device = profile["uuid"], profile["device"]
+        if not device:
+            return
+        now = time.monotonic()
+        if uuid in self._debug_samples and now - self._debug_samples[uuid] < PROBE_INTERVAL:
+            return
+        self._debug_samples[uuid] = now
+        try:
+            handshakes, counters, endpoints = await asyncio.wait_for(
+                asyncio.gather(
+                    _handshakes(device), _transfer_counters(device), _endpoints(device),
+                    return_exceptions=True,
+                ),
+                timeout=2,
+            )
+        except TimeoutError:
+            self._log(logging.DEBUG, "%s peer_snapshot_timed_out", self._profile_ref(uuid))
+            return
+        if handler is not self._log_handler or not self._logging["debug"]:
+            return
+        if not isinstance(handshakes, dict) or not isinstance(counters, dict) or not isinstance(endpoints, dict):
+            for kind, sample in zip(("handshakes", "counters", "endpoints"), (handshakes, counters, endpoints)):
+                if isinstance(sample, NetworkManagerError):
+                    self._log(logging.DEBUG, "%s peer_snapshot_unavailable source=%s",
+                              self._profile_ref(uuid), kind)
+                elif isinstance(sample, BaseException):
+                    raise sample
+            return
+        previous_endpoints, previous_counters = self._peer_samples.get(uuid, ({}, {}))
+        self._peer_samples[uuid] = (endpoints, counters)
+        peers = handshakes.keys() | counters.keys() | endpoints.keys()
+        if not peers:
+            self._log(logging.DEBUG, "%s no_peers", self._profile_ref(uuid))
+        for peer in sorted(peers):
+            endpoint = endpoints.get(peer)
+            timestamp = handshakes.get(peer)
+            age = max(0, int(time.time()) - timestamp) if timestamp else "never"
+            changes = [
+                "increased" if current > old else "reset" if current < old else "unchanged"
+                for current, old in zip(counters[peer], previous_counters[peer])
+            ] if peer in counters and peer in previous_counters else ["baseline", "baseline"]
+            self._log(
+                logging.DEBUG, "%s handshake_age_seconds=%s rx=%s tx=%s endpoint=%s endpoint_changed=%s",
+                self._peer_ref(uuid, peer), age, *changes,
+                "none" if endpoint in (None, "(none)") else "ipv6" if endpoint.startswith("[") else "ipv4",
+                peer in previous_endpoints and endpoint != previous_endpoints[peer],
+            )
 
     async def _profile(self, uuid: str) -> Profile:
         if not isinstance(uuid, str):
@@ -1097,9 +1283,9 @@ class Plugin:
             return self._failure(NetworkManagerError(
                 "connection.autoconnect is managed by the startup controls."
             ))
-        if STRUCTURED_PROPERTIES.intersection(keys):
+        if structured_keys := STRUCTURED_PROPERTIES.intersection(keys):
             return self._failure(NetworkManagerError(
-                f"{sorted(STRUCTURED_PROPERTIES.intersection(keys))[0]} is edited in the "
+                f"{min(structured_keys)} is edited in the "
                 "WireGuard fields above, not as an advanced property."
             ))
         if (
@@ -1185,7 +1371,8 @@ class Plugin:
         if not isinstance(ready, bool) or (error is not None and not isinstance(error, str)):
             return self._failure(NetworkManagerError("Invalid Steam readiness report."))
         if error and error != self._steam_error:
-            logger.warning("Steam readiness unavailable: %s", error)
+            logger.warning("Steam readiness unavailable.")
+        self._observe_resume()
         self._steam_error = error
         self._steam_ready = ready and error is None
         self._steam_reported_at = time.monotonic()
@@ -1307,6 +1494,11 @@ class Plugin:
                 ),
             )
             self._activations[uuid] = activation
+            if self._log_handler is not None:
+                source = "requested" if pending else (
+                    "observed_connecting" if activation.since is not None else "already_active"
+                )
+                self._log(logging.INFO, "%s activation_observed source=%s", self._profile_ref(uuid), source)
         if activation.completed:
             return "established"
         if profile["state"] == "connected":
@@ -1315,61 +1507,95 @@ class Plugin:
             handshakes = await _handshakes(profile["device"])
             if activation.baseline is None:
                 activation.baseline = handshakes
-            if any(
-                timestamp > 0 and (
+            verified_peer = next((
+                peer for peer, timestamp in handshakes.items()
+                if timestamp > 0 and (
                     timestamp >= activation.since if activation.since is not None
                     else timestamp > activation.baseline.get(peer, 0)
                 )
-                for peer, timestamp in handshakes.items()
-            ):
+            ), None)
+            if verified_peer is not None:
                 activation.completed = True
+                if self._log_handler is not None:
+                    self._log(logging.INFO, "%s verified evidence=handshake", self._peer_ref(uuid, verified_peer))
                 return "established"
             received = await _received_bytes(profile["device"])
-            if activation.received is not None and any(
-                peer in activation.received and amount > activation.received[peer]
-                for peer, amount in received.items()
-            ):
-                activation.completed = True
-                return "established"
+            if activation.received is not None:
+                verified_peer = next((
+                    peer for peer, amount in received.items()
+                    if peer in activation.received and amount > activation.received[peer]
+                ), None)
+                if verified_peer is not None:
+                    activation.completed = True
+                    if self._log_handler is not None:
+                        self._log(logging.INFO, "%s verified evidence=receive", self._peer_ref(uuid, verified_peer))
+                    return "established"
             activation.received = received
             if activation.last_probe is None or (
                 time.monotonic() - activation.last_probe >= PROBE_INTERVAL
             ):
-                if activation.targets is None:
-                    activation.targets = await _probe_targets(profile["device"])
-                await _send_probe(profile["device"], activation.targets)
+                stage = "targets"
+                try:
+                    if activation.targets is None:
+                        activation.targets = await _probe_targets(profile["device"])
+                    stage = "send"
+                    failures = await _send_probe(profile["device"], activation.targets)
+                except NetworkManagerError:
+                    if self._log_handler is not None:
+                        self._log(logging.DEBUG, "%s probe_failed stage=%s", self._profile_ref(uuid), stage)
+                    raise
+                if self._log_handler is not None:
+                    self._log(logging.DEBUG, "%s probe_round targets=%d send_failures=%s",
+                              self._profile_ref(uuid), len(activation.targets), failures)
                 activation.last_probe = time.monotonic()
         return "timeout" if time.monotonic() - activation.started >= HANDSHAKE_TIMEOUT else "waiting"
 
     def _failure(self, error: Exception) -> dict[str, object]:
-        logger.warning("%s", error)
+        logger.warning("WireGuard request failed; details returned to the caller.")
         return {"success": False, "error": str(error)}
 
     async def get_profiles(self) -> dict[str, object]:
         try:
             async with self._lock:
+                self._observe_resume()
                 profiles = await self._profiles()
                 for uuid in self._activations.keys() - self._active_paths.keys():
                     del self._activations[uuid]
                 for uuid in self._pending_activations.keys() - self._active_paths.keys():
                     del self._pending_activations[uuid]
+                for uuid in self._logged_statuses.keys() - self._active_paths.keys():
+                    self._log(logging.INFO, "%s profile_removed", self._profile_ref(uuid))
+                    del self._logged_statuses[uuid]
+                    self._debug_samples.pop(uuid, None)
+                    self._peer_samples.pop(uuid, None)
                 statuses: list[dict[str, object]] = []
                 for profile in profiles:
                     error_message = None
                     try:
                         handshake = await self._handshake_status(profile)
                     except NetworkManagerError as error:
-                        logger.warning("%s: %s", profile["name"], error)
+                        logger.warning("WireGuard verification unavailable; details returned to the caller.")
                         handshake = "unknown"
                         error_message = str(error)
-                    statuses.append({
+                    status: dict[str, object] = {
                         **profile, "handshake": handshake, "handshake_error": error_message,
-                    })
+                    }
+                    if self._log_handler is not None:
+                        uuid = profile["uuid"]
+                        reference = self._profile_ref(uuid)
+                        status["diagnostic_ref"] = reference
+                        current = (profile["state"], handshake)
+                        if self._logged_statuses.get(uuid) != current:
+                            self._log(logging.INFO, "%s state=%s verification=%s", reference, *current)
+                            self._logged_statuses[uuid] = current
+                        await self._debug_peer_snapshot(profile)
+                    statuses.append(status)
                 result: dict[str, object] = {"success": True, "profiles": statuses}
                 if self._startup_error is not None:
                     result["startup_error"] = self._startup_error
                 return result
         except NetworkManagerError as error:
+            self._log(logging.INFO, "profile_query_failed")
             return self._failure(error)
 
     async def get_peer_health(self, uuid: str) -> dict[str, object]:
@@ -1424,13 +1650,22 @@ class Plugin:
         if connected:
             self._activations.pop(uuid, None)
             self._pending_activations[uuid] = (time.monotonic(), int(time.time()))
-        await _nmcli("connection", "up" if connected else "down", "uuid", uuid, wait=30)
+        action = "up" if connected else "down"
+        if self._log_handler is not None:
+            self._log(logging.INFO, "%s connection_requested action=%s", self._profile_ref(uuid), action)
+        try:
+            await _nmcli("connection", action, "uuid", uuid, wait=30)
+        except NetworkManagerError:
+            if self._log_handler is not None:
+                self._log(logging.INFO, "%s connection_failed action=%s", self._profile_ref(uuid), action)
+            raise
         if not connected:
             self._activations.pop(uuid, None)
             self._pending_activations.pop(uuid, None)
 
     async def _main(self) -> None:
         logger.info("WireGuard plugin loaded.")
+        self._load_logging()
         self._startup_task = asyncio.create_task(self._activate_after_boot())
 
     async def _activate_after_boot(self) -> None:
@@ -1498,7 +1733,7 @@ class Plugin:
                             await self._change_connection(profile, True)
                     except NetworkManagerError as error:
                         message = f"After-boot connection failed for {uuid}: {error}"
-                        logger.warning("%s", message)
+                        logger.warning("WireGuard after-boot profile activation failed.")
                         self._startup_error = (
                             f"{self._startup_error}\n{message}" if self._startup_error else message
                         )
@@ -1509,7 +1744,7 @@ class Plugin:
                 if self._startup_pending:
                     await asyncio.sleep(5)
         except NetworkManagerError as error:
-            logger.warning("After-boot connection: %s", error)
+            logger.warning("WireGuard after-boot startup failed.")
             self._startup_error = str(error)
         finally:
             self._startup_pending.clear()
@@ -1522,4 +1757,9 @@ class Plugin:
                 await self._startup_task
             except asyncio.CancelledError:
                 pass
+        self._log(logging.INFO, "backend_unloaded")
+        if self._log_handler is not None:
+            self._diagnostics.removeHandler(self._log_handler)
+            self._log_handler.close()
+            self._log_handler = None
         logger.info("WireGuard plugin unloaded; existing connections are unchanged.")

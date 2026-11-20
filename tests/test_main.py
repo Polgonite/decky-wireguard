@@ -12,19 +12,19 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from main import (
+    DIAGNOSTIC_LOG,
     NetworkManagerError,
     Plugin,
     ProbeTarget,
+    _encode_bus_value,
     _handshakes,
     _nmcli,
     _probe_targets,
     _received_bytes,
-    _transfer_counters,
-    _encode_bus_value,
     _send_probe,
     _split_signature,
+    _transfer_counters,
 )
-
 
 HOME = "11111111-1111-4111-8111-111111111111"
 WORK = "22222222-2222-4222-8222-222222222222"
@@ -493,11 +493,13 @@ class InternetReadinessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_connectivity_data_is_an_error_not_readiness(self):
         for responses in [["unexpected\n"], ["full\n", "broken:row\n"]]:
-            with self.subTest(responses=responses), patch(
-                "main._command", new_callable=AsyncMock, return_value="b true\nb true\n",
-            ), patch("main._nmcli", new_callable=AsyncMock, side_effect=responses):
-                with self.assertRaisesRegex(NetworkManagerError, "unexpected"):
-                    await Plugin()._internet_ready()
+            with (
+                self.subTest(responses=responses),
+                patch("main._command", new_callable=AsyncMock, return_value="b true\nb true\n"),
+                patch("main._nmcli", new_callable=AsyncMock, side_effect=responses),
+                self.assertRaisesRegex(NetworkManagerError, "unexpected"),
+            ):
+                await Plugin()._internet_ready()
 
 
 class ProfileTests(unittest.IsolatedAsyncioTestCase):
@@ -546,6 +548,91 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_list_is_success(self):
         self.nmcli.return_value = ""
         self.assertEqual(await self.plugin.get_profiles(), {"success": True, "profiles": []})
+
+    def diagnostic_directory(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.dict(os.environ, {
+            "DECKY_PLUGIN_SETTINGS_DIR": directory, "DECKY_PLUGIN_LOG_DIR": directory,
+        }))
+        self.addAsyncCleanup(self.plugin._unload)
+        return Path(directory) / DIAGNOSTIC_LOG
+
+    async def test_diagnostics_default_off_and_persist_without_debug_after_disabling(self):
+        log = self.diagnostic_directory()
+        self.nmcli.return_value = f"{HOME}:wireguard:Private VPN:private-wg:activated:/active/42\n"
+        self.assertFalse((await self.plugin.get_logging_settings())["enabled"])
+        await self.handshake_status()
+        self.assertFalse(log.exists())
+
+        self.assertTrue((await self.plugin.set_logging_settings(True, True))["debug"])
+        reloaded = Plugin()
+        self.addAsyncCleanup(reloaded._unload)
+        reloaded._load_logging()
+        self.assertTrue((await reloaded.get_logging_settings())["debug"])
+        await reloaded._unload()
+
+        self.assertFalse((await self.plugin.set_logging_settings(False, True))["debug"])
+        before = log.read_text()
+        self.handshakes.return_value = {"public-key": 1000}
+        self.assertEqual(await self.handshake_status(), "established")
+        self.assertEqual(log.read_text(), before)
+        reloaded = Plugin()
+        reloaded._load_logging()
+        self.assertFalse((await reloaded.get_logging_settings())["enabled"])
+
+    async def test_resume_capture_distinguishes_timeout_from_peer_activity_without_raw_values(self):
+        log = self.diagnostic_directory()
+        self.nmcli.return_value = (
+            f"{HOME}:wireguard:Private VPN:private-wg:activated:/active/42\n"
+            f"{WORK}:wireguard:Working VPN:working-wg:activated:/active/43\n"
+        )
+        self.handshakes.return_value = {"public-key": 0}
+        self.probe.return_value = 0
+        endpoint = "203.0.113.47:51820"
+        with (
+            patch("main.time.clock_gettime", side_effect=lambda _: asyncio.get_running_loop().time()) as clock,
+            patch("main._endpoints", new_callable=AsyncMock, return_value={"public-key": endpoint}) as endpoints,
+            patch("main._transfer_counters", new_callable=AsyncMock, return_value={"public-key": (0, 0)}) as counters,
+        ):
+            await self.plugin.set_logging_settings(True, False)
+            await self.handshake_status()
+            endpoints.assert_not_awaited()
+            self.assertNotIn("probe_round", log.read_text())
+            await self.plugin.set_logging_settings(True, True)
+            result = await self.plugin.get_profiles()
+            self.assertEqual([p["diagnostic_ref"] for p in result["profiles"]], ["tunnel-1", "tunnel-2"])
+            await self.handshake_status()
+            self.assertEqual(endpoints.await_count, 2)
+
+            clock.side_effect = lambda _: asyncio.get_running_loop().time() + 60
+            await self.plugin.set_steam_readiness(True)
+            self.plugin._activations[HOME].started -= 31
+            self.plugin._activations[HOME].last_probe -= 11
+            self.handshakes.side_effect = lambda device: {
+                "public-key": 0 if device == "private-wg" else 1000,
+            }
+            endpoints.return_value = {"public-key": "198.51.100.35:51820"}
+            counters.return_value = {"public-key": (32, 64)}
+            result = await self.plugin.get_profiles()
+            self.assertEqual([p["handshake"] for p in result["profiles"]], ["timeout", "established"])
+            self.assertEqual(endpoints.await_count, 4)
+
+            self.handshakes.side_effect = NetworkManagerError(f"Sensitive command error: {endpoint}")
+            with self.assertLogs("decky-wireguard") as notices:
+                self.assertEqual(await self.handshake_status(), "unknown")
+            self.assertNotIn(endpoint, "\n".join(notices.output))
+
+        text = log.read_text()
+        self.assertIn("resume_detected suspended_seconds=60", text)
+        self.assertIn("tunnel-1 state=connected verification=timeout", text)
+        self.assertIn("tunnel-2-peer-1 verified evidence=handshake", text)
+        self.assertIn("tunnel-1-peer-1 handshake_age_seconds=never rx=increased tx=increased", text)
+        self.assertIn("endpoint=ipv4 endpoint_changed=True", text)
+        self.assertIn("tunnel-1 probe_round targets=1 send_failures=0", text)
+        for secret in (HOME, WORK, "Private VPN", "Working VPN", "private-wg", "working-wg",
+                       "/active/42", "public-key", "10.0.0.1", endpoint, "198.51.100.35", ":51820",
+                       "Sensitive command error"):
+            self.assertNotIn(secret, text)
 
     async def test_peer_health_returns_per_peer_handshakes_and_traffic_counters(self):
         self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
@@ -621,8 +708,10 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(connected=connected):
                 self.nmcli.reset_mock()
                 self.nmcli.side_effect = [
-                    f"{HOME}:wireguard:Same name:wg0:{initial}:/active/1\n"
-                    f"{WORK}:wireguard:Same name:wg1:activated:/active/2\n",
+                    (
+                        f"{HOME}:wireguard:Same name:wg0:{initial}:/active/1\n"
+                        f"{WORK}:wireguard:Same name:wg1:activated:/active/2\n"
+                    ),
                     "",
                 ]
                 self.assertEqual(
@@ -1251,7 +1340,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         for failure in ("advanced", "save"):
             methods = []
 
-            async def bus(path, interface, method, *arguments):
+            async def bus(path, interface, method, *arguments, methods=methods):
                 methods.append(method)
                 if method == "AddConnectionUnsaved":
                     return [CONNECTION_PATH]
@@ -1598,9 +1687,8 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             ("peer\tbad-network\n", ""),
             ("peer\t10.0.0.0/24\n", "unexpected:field:shape\n"),
         ]:
-            with self.subTest(allowed=allowed, device=device):
-                with self.assertRaises(NetworkManagerError):
-                    await self.targets(allowed, device)
+            with self.subTest(allowed=allowed, device=device), self.assertRaises(NetworkManagerError):
+                await self.targets(allowed, device)
 
     async def test_probes_bind_to_tunnel_and_use_dns_or_icmp_for_both_ip_families(self):
         targets = [
@@ -1685,11 +1773,12 @@ class SubprocessTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertEqual(await _transfer_counters("wg0"), {"peer": (123, 999999)})
         for output in ["peer\t-1\t0\n", "peer\t1\n", "peer\tx\t10\n", "peer\t1\tbad\n"]:
-            with self.subTest(output=output), patch(
-                "main._command", new_callable=AsyncMock, return_value=output,
+            with (
+                self.subTest(output=output),
+                patch("main._command", new_callable=AsyncMock, return_value=output),
+                self.assertRaisesRegex(NetworkManagerError, "unexpected transfer data"),
             ):
-                with self.assertRaisesRegex(NetworkManagerError, "unexpected transfer data"):
-                    await _transfer_counters("wg0")
+                await _transfer_counters("wg0")
 
     async def test_handshake_query_only_requests_timestamps_without_secrets(self):
         process = Mock(
@@ -1702,16 +1791,19 @@ class SubprocessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handshake_query_rejects_malformed_timestamps(self):
         for output in ["peer\t-1\n", "peer\tinvalid\n", "peer\n", "peer\t1\textra\n"]:
-            with self.subTest(output=output), patch(
-                "main._command", new_callable=AsyncMock, return_value=output,
+            with (
+                self.subTest(output=output),
+                patch("main._command", new_callable=AsyncMock, return_value=output),
+                self.assertRaisesRegex(NetworkManagerError, "unexpected handshake data"),
             ):
-                with self.assertRaisesRegex(NetworkManagerError, "unexpected handshake data"):
-                    await _handshakes("wg0")
+                await _handshakes("wg0")
 
     async def test_missing_handshake_tool_has_actionable_error(self):
-        with patch("main.asyncio.create_subprocess_exec", side_effect=FileNotFoundError()):
-            with self.assertRaisesRegex(NetworkManagerError, "Install wireguard-tools"):
-                await _handshakes("wg0")
+        with (
+            patch("main.asyncio.create_subprocess_exec", side_effect=FileNotFoundError()),
+            self.assertRaisesRegex(NetworkManagerError, "Install wireguard-tools"),
+        ):
+            await _handshakes("wg0")
 
     async def test_nmcli_uses_argument_vector_locale_and_no_interactive_input(self):
         process = Mock(returncode=0, communicate=AsyncMock(return_value=(b"result\n", b"")))
@@ -1730,22 +1822,26 @@ class SubprocessTests(unittest.IsolatedAsyncioTestCase):
             (FileNotFoundError(), "nmcli is not installed"),
             (PermissionError("denied"), "Unable to start nmcli"),
         ]:
-            with self.subTest(error=error):
-                with patch("main.asyncio.create_subprocess_exec", side_effect=error):
-                    with self.assertRaisesRegex(NetworkManagerError, message):
-                        await _nmcli(*FIELDS)
+            with (
+                self.subTest(error=error),
+                patch("main.asyncio.create_subprocess_exec", side_effect=error),
+                self.assertRaisesRegex(NetworkManagerError, message),
+            ):
+                await _nmcli(*FIELDS)
 
     async def test_command_error_includes_nmcli_diagnostics(self):
         process = Mock(
             returncode=4,
             communicate=AsyncMock(return_value=(b"", b"Error: activation failed")),
         )
-        with patch("main.asyncio.create_subprocess_exec", return_value=process):
-            with self.assertRaisesRegex(NetworkManagerError, r"nmcli failed \(4\): Error: activation failed"):
-                await _nmcli("connection", "up", "uuid", HOME)
+        with (
+            patch("main.asyncio.create_subprocess_exec", return_value=process),
+            self.assertRaisesRegex(NetworkManagerError, r"nmcli failed \(4\): Error: activation failed"),
+        ):
+            await _nmcli("connection", "up", "uuid", HOME)
 
     async def test_timeout_and_cancellation_kill_and_reap_process(self):
-        for failure in [asyncio.TimeoutError(), asyncio.CancelledError()]:
+        for failure in [TimeoutError(), asyncio.CancelledError()]:
             with self.subTest(failure=type(failure).__name__):
                 process = Mock(
                     returncode=None,
@@ -1755,9 +1851,8 @@ class SubprocessTests(unittest.IsolatedAsyncioTestCase):
                     asyncio.CancelledError if isinstance(failure, asyncio.CancelledError)
                     else NetworkManagerError
                 )
-                with patch("main.asyncio.create_subprocess_exec", return_value=process):
-                    with self.assertRaises(expected):
-                        await _nmcli(*FIELDS)
+                with patch("main.asyncio.create_subprocess_exec", return_value=process), self.assertRaises(expected):
+                    await _nmcli(*FIELDS)
                 process.kill.assert_called_once_with()
                 self.assertEqual(process.communicate.await_count, 2)
 

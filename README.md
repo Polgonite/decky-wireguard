@@ -372,6 +372,30 @@ directory), then restart Decky Loader.
   connection-down behavior can temporarily inhibit autoconnect until reboot or
   another explicit activation. Unloading the plugin leaves tunnels as they are.
 
+### Diagnosing a failure after sleep
+
+Red means the plugin did not observe a fresh peer response, not necessarily
+that the tunnel stopped passing traffic. A tunnel that stayed green may simply
+have been verified before sleep. If it happens again, try reaching a service
+behind the affected tunnel before switching modes or reconnecting.
+
+In the WireGuard connections list, turn on **Diagnostic logging** for
+NetworkManager activation and verification changes, including detected resumes.
+Then turn on **Debug logging** for probe outcomes, handshake ages, whether
+receive/send counters changed, and whether a peer's endpoint changed or was
+missing. These settings persist across reloads. Open the panel before sleeping
+and again right after waking: peer samples are taken only while it is open,
+at most every 10 seconds per tunnel, with a fresh sample after a detected resume.
+
+Collect `wireguard-diagnostics.log` and, if present, `wireguard-diagnostics.log.1`
+from Decky's WireGuard plugin log directory (`DECKY_PLUGIN_LOG_DIR`, normally
+under `~/homebrew/logs/`). The two files are capped at about 256 KiB each.
+Note the affected `tunnel-N` shown in the plugin, when it went red, and whether
+traffic still worked. Aliases such as `tunnel-1-peer-2` are local to one backend
+session. The log does not include IP addresses, names, UUIDs, keys, or raw
+command output. Disabling logging also disables debug and stops recording
+without deleting the existing files.
+
 Backend tests mock `nmcli`, `busctl`, and `wg`; they do not activate any host network connections.
 `npm test` also exercises the frontend readiness monitor with mocked Steam APIs,
 including online/offline login, unfinished initialization, API errors, and unloading.
