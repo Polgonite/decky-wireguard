@@ -428,22 +428,13 @@ selectedUuid === null ? "WireGuard connections" : "Manage connection"
           .decky-wireguard-status { animation: none !important; }
         }
       `}</style>
-      <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          onClick={() => {
-            if (selectedUuid === null) {
-              void refresh();
-            } else {
-              setSelectedUuid(null);
-            }
-          }}
-          disabled={selectedUuid === null && busy}
-        >
-          {selectedUuid === null ? (busy ? "Working..." : "Refresh")
-            : "Back to connections"}
-        </ButtonItem>
-      </PanelSectionRow>
+      {selectedUuid !== null && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => setSelectedUuid(null)}>
+            Back to connections
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
       {error && (
         <PanelSectionRow>
           <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
