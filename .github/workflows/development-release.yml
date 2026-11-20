@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   checks:
-    name: Pre-commit checks in dev container
+    name: Pre-commit checks in uv venv
     # Disabled: checks run locally before pushing. Remove this line to re-enable.
     if: ${{ false }}
     runs-on: ubuntu-24.04
@@ -21,13 +21,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Run checks in the development container
-        uses: devcontainers/ci@v0.3
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
         with:
-          push: never
-          runCmd: |
-            npm ci
-            pre-commit run --all-files
+          enable-cache: true
+
+      - name: Install development dependencies
+        run: |
+          uv sync --locked
+          uv run --locked npm ci
+
+      - name: Run pre-commit checks
+        run: uv run --locked pre-commit run --all-files
 
   release:
     name: Build and publish development release
@@ -44,40 +49,36 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
         with:
-          node-version: "22"
-          cache: npm
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
+          enable-cache: true
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          uv sync --locked
+          uv run --locked npm ci
 
       - name: Assign unique development version
         id: version
         shell: bash
         run: |
-          base_version="$(node -p "require('./package.json').version.split('-')[0]")"
+          base_version="$(uv run --locked node -p "require('./package.json').version.split('-')[0]")"
           version="${base_version}-dev.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.sha${GITHUB_SHA:0:7}"
-          npm version "$version" --no-git-tag-version --ignore-scripts
+          uv run --locked npm version "$version" --no-git-tag-version --ignore-scripts
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Run backend tests
-        run: npm test
+        run: uv run --locked npm test
 
       - name: Build installable ZIP
-        run: npm run package
+        run: uv run --locked npm run package
 
       - name: Verify installable ZIP
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          python3 - <<'PY'
+          uv run --locked python - <<'PY'
           import json
           import os
           from zipfile import ZipFile

@@ -104,19 +104,23 @@ and [NetworkManager's WireGuard verifier](https://github.com/NetworkManager/Netw
 
 ## Build
 
-Use Node.js 22.13+ with npm and Python 3.10+:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git.
+uv downloads Python 3.13 and installs the pinned Node.js 22/npm and development
+tools in the repository's `.venv`; no system Node.js installation is needed:
 
 ```sh
-npm ci
-npm test
-npm run package
+uv sync --locked
+uv run --locked npm ci
+uv run --locked npm test
+uv run --locked npm run package
 ```
 
 The installable archive is `out/decky-wireguard-0.1.0.zip`. Its single top-level
 `decky-wireguard` directory contains the backend, plugin metadata, and compiled
 `dist/index.js`. No Python packages or runtime npm installation are needed.
 
-For frontend development, use `npm run watch`; `npm run typecheck` checks the UI.
+For frontend development, use `uv run --locked npm run watch`;
+`uv run --locked npm run typecheck` checks the UI.
 The build uses Decky's official Rollup tooling and externalizes React and
 `@decky/ui`, provided by the loader. TypeScript is pinned to 5.9 because the
 current Decky Rollup plugin requires its JavaScript compiler API, which is not
@@ -143,8 +147,11 @@ Each build gets a version such as `0.1.0-dev.123456789.1.shaabcdef0`, containing
 the workflow run ID, attempt number, and short commit SHA. Reruns create distinct
 releases instead of overwriting previous assets. That version is embedded in the
 packaged `package.json` and ZIP filename; source versions are not committed back.
-Releases target the exact pushed commit. Pre-commit checks run in the development
-container on pull requests and pushes; a failed check blocks publication.
+Releases target the exact pushed commit. The pre-commit checks job uses the same
+locked uv environment as local development. It is currently disabled because
+checks run locally before pushing. To enforce checks on pull requests and pushes
+and block publication on failure, remove its `if: ${{ false }}` and uncomment
+`needs: checks` on the release job.
 Runs are not canceled or grouped by a
 concurrency limit, so each push can publish its own build after successful checks.
 
@@ -152,40 +159,44 @@ The workflow uses the automatic `GITHUB_TOKEN` with `contents: write`; no
 additional secret is required. Repository or organization policies must allow
 GitHub Actions to create releases.
 
-## Development container and pre-commit
+## Development environment and pre-commit
 
-Open the repository in VS Code and select **Dev Containers: Reopen in Container**.
-The container includes Node.js 22, Python 3, pinned pre-commit and Ruff versions,
-actionlint, and ShellCheck. Creation installs npm dependencies and the Git
-pre-commit hook. Run commits from inside the container so the hook can find its
-tools.
-
-Inside the container:
+From the repository root, create the uv venv, install npm dependencies, and
+install the Git pre-commit hook:
 
 ```sh
-pre-commit run --all-files
-npm run package
+uv sync --locked
+uv run --locked npm ci
+uv run --locked pre-commit install
+uv run --locked pre-commit run --all-files
+uv run --locked npm run package
 ```
 
 The hooks lint Python with Ruff, lint JavaScript/TypeScript with ESLint, check
 frontend types, run backend tests, and validate Actions workflows (including
-embedded shell) with actionlint/ShellCheck. The same container and hook command
-run in CI before development releases can publish.
+embedded shell) with actionlint/ShellCheck. Python is selected by
+`.python-version`; `pyproject.toml` pins Node.js, pre-commit, Ruff, actionlint, and
+ShellCheck, and `uv.lock` locks their dependencies. Node.js, actionlint, and
+ShellCheck are supplied through Python wrapper packages. Local and CI commands
+use `--locked` so dependency changes require an explicit `uv lock`.
 
-For terminal-only development, install the Dev Container CLI and use:
+The hooks invoke tools through `uv run --locked`, so they work without activating
+the venv, provided uv and Git are on your `PATH`. For an interactive shell with
+plain `npm`, `python3`, and `pre-commit` commands, activate it:
 
 ```sh
-devcontainer up --workspace-folder .
-devcontainer exec --workspace-folder . pre-commit run --all-files
+source .venv/bin/activate
 ```
+
+VS Code retains the ESLint and Ruff extension recommendations in
+`.vscode/extensions.json`. Launch it from the activated shell so extensions can
+find the venv's Node.js and Python tools.
 
 ### Committing from the terminal
 
-With Docker running, run these commands from the repository root. The `npx`
-form works without a globally installed Dev Container CLI:
+After the setup above, run these commands from the repository root:
 
 ```sh
-npx --yes @devcontainers/cli up --workspace-folder .
 git status --short
 git diff
 git add README.md src/index.tsx # Replace with the files you intend to commit.
@@ -193,22 +204,16 @@ git diff --cached --check
 git diff --cached
 ```
 
-Commit inside the container so the installed hooks can find their tools. The
-container may not inherit the host's Git identity. Resolve the effective host
-identity (including environment-based configuration) and pass it only for this
-command, without saving personal details in the container or repository:
+Commit normally; the installed hook uses the uv environment and your existing
+Git identity:
 
 ```sh
-git_name=$(git var GIT_AUTHOR_IDENT | sed 's/ <.*//')
-git_email=$(git var GIT_AUTHOR_IDENT | sed 's/.*<//; s/>.*//')
-npx --yes @devcontainers/cli exec --workspace-folder . \
-  git -c "user.name=$git_name" -c "user.email=$git_email" \
-  commit -m "Describe the change"
+git commit -m "Describe the change"
 git status --short
 git --no-pager log --oneline -1
 ```
 
-If Git cannot resolve your identity, configure it on the host first. If a hook
+If Git cannot resolve your identity, configure it first. If a hook
 fails, fix the reported issue and retry without bypassing hooks. If a hook
 rewrites files, review and stage those changes before retrying. An empty final
 status means the working tree is clean.

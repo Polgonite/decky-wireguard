@@ -1,0 +1,16 @@
+[project]
+name = "decky-wireguard"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[dependency-groups]
+dev = [
+    "actionlint-py==1.7.7.24",
+    "nodejs-wheel==22.20.0",
+    "pre-commit==4.2.0",
+    "ruff==0.11.13",
+    "shellcheck-py==0.9.0.6",
+]
+
+[tool.uv]
+package = false

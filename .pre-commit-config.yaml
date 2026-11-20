@@ -4,30 +4,30 @@ repos:
     hooks:
       - id: ruff
         name: Lint Python
-        entry: ruff check
+        entry: uv run --locked ruff check
         language: system
         types: [python]
       - id: eslint
         name: Lint JavaScript and TypeScript
-        entry: npm run lint
+        entry: uv run --locked npm run lint
         language: system
         files: '\.(js|tsx?)$'
         pass_filenames: false
       - id: typecheck
         name: Type-check frontend
-        entry: npm run typecheck
+        entry: uv run --locked npm run typecheck
         language: system
         files: '(^src/|^tsconfig\.json$|^package(-lock)?\.json$)'
         pass_filenames: false
       - id: backend-tests
         name: Run backend tests
-        entry: npm test
+        entry: uv run --locked npm test
         language: system
         types: [python]
         pass_filenames: false
       - id: actionlint
         name: Lint GitHub Actions workflows and embedded shell
-        entry: actionlint
+        entry: uv run --locked actionlint
         language: system
         files: '^\.github/workflows/.*\.ya?ml$'
         pass_filenames: false
