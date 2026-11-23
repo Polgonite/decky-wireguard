@@ -81,6 +81,7 @@ jobs:
           uv run --locked python - <<'PY'
           import json
           import os
+          from pathlib import Path
           from zipfile import ZipFile
 
           version = os.environ["VERSION"]
@@ -89,6 +90,10 @@ jobs:
               expected = {
                   "plugin.json", "package.json", "main.py", "dist/index.js", "README.md"
               }
+              expected.update(
+                  f"docs/{path.relative_to('docs').as_posix()}"
+                  for path in Path("docs").rglob("*.md")
+              )
               assert set(archive.namelist()) == {
                   f"decky-wireguard/{name}" for name in expected
               }, "Unexpected ZIP layout"

@@ -17,9 +17,10 @@ uv run --locked npm run package
 ```
 
 The installable archive is `out/decky-wireguard-0.1.0.zip`. Its single top-level
-`decky-wireguard` directory contains the backend, plugin metadata, and compiled
-`dist/index.js`. No Python packages or runtime npm installation are needed.
-See [Install on Steam Deck](../README.md#install-on-steam-deck) to install it.
+`decky-wireguard` directory contains the backend, plugin metadata, compiled
+`dist/index.js`, the README, and Markdown guides in `docs/`. No Python packages
+or runtime npm installation are needed.
+See [Install](../README.md#install) to install it.
 
 For frontend development, use `uv run --locked npm run watch`;
 `uv run --locked npm run typecheck` checks the UI.

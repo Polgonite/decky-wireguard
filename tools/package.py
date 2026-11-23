@@ -6,6 +6,10 @@ from zipfile import ZIP_DEFLATED, ZipFile
 root = Path(__file__).resolve().parents[1]
 version = json.loads((root / "package.json").read_text())["version"]
 files = ["plugin.json", "package.json", "main.py", "dist/index.js", "README.md"]
+files.extend(
+    path.relative_to(root).as_posix()
+    for path in sorted((root / "docs").rglob("*.md"))
+)
 for name in files:
     if not (root / name).is_file():
         raise SystemExit(f"Missing package file: {name}. Run npm run build first.")
