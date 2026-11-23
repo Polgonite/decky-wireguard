@@ -248,8 +248,20 @@ function connectionStatus(node) {
     elementsIn(element).some((child) => child.type?.name === "StatusCircle")).at(-1);
 }
 
+function controlBeforeEdit(nodes, label) {
+  const button = nodes.find((node) => node.type === "ButtonItem" && node.props.children === label);
+  const edit = nodes.find((node) => node.type === "ButtonItem" && node.props.children === "Edit configuration");
+  assert.ok(button && edit);
+  const rows = nodes.filter((node) => node.type === "PanelSectionRow");
+  const buttonRow = rows.findIndex((row) => elementsIn(row).includes(button));
+  const editRow = rows.findIndex((row) => elementsIn(row).includes(edit));
+  assert.ok(buttonRow >= 0);
+  assert.equal(editRow, buttonRow + 1);
+  return button;
+}
+
 for (const state of ["disconnected", "connected"]) {
-  test(`connection control follows the status and precedes peer details when ${state}`, async () => {
+  test(`connection control follows peer details and precedes editing when ${state}`, async () => {
     const connection = {
       ...profile, device: "wg0", state,
       handshake: state === "connected" ? "established" : "inactive",
@@ -257,10 +269,10 @@ for (const state of ["disconnected", "connected"]) {
     const calls = [];
     const panel = plugin([connection], (route, ...args) => {
       if (route === "get_startup_settings") return { success: true };
-      if (route === "get_peer_health") return { success: true, peers: [{
-        public_key: "peer-key", endpoint_ip: "203.0.113.1", last_handshake: null,
-        received_bytes: 0, sent_bytes: 0,
-      }] };
+      if (route === "get_peer_health") return { success: true, peers: [
+        { public_key: "key-1", endpoint_ip: "203.0.113.1", last_handshake: null, received_bytes: 0, sent_bytes: 0 },
+        { public_key: "key-2", endpoint_ip: "203.0.113.2", last_handshake: null, received_bytes: 0, sent_bytes: 0 },
+      ] };
       if (route === "set_connection") {
         calls.push(args);
         return { success: true };
@@ -273,28 +285,41 @@ for (const state of ["disconnected", "connected"]) {
 
     const details = panel.render();
     const nodes = elementsIn(details);
-    const button = nodes.find((node) =>
-      node.type === "ButtonItem" && node.props.children === (state === "connected" ? "Disconnect" : "Connect"));
+    const button = controlBeforeEdit(nodes, state === "connected" ? "Disconnect" : "Connect");
     const status = connectionStatus(details);
     const peerDetails = nodes.find((node) => node.type === "div" && (state === "connected"
-      ? textIn(node).startsWith("Peer 1 \u00b7 203.0.113.1")
+      ? textIn(node).startsWith("Peer 2 \u00b7 203.0.113.2")
       : textIn(node) === "Available when connected."));
-    const edit = nodes.find((node) => node.type === "ButtonItem" && node.props.children === "Edit configuration");
-    assert.ok(button && status && peerDetails && edit);
-    const statusRow = nodes.find((node) =>
-      node.type === "PanelSectionRow" && elementsIn(node).includes(status));
-    const buttonRow = nodes.find((node) =>
-      node.type === "PanelSectionRow" && elementsIn(node).includes(button));
-    assert.ok(statusRow && buttonRow && statusRow !== buttonRow);
-    assert.ok(nodes.indexOf(status) < nodes.indexOf(button));
-    assert.ok(nodes.indexOf(button) < nodes.indexOf(peerDetails));
-    assert.ok(nodes.indexOf(peerDetails) < nodes.indexOf(edit));
+    assert.ok(status && peerDetails);
+    assert.ok(nodes.indexOf(status) < nodes.indexOf(peerDetails));
+    assert.ok(nodes.indexOf(peerDetails) < nodes.indexOf(button));
     assert.equal(textIn(status), state === "connected" ? "HomeConnected on wg0" : "HomeDisconnected on wg0");
     assert.equal(button.props.disabled, false);
 
     button.props.onClick();
     await flush();
     assert.deepEqual(calls, [["home", state === "disconnected"]]);
+  });
+}
+
+for (const [label, response, message] of [
+  ["loading", () => new Promise(() => {}), "Loading peer details..."],
+  ["empty", () => ({ success: true, peers: [] }), "No peer statistics available."],
+  ["error", () => ({ success: false, error: "Peer lookup failed" }), "Peer details unavailable: Peer lookup failed"],
+]) {
+  test(`connection control remains above editing when peer details are ${label}`, async () => {
+    const panel = plugin([{ ...profile, state: "connected", handshake: "established" }], (route) => {
+      if (route === "get_startup_settings") return { success: true };
+      if (route === "get_peer_health") return response();
+      assert.fail(`Unexpected backend call: ${route}`);
+    });
+    panel.navigation.returnToPlugin("home");
+    await panel.mount();
+    await panel.update();
+    const nodes = elementsIn(panel.render());
+    const peerDetails = nodes.find((node) => node.type === "PanelSectionRow" && textIn(node).includes(message));
+    const button = controlBeforeEdit(nodes, "Disconnect");
+    assert.ok(peerDetails && nodes.indexOf(peerDetails) < nodes.indexOf(button));
   });
 }
 

@@ -582,24 +582,6 @@ function Content() {
         </PanelSectionRow>
       )}
       {selectedProfile && (
-        <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
-            onClick={() => void applyChange(
-              selectedProfile,
-              () => setConnection(selectedProfile.uuid, selectedProfile.state !== "connected"),
-            )}
-          >
-            {pendingUuid === selectedProfile.uuid
-              ? "Please wait..."
-              : transitioning || selectedProfile.state === "unknown"
-                ? stateLabels[selectedProfile.state]
-                : selectedProfile.state === "connected" ? "Disconnect" : "Connect"}
-          </ButtonItem>
-        </PanelSectionRow>
-      )}
-      {selectedProfile && (
         <>
           {selectedProfile.state !== "connected" ? (
             <PanelSectionRow>
@@ -634,6 +616,22 @@ function Content() {
               ))}
             </>
           )}
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
+              onClick={() => void applyChange(
+                selectedProfile,
+                () => setConnection(selectedProfile.uuid, selectedProfile.state !== "connected"),
+              )}
+            >
+              {pendingUuid === selectedProfile.uuid
+                ? "Please wait..."
+                : transitioning || selectedProfile.state === "unknown"
+                  ? stateLabels[selectedProfile.state]
+                  : selectedProfile.state === "connected" ? "Disconnect" : "Connect"}
+            </ButtonItem>
+          </PanelSectionRow>
           <PanelSectionRow>
             <ButtonItem
               layout="below"
