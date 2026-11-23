@@ -379,7 +379,7 @@ test("active tunnels retain fast polling after verification; disconnected tunnel
 });
 
 for (const logging of [false, true]) {
-  test(`connection status hides identifiers with diagnostic logging ${logging ? "on" : "off"}`, async () => {
+  test(`connection list shows a short UUID while details hide it with diagnostic logging ${logging ? "on" : "off"}`, async () => {
     const uuid = "12345678-1234-1234-1234-123456789abc";
     const connected = {
       ...profile, uuid, device: "wg0", state: "connected", handshake: "established",
@@ -401,7 +401,7 @@ for (const logging of [false, true]) {
     const button = elementsIn(panel.render()).find((node) =>
       node.type === "ButtonItem" && textIn(node).startsWith("Home"));
     assert.ok(button);
-    assert.equal(textIn(button), "Home");
+    assert.equal(textIn(button), `Home${uuid.slice(0, 8)}`);
     const listIndicator = elementsIn(button).find((node) => node.type?.name === "StatusCircle");
     assert.ok(listIndicator);
     const listCircle = listIndicator.type(listIndicator.props);
@@ -463,14 +463,20 @@ for (const [connection, listStatus, description] of [
     state: "connected", handshake: "established", device: "wg0", handshake_error: "Peer check failed",
   }, "Peer check failed", "Connected on wg0 \u00b7 Peer check failed"],
 ]) {
-  test(`connection status retains its details without an identifier: ${description || "verified"}`, async () => {
+  test(`connection list shows a short UUID with status: ${description || "verified"}`, async () => {
     const uuid = "12345678-1234-1234-1234-123456789abc";
     const panel = plugin([{ ...profile, ...connection, uuid }]);
     await panel.mount();
     const listButton = elementsIn(panel.render()).find((node) =>
       node.type === "ButtonItem" && textIn(node).startsWith("Home"));
     assert.ok(listButton);
-    assert.equal(textIn(listButton), `Home${listStatus}`);
+    const statusText = connection.handshake_error
+      ? listStatus.replace(connection.handshake_error, "")
+      : listStatus;
+    assert.equal(
+      textIn(listButton),
+      `Home${uuid.slice(0, 8)}${statusText ? ` · ${statusText}` : ""}${connection.handshake_error ?? ""}`,
+    );
     if (connection.handshake_error) {
       const alert = elementsIn(listButton).find((node) => node.props?.role === "alert");
       assert.equal(textIn(alert), connection.handshake_error);

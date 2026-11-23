@@ -536,6 +536,8 @@ function Content() {
       )}
       {selectedUuid === null && profiles?.map((profile) => {
         const status = profileLabel(profile);
+        const statusText = error ? "Status unavailable" : pendingUuid === profile.uuid
+          ? "Applying change..." : status === stateLabels.disconnected ? "" : status;
         return (
           <PanelSectionRow key={profile.uuid}>
             <ButtonItem layout="below" onClick={() => setSelectedUuid(profile.uuid)}>
@@ -547,8 +549,8 @@ function Content() {
                 <span style={{ flex: 1, textAlign: "left", overflowWrap: "anywhere" }}>
                   {profile.name}
                   <span style={{ display: "block", fontSize: "0.8em", opacity: 0.75 }}>
-                    {error ? "Status unavailable" : pendingUuid === profile.uuid
-                      ? "Applying change..." : status === stateLabels.disconnected ? "" : status}
+                    {profile.uuid.slice(0, 8)}
+                    {statusText && ` · ${statusText}`}
                     {profile.handshake_error && <span role="alert" style={{ display: "block" }}>
                       {profile.handshake_error}
                     </span>}
@@ -693,7 +695,7 @@ function Content() {
               <PanelSectionRow>
                 <ToggleField
                   label="Wait for internet"
-                  description="NetworkManager checks internet on Wi-Fi, Ethernet or mobile data, not VPNs."
+                  description="Checks Wi-Fi, Ethernet, Bluetooth or mobile data, not VPNs."
                   checked={selectedStartup.wait_for_internet}
                   disabled={busy || error !== null}
                   onChange={(checked) => void applyChange(

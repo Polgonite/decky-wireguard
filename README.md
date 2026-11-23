@@ -294,10 +294,10 @@ directory), then restart Decky Loader.
   reports readiness every two seconds; unavailable APIs, errors, or a report
   older than ten seconds never count as ready.
 - Internet readiness requests a fresh NetworkManager connectivity check and
-  requires `full` connectivity on a connected Wi-Fi, Ethernet, or mobile-data
-  device. A VPN's connectivity, Wi-Fi association alone, captive portals, and
-  limited connectivity do not qualify. This uses NetworkManager's configured
-  connectivity-check service, not a plugin-selected endpoint. Disabled or
+  requires `full` connectivity on a connected Wi-Fi, Ethernet, Bluetooth, or
+  mobile-data device. A VPN's connectivity, Wi-Fi association alone, captive
+  portals, and limited connectivity do not qualify. This uses NetworkManager's
+  configured connectivity-check service, not a plugin-selected endpoint. Disabled or
   unconfigured checks produce an actionable error and leave the VPN off,
   rather than trusting a default route as proof of internet access.
 - With either requirement unmet, the backend leaves the tunnel off and checks
@@ -388,9 +388,11 @@ directory), then restart Decky Loader.
   the imported profile.
 - Multiple tunnels can be active. Connecting one does not disconnect others;
   overlapping routes may conflict.
-- The plugin does not import or delete profiles. Secrets are shown only in the
-  configuration editor, and profiles change only through that editor or the startup
-  autoconnect setting. NetworkManager's normal
+- The plugin does not delete profiles. It can import WireGuard `.conf` files into
+  the configuration editor, but does not use NetworkManager's
+  `nmcli connection import` workflow. Secrets are shown only in the configuration
+  editor, and profiles change only through that editor or the startup autoconnect
+  setting. NetworkManager's normal
   connection-down behavior can temporarily inhibit autoconnect until reboot or
   another explicit activation. Unloading the plugin leaves tunnels as they are.
 
