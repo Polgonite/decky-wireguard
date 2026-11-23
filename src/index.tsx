@@ -565,36 +565,38 @@ function Content() {
       )}
       {selectedProfile && (
         <PanelSectionRow>
-          <div style={{ width: "100%" }}>
-            <ButtonItem
-              layout="below"
-              disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
-              onClick={() => void applyChange(
-                selectedProfile,
-                () => setConnection(selectedProfile.uuid, selectedProfile.state !== "connected"),
-              )}
-            >
-              {pendingUuid === selectedProfile.uuid
-                ? "Please wait..."
-                : transitioning || selectedProfile.state === "unknown"
-                  ? stateLabels[selectedProfile.state]
-                  : selectedProfile.state === "connected" ? "Disconnect" : "Connect"}
-            </ButtonItem>
-            <div style={{ padding: "8px 0", width: "100%", overflowWrap: "anywhere" }}>
-              <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <StatusCircle
-                  state={indicatorState(selectedProfile)}
-                  probeSent={error || pendingUuid === selectedProfile.uuid ? null : selectedProfile.probe_sent}
-                />
-                {selectedProfile.name}
-              </span>
-              {(selectedDescription || selectedProfile.handshake_error) && (
-                <div style={{ fontSize: "0.85em", opacity: 0.75 }}>
-                  {[selectedDescription, selectedProfile.handshake_error].filter(Boolean).join(" \u00b7 ")}
-                </div>
-              )}
-            </div>
+          <div style={{ padding: "8px 0", width: "100%", overflowWrap: "anywhere" }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <StatusCircle
+                state={indicatorState(selectedProfile)}
+                probeSent={error || pendingUuid === selectedProfile.uuid ? null : selectedProfile.probe_sent}
+              />
+              {selectedProfile.name}
+            </span>
+            {(selectedDescription || selectedProfile.handshake_error) && (
+              <div style={{ fontSize: "0.85em", opacity: 0.75 }}>
+                {[selectedDescription, selectedProfile.handshake_error].filter(Boolean).join(" \u00b7 ")}
+              </div>
+            )}
           </div>
+        </PanelSectionRow>
+      )}
+      {selectedProfile && (
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
+            onClick={() => void applyChange(
+              selectedProfile,
+              () => setConnection(selectedProfile.uuid, selectedProfile.state !== "connected"),
+            )}
+          >
+            {pendingUuid === selectedProfile.uuid
+              ? "Please wait..."
+              : transitioning || selectedProfile.state === "unknown"
+                ? stateLabels[selectedProfile.state]
+                : selectedProfile.state === "connected" ? "Disconnect" : "Connect"}
+          </ButtonItem>
         </PanelSectionRow>
       )}
       {selectedProfile && (

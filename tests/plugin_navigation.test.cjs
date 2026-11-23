@@ -249,7 +249,7 @@ function connectionStatus(node) {
 }
 
 for (const state of ["disconnected", "connected"]) {
-  test(`connection control precedes the status and peer details when ${state}`, async () => {
+  test(`connection control follows the status and precedes peer details when ${state}`, async () => {
     const connection = {
       ...profile, device: "wg0", state,
       handshake: state === "connected" ? "established" : "inactive",
@@ -283,9 +283,11 @@ for (const state of ["disconnected", "connected"]) {
     assert.ok(button && status && peerDetails && edit);
     const statusRow = nodes.find((node) =>
       node.type === "PanelSectionRow" && elementsIn(node).includes(status));
-    assert.ok(statusRow && elementsIn(statusRow).includes(button));
-    assert.ok(nodes.indexOf(button) < nodes.indexOf(status));
-    assert.ok(nodes.indexOf(status) < nodes.indexOf(peerDetails));
+    const buttonRow = nodes.find((node) =>
+      node.type === "PanelSectionRow" && elementsIn(node).includes(button));
+    assert.ok(statusRow && buttonRow && statusRow !== buttonRow);
+    assert.ok(nodes.indexOf(status) < nodes.indexOf(button));
+    assert.ok(nodes.indexOf(button) < nodes.indexOf(peerDetails));
     assert.ok(nodes.indexOf(peerDetails) < nodes.indexOf(edit));
     assert.equal(textIn(status), state === "connected" ? "HomeConnected on wg0" : "HomeDisconnected on wg0");
     assert.equal(button.props.disabled, false);
