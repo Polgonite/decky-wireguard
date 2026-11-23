@@ -126,6 +126,13 @@ function plugin(profiles, backend, options = {}) {
       effects.forEach((effect) => effect());
       await flush();
     },
+    update: async () => {
+      effects = [];
+      cursor = 0;
+      content();
+      effects.forEach((effect) => effect());
+      await flush();
+    },
   };
 }
 
@@ -216,13 +223,114 @@ test("the Back button returns from connection settings to the list", async () =>
 function elementsIn(node) {
   const elements = [];
   function collect(child) {
+    if (Array.isArray(child)) {
+      child.forEach(collect);
+      return;
+    }
     if (!child || typeof child !== "object") return;
     elements.push(child);
-    const children = child.props?.children;
-    (Array.isArray(children) ? children : [children]).forEach(collect);
+    collect(child.props?.children);
   }
   collect(node);
   return elements;
+}
+
+function textIn(node) {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(textIn).join("");
+  return node && typeof node === "object" ? textIn(node.props?.children) : "";
+}
+
+for (const logging of [false, true]) {
+  test(`connection status hides identifiers with diagnostic logging ${logging ? "on" : "off"}`, async () => {
+    const uuid = "12345678-1234-1234-1234-123456789abc";
+    const connected = {
+      ...profile, uuid, device: "wg0", state: "connected", handshake: "established",
+      ...(logging ? { diagnostic_ref: "tunnel-1" } : {}),
+    };
+    const peer = {
+      public_key: "peer-key", endpoint_ip: "203.0.113.1", last_handshake: null,
+      received_bytes: 0, sent_bytes: 0,
+      ...(logging ? { diagnostic_ref: "tunnel-1-peer-1" } : {}),
+    };
+    const panel = plugin([connected], (route, requestedUuid) => {
+      assert.equal(requestedUuid, uuid);
+      if (route === "get_startup_settings") return { success: true };
+      if (route === "get_peer_health") return { success: true, peers: [peer] };
+      assert.fail(`Unexpected backend call: ${route}`);
+    });
+
+    await panel.mount();
+    const button = elementsIn(panel.render()).find((node) =>
+      node.type === "ButtonItem" && textIn(node).startsWith("Home"));
+    assert.ok(button);
+    assert.equal(textIn(button), "Home");
+    const listIndicator = elementsIn(button).find((node) => node.type?.name === "StatusCircle");
+    assert.ok(listIndicator);
+    const listCircle = listIndicator.type(listIndicator.props);
+    assert.equal(listCircle.props.role, "img");
+    assert.equal(listCircle.props["aria-label"], "Peer verified");
+    assert.equal(listCircle.props["aria-hidden"], undefined);
+
+    button.props.onClick();
+    await panel.mount();
+    await panel.update();
+    const details = panel.render();
+    const connection = elementsIn(details).find((node) =>
+      node.type === "ButtonItem" && node.props.children === "Disconnect");
+    assert.ok(connection);
+    assert.equal(connection.props.description, "wg0");
+    const detailIndicator = elementsIn(connection.props.label).find((node) => node.type?.name === "StatusCircle");
+    assert.ok(detailIndicator);
+    const detailCircle = detailIndicator.type(detailIndicator.props);
+    assert.equal(detailCircle.props.role, "img");
+    assert.equal(detailCircle.props["aria-label"], "Peer verified");
+    assert.equal(detailCircle.props["aria-hidden"], undefined);
+    const logRows = elementsIn(details).filter((node) =>
+      node.type === "div" && textIn(node).startsWith("Log: "));
+    assert.equal(logRows.length, logging ? 1 : 0);
+    if (logging) {
+      assert.equal(textIn(logRows[0]), "Log: tunnel-1 \u00b7 Peer 1 = tunnel-1-peer-1");
+    }
+    assert.ok(!textIn(details).includes(uuid.slice(0, 8)));
+    assert.ok(!textIn(details).includes("Peer health"));
+    assert.ok(!textIn(details).includes("Traffic counters are cumulative"));
+    assert.ok(!textIn(details).includes("A peer response does not"));
+    assert.ok(textIn(details).includes("Peer 1 \u00b7 203.0.113.1"));
+    assert.ok(textIn(details).includes("Last handshake: Never"));
+    assert.ok(textIn(details).includes("Received: 0 B \u00b7 Sent: 0 B"));
+  });
+}
+
+for (const [connection, listStatus, description] of [
+  [{ state: "disconnected", handshake: "inactive", device: "", handshake_error: null },
+    "Disconnected", "Disconnected"],
+  [{ state: "connected", handshake: "waiting", device: "wg0", handshake_error: null },
+    "Verifying peer...", "Verifying peer... on wg0"],
+  [{ state: "connected", handshake: "timeout", device: "wg0", handshake_error: null },
+    "No peer response after 30 seconds", "No peer response after 30 seconds on wg0"],
+  [{ state: "connecting", handshake: "established", device: "wg0", handshake_error: null },
+    "Connecting...", "Connecting... on wg0"],
+  [{ state: "connected", handshake: "established", device: "", handshake_error: null }, "", ""],
+  [{
+    state: "connected", handshake: "unknown", device: "wg0", handshake_error: "Peer check failed",
+  }, "Peer status unavailablePeer check failed", "Peer status unavailable on wg0 \u00b7 Peer check failed"],
+]) {
+  test(`connection status retains its details without an identifier: ${description || "verified"}`, async () => {
+    const uuid = "12345678-1234-1234-1234-123456789abc";
+    const panel = plugin([{ ...profile, ...connection, uuid }]);
+    await panel.mount();
+    const listButton = elementsIn(panel.render()).find((node) =>
+      node.type === "ButtonItem" && textIn(node).startsWith("Home"));
+    assert.ok(listButton);
+    assert.equal(textIn(listButton), `Home${listStatus}`);
+    panel.navigation.returnToPlugin(uuid);
+    await panel.mount();
+    const button = elementsIn(panel.render()).find((node) =>
+      node.type === "ButtonItem" && typeof node.props.description === "string");
+    assert.ok(button);
+    assert.equal(button.props.description, description);
+  });
 }
 
 test("the new connection button opens the configuration page", async () => {

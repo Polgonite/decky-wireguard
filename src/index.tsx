@@ -132,14 +132,18 @@ const stateColors: Record<HandshakeState, string> = {
 };
 
 function profileLabel(profile: Profile): string {
+  if (profile.state === "connected" && profile.handshake === "established") return "";
   return profile.state === "connected" || profile.handshake === "timeout"
     ? handshakeLabels[profile.handshake] : stateLabels[profile.state];
 }
 
 function StatusCircle({ state }: { state: HandshakeState }) {
+  const verified = state === "established";
   return (
     <span
-      aria-hidden="true"
+      role={verified ? "img" : undefined}
+      aria-label={verified ? handshakeLabels.established : undefined}
+      aria-hidden={verified ? undefined : true}
       className="decky-wireguard-status"
       style={{
         backgroundColor: stateColors[state],
@@ -405,6 +409,8 @@ function Content() {
   const selectedStatus = error ? "Status unavailable" : pendingUuid === selectedProfile?.uuid
     ? "Applying change..."
     : selectedProfile ? profileLabel(selectedProfile) : "";
+  const selectedDescription = `${selectedStatus}${selectedProfile?.device
+    ? `${selectedStatus ? " on " : ""}${selectedProfile.device}` : ""}`;
 
   const indicatorState = (profile: Profile): HandshakeState => {
     if (error) return "unknown";
@@ -520,8 +526,7 @@ function Content() {
                 {profile.name}
                 <span style={{ display: "block", fontSize: "0.8em", opacity: 0.75 }}>
                   {error ? "Status unavailable" : pendingUuid === profile.uuid
-                    ? "Applying change..." : profileLabel(profile)} · {profile.uuid.slice(0, 8)}
-                  {profile.diagnostic_ref && ` · ${profile.diagnostic_ref}`}
+                    ? "Applying change..." : profileLabel(profile)}
                   {profile.handshake_error && <span role="alert" style={{ display: "block" }}>
                     {profile.handshake_error}
                   </span>}
@@ -543,7 +548,7 @@ function Content() {
               <StatusCircle state={indicatorState(selectedProfile)} />
               {selectedProfile.name}
             </span>}
-            description={`${selectedStatus}${selectedProfile.device ? ` on ${selectedProfile.device}` : ""} \u00b7 ${selectedProfile.uuid.slice(0, 8)}${selectedProfile.handshake_error ? ` \u00b7 ${selectedProfile.handshake_error}` : ""}`}
+            description={[selectedDescription, selectedProfile.handshake_error].filter(Boolean).join(" \u00b7 ")}
             disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
             onClick={() => void applyChange(
               selectedProfile,
@@ -560,11 +565,6 @@ function Content() {
       )}
       {selectedProfile && (
         <>
-          <PanelSectionRow>
-            <div style={{ fontSize: "0.85em", opacity: 0.75, padding: "8px 0" }}>
-              Peer health
-            </div>
-          </PanelSectionRow>
           {selectedProfile.state !== "connected" ? (
             <PanelSectionRow>
               <div style={{ fontSize: "0.85em", opacity: 0.75, padding: "8px 0" }}>
@@ -596,11 +596,6 @@ function Content() {
                   </div>
                 </PanelSectionRow>
               ))}
-              <PanelSectionRow>
-                <div style={{ fontSize: "0.8em", opacity: 0.7, padding: "4px 0" }}>
-                  Traffic counters are cumulative for this interface.
-                </div>
-              </PanelSectionRow>
             </>
           )}
           <PanelSectionRow>
@@ -706,11 +701,6 @@ function Content() {
           </PanelSectionRow>
         </>
       )}
-      <PanelSectionRow>
-        <div style={{ fontSize: "0.85em", opacity: 0.75, paddingTop: 8 }}>
-          A peer response does not guarantee internet access or ongoing health.
-        </div>
-      </PanelSectionRow>
       {selectedProfile?.diagnostic_ref && (
         <PanelSectionRow>
           <div style={{ fontSize: "0.75em", opacity: 0.5, overflowWrap: "anywhere", paddingTop: 8 }}>
