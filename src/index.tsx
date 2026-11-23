@@ -27,6 +27,7 @@ interface PeerHealth {
   last_handshake: number | null;
   received_bytes: number;
   sent_bytes: number;
+  diagnostic_ref?: string;
 }
 
 type Result<T> = ({ success: true } & T) | { success: false; error: string };
@@ -509,7 +510,7 @@ function Content() {
               <StatusCircle state={indicatorState(selectedProfile)} />
               {selectedProfile.name}
             </span>}
-            description={`${selectedStatus}${selectedProfile.device ? ` on ${selectedProfile.device}` : ""} \u00b7 ${selectedProfile.uuid.slice(0, 8)}${selectedProfile.diagnostic_ref ? ` \u00b7 ${selectedProfile.diagnostic_ref}` : ""}${selectedProfile.handshake_error ? ` \u00b7 ${selectedProfile.handshake_error}` : ""}`}
+            description={`${selectedStatus}${selectedProfile.device ? ` on ${selectedProfile.device}` : ""} \u00b7 ${selectedProfile.uuid.slice(0, 8)}${selectedProfile.handshake_error ? ` \u00b7 ${selectedProfile.handshake_error}` : ""}`}
             disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
             onClick={() => void applyChange(
               selectedProfile,
@@ -677,6 +678,19 @@ function Content() {
           A peer response does not guarantee internet access or ongoing health.
         </div>
       </PanelSectionRow>
+      {selectedProfile?.diagnostic_ref && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "0.75em", opacity: 0.5, overflowWrap: "anywhere", paddingTop: 8 }}>
+            Log: {[
+              selectedProfile.diagnostic_ref,
+              ...(selectedProfile.state === "connected" && peerHealth?.uuid === selectedProfile.uuid
+                ? peerHealth.peers.flatMap((peer, index) =>
+                  peer.diagnostic_ref ? [`Peer ${index + 1} = ${peer.diagnostic_ref}`] : [])
+                : []),
+            ].join(" · ")}
+          </div>
+        </PanelSectionRow>
+      )}
     </PanelSection>
   );
 

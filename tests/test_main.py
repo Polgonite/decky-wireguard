@@ -662,6 +662,20 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
             ],
         })
 
+    async def test_peer_health_includes_peer_refs_only_while_logging(self):
+        self.diagnostic_directory()
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        with patch(
+            "main._handshakes", new_callable=AsyncMock, return_value={"peer1": 1, "peer2": 0},
+        ), patch("main._transfer_counters", new_callable=AsyncMock, return_value={}):
+            result = await self.plugin.get_peer_health(HOME)
+            self.assertNotIn("diagnostic_ref", result["peers"][0])
+            await self.plugin.set_logging_settings(True, False)
+            result = await self.plugin.get_peer_health(HOME)
+        self.assertEqual(
+            [peer["diagnostic_ref"] for peer in result["peers"]], ["tunnel-1-peer-1", "tunnel-1-peer-2"],
+        )
+
     async def test_peer_health_does_not_query_interface_when_disconnected(self):
         self.nmcli.return_value = f"{HOME}:wireguard:Home:--:deactivated:--\n"
         with patch("main._handshakes", new_callable=AsyncMock) as handshakes, patch(

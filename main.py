@@ -1608,15 +1608,17 @@ class Plugin:
                     raise NetworkManagerError("NetworkManager did not report a WireGuard interface.")
                 handshakes = await _handshakes(profile["device"])
                 counters = await _transfer_counters(profile["device"])
-                peers = [
-                    {
+                peers: list[dict[str, object]] = []
+                for peer in sorted(handshakes.keys() | counters.keys()):
+                    entry: dict[str, object] = {
                         "public_key": peer,
                         "last_handshake": handshakes.get(peer) or None,
                         "received_bytes": counters.get(peer, (0, 0))[0],
                         "sent_bytes": counters.get(peer, (0, 0))[1],
                     }
-                    for peer in sorted(handshakes.keys() | counters.keys())
-                ]
+                    if self._log_handler is not None:
+                        entry["diagnostic_ref"] = self._peer_ref(uuid, peer)
+                    peers.append(entry)
                 return {"success": True, "peers": peers}
         except NetworkManagerError as error:
             return self._failure(error)

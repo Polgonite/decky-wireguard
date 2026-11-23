@@ -396,7 +396,8 @@ at most every 10 seconds per tunnel, with a fresh sample after a detected resume
 Collect `wireguard-diagnostics.log` and, if present, `wireguard-diagnostics.log.1`
 from Decky's WireGuard plugin log directory (`DECKY_PLUGIN_LOG_DIR`, normally
 under `~/homebrew/logs/`). The two files are capped at about 256 KiB each.
-Note the affected `tunnel-N` shown in the plugin, when it went red, and whether
+Note the affected `tunnel-N` shown in the plugin (at the bottom of a connection's
+management page, along with its peer aliases), when it went red, and whether
 traffic still worked. Aliases such as `tunnel-1-peer-2` are local to one backend
 session. The log does not include IP addresses, names, UUIDs, keys, or raw
 command output. Disabling logging also disables debug and stops recording
