@@ -436,7 +436,7 @@ function Content() {
           <PanelSectionRow>
             <ToggleField
               label="Show advanced settings"
-              description="Show advanced editor options and after-boot wait controls."
+              description="Show advanced editor options and Smart connect wait controls."
               checked={uiSettings.showAdvanced}
               disabled={!uiSettings.loaded || uiSettings.saving}
               onChange={(checked) => void saveUISettings(checked)}
@@ -624,7 +624,7 @@ function Content() {
           <PanelSectionRow>
             <ToggleField
               label="Connect during boot"
-              description="Uses NetworkManager autoconnect; may delay boot when offline."
+              description="Uses NetworkManager autoconnect."
               checked={selectedStartup?.on_boot ?? false}
               disabled={busy || error !== null || selectedStartup === null}
               onChange={(checked) => void applyChange(
@@ -635,8 +635,8 @@ function Content() {
           </PanelSectionRow>
           <PanelSectionRow>
             <ToggleField
-              label="Connect after boot"
-              description="From next boot, attempts once per boot after plugin load; disables NetworkManager autoconnect."
+              label="Smart connect"
+              description="Waits until the Deck has fully booted and processes known to cause problems are ready, then connects. Will let some traffic through outside the VPN before it decides to connect."
               checked={selectedStartup?.after_boot ?? false}
               disabled={busy || error !== null || selectedStartup === null}
               onChange={(checked) => void applyChange(

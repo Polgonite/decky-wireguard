@@ -273,15 +273,16 @@ directory), then restart Decky Loader.
   the editor with Back or the B button asks before discarding unsaved changes.
 - Every connection management page has two mutually exclusive startup checkboxes.
   **Connect during boot** sets NetworkManager's `connection.autoconnect` through
-  `nmcli`; this can delay boot when the Deck is offline. **Connect after boot**
-  disables NetworkManager autoconnect and lets the backend attempt activation
-  when the plugin loads, after systemd reports boot finished (`running` or
-  `degraded`). Neither checkbox needs to be enabled; changing them does not
+  `nmcli`. **Smart connect** delays the connection until the Deck is fully
+  booted, waiting for processes that often cause problems when a tunnel comes
+  up too early. It disables NetworkManager autoconnect and lets the backend
+  attempt activation when the plugin loads, after systemd reports boot finished
+  (`running` or `degraded`) and the enabled wait conditions below are met. Neither checkbox needs to be enabled; changing them does not
   immediately connect or disconnect the tunnel.
 - Two independent per-connection checkboxes control plugin-managed startup:
   **Wait for Steam login** and **Wait for internet**. Both default to enabled,
   including for connections configured before these options were added. They
-  only appear when **Show advanced settings** and **Connect after boot** are
+  only appear when **Show advanced settings** and **Smart connect** are
   enabled, and their saved values are preserved when either is turned off and
   on again. Hiding them does not change startup behavior. They do not affect
   NetworkManager boot autoconnect or manual Connect actions.
@@ -304,14 +305,14 @@ directory), then restart Decky Loader.
   page shows what it is waiting for. Requirement changes apply to pending
   startup work. Manual Connect or Disconnect cancels that connection's pending
   automatic activation for this boot, even if it is already disconnected.
-- After-boot preferences and the last handled Linux boot ID are saved atomically
+- Smart connect preferences and the last handled Linux boot ID are saved atomically
   in Decky's persistent plugin settings directory (`startup.json`). The backend
   records the boot before attempting activation, including when no profiles are
   configured. Closing the panel, reloading the frontend, restarting Decky, or
   reloading the backend does not trigger another attempt during the same boot.
   Enabling this option after the plugin's first load takes effect next boot.
   Uninstalling or deleting plugin settings resets this record.
-- After-boot activation runs in the background without blocking plugin loading
+- Smart connect activation runs in the background without blocking plugin loading
   or the system boot path. After its enabled requirements are met, each configured
   tunnel gets one bounded activation attempt; activation/readiness-check errors
   are shown in the panel with no automatic retries. Missing internet or an

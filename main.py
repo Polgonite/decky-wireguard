@@ -1733,7 +1733,7 @@ class Plugin:
                 if state in ("running", "degraded"):
                     break
                 if state not in ("initializing", "starting"):
-                    raise NetworkManagerError(f"Cannot connect after boot: system state is {state!r}.")
+                    raise NetworkManagerError(f"Smart connect unavailable: system state is {state!r}.")
                 await asyncio.sleep(2)
             while self._startup_pending:
                 for uuid in configured:
@@ -1772,8 +1772,8 @@ class Plugin:
                                 continue
                             await self._change_connection(profile, True)
                     except NetworkManagerError as error:
-                        message = f"After-boot connection failed for {uuid}: {error}"
-                        logger.warning("WireGuard after-boot profile activation failed.")
+                        message = f"Smart connect failed for {uuid}: {error}"
+                        logger.warning("WireGuard Smart connect profile activation failed.")
                         self._startup_error = (
                             f"{self._startup_error}\n{message}" if self._startup_error else message
                         )
@@ -1784,7 +1784,7 @@ class Plugin:
                 if self._startup_pending:
                     await asyncio.sleep(5)
         except NetworkManagerError as error:
-            logger.warning("WireGuard after-boot startup failed.")
+            logger.warning("WireGuard Smart connect startup failed.")
             self._startup_error = str(error)
         finally:
             self._startup_pending.clear()

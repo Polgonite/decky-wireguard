@@ -283,7 +283,7 @@ function toggles(panel) {
 
 for (const mode of ["off", "on_boot", "after_boot"]) {
   for (const advanced of [false, true]) {
-    test(`startup wait switches require advanced settings and after-boot mode (${mode}, ${advanced})`, async () => {
+    test(`startup wait switches require advanced settings and Smart connect mode (${mode}, ${advanced})`, async () => {
       const panel = plugin([profile], (route) => {
         assert.equal(route, "get_startup_settings");
         return {
@@ -295,7 +295,7 @@ for (const mode of ["off", "on_boot", "after_boot"]) {
       await panel.mount();
       const fields = toggles(panel);
       assert.ok(fields["Connect during boot"]);
-      assert.ok(fields["Connect after boot"]);
+      assert.ok(fields["Smart connect"]);
       for (const label of ["Wait for Steam login", "Wait for internet"]) {
         assert.equal(fields[label] !== undefined, advanced && mode === "after_boot");
         if (advanced && mode === "after_boot") {
@@ -332,11 +332,11 @@ test("startup wait choices survive hiding, showing, and remounting the panel", a
     await flush();
     assert.equal(toggles(panel)[label].checked, false);
   }
-  toggles(panel)["Connect after boot"].onChange(false);
+  toggles(panel)["Smart connect"].onChange(false);
   await flush();
   assert.equal(toggles(panel)["Wait for Steam login"], undefined);
   assert.equal(toggles(panel)["Wait for internet"], undefined);
-  toggles(panel)["Connect after boot"].onChange(true);
+  toggles(panel)["Smart connect"].onChange(true);
   await flush();
   await panel.mount();
   assert.equal(toggles(panel)["Wait for Steam login"].checked, false);
@@ -396,7 +396,7 @@ test("the settings toggle hides wait switches without changing their saved value
   await openConnection();
   assert.equal(toggles(panel)["Wait for Steam login"], undefined);
   assert.equal(toggles(panel)["Wait for internet"], undefined);
-  assert.equal(toggles(panel)["Connect after boot"].checked, true);
+  assert.equal(toggles(panel)["Smart connect"].checked, true);
 
   await openList();
   openSettings();
