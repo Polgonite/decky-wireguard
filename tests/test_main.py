@@ -642,21 +642,24 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "main._transfer_counters", new_callable=AsyncMock,
             return_value={"peer1": (2048, 4096), "peer3": (0, 0)},
+        ), patch(
+            "main._endpoints", new_callable=AsyncMock,
+            return_value={"peer1": "198.51.100.7:51820", "peer2": "[2001:db8::1]:51820", "peer3": "(none)"},
         ):
             result = await self.plugin.get_peer_health(HOME)
         self.assertEqual(result, {
             "success": True,
             "peers": [
                 {
-                    "public_key": "peer1", "last_handshake": 1234,
+                    "public_key": "peer1", "endpoint_ip": "198.51.100.7", "last_handshake": 1234,
                     "received_bytes": 2048, "sent_bytes": 4096,
                 },
                 {
-                    "public_key": "peer2", "last_handshake": None,
+                    "public_key": "peer2", "endpoint_ip": "2001:db8::1", "last_handshake": None,
                     "received_bytes": 0, "sent_bytes": 0,
                 },
                 {
-                    "public_key": "peer3", "last_handshake": None,
+                    "public_key": "peer3", "endpoint_ip": None, "last_handshake": None,
                     "received_bytes": 0, "sent_bytes": 0,
                 },
             ],
@@ -667,7 +670,9 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
         self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
         with patch(
             "main._handshakes", new_callable=AsyncMock, return_value={"peer1": 1, "peer2": 0},
-        ), patch("main._transfer_counters", new_callable=AsyncMock, return_value={}):
+        ), patch("main._transfer_counters", new_callable=AsyncMock, return_value={}), patch(
+            "main._endpoints", new_callable=AsyncMock, return_value={},
+        ):
             result = await self.plugin.get_peer_health(HOME)
             self.assertNotIn("diagnostic_ref", result["peers"][0])
             await self.plugin.set_logging_settings(True, False)

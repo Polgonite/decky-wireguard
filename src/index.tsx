@@ -24,6 +24,7 @@ interface Profile {
 
 interface PeerHealth {
   public_key: string;
+  endpoint_ip: string | null;
   last_handshake: number | null;
   received_bytes: number;
   sent_bytes: number;
@@ -553,7 +554,7 @@ function Content() {
               {peerHealth.peers.map((peer, index) => (
                 <PanelSectionRow key={peer.public_key}>
                   <div style={{ fontSize: "0.85em", overflowWrap: "anywhere", padding: "8px 0", width: "100%" }}>
-                    <div>Peer {index + 1} · {peer.public_key.slice(0, 12)}...</div>
+                    <div>Peer {index + 1} · {peer.endpoint_ip ?? "No endpoint"}</div>
                     <div style={{ opacity: 0.75 }}>
                       Last handshake: {formatHandshakeAge(peer.last_handshake)}
                     </div>

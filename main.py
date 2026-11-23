@@ -782,6 +782,14 @@ async def _endpoints(device: str) -> dict[str, str]:
     return endpoints
 
 
+def _endpoint_ip(endpoint: str | None) -> str | None:
+    # `wg show endpoints` prints "(none)", "host:port" or "[v6]:port".
+    if not endpoint or endpoint == "(none)":
+        return None
+    host = endpoint.rpartition(":")[0]
+    return host[1:-1] if host.startswith("[") and host.endswith("]") else host or None
+
+
 def _unicast(address: Address) -> bool:
     return not (
         address.is_unspecified or address.is_loopback or address.is_multicast
@@ -1608,10 +1616,12 @@ class Plugin:
                     raise NetworkManagerError("NetworkManager did not report a WireGuard interface.")
                 handshakes = await _handshakes(profile["device"])
                 counters = await _transfer_counters(profile["device"])
+                endpoints = await _endpoints(profile["device"])
                 peers: list[dict[str, object]] = []
                 for peer in sorted(handshakes.keys() | counters.keys()):
                     entry: dict[str, object] = {
                         "public_key": peer,
+                        "endpoint_ip": _endpoint_ip(endpoints.get(peer)),
                         "last_handshake": handshakes.get(peer) or None,
                         "received_bytes": counters.get(peer, (0, 0))[0],
                         "sent_bytes": counters.get(peer, (0, 0))[1],
