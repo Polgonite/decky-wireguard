@@ -321,8 +321,8 @@ directory), then restart Decky Loader.
   are left alone. Unloading cancels pending startup work; it does not retry on
   reload that boot. External NetworkManager edits that re-enable autoconnect
   cause the plugin to skip that tunnel and report the conflict.
-- Status refreshes every second while verifying a peer, otherwise every five
-  seconds while the panel is mounted. Refresh also
+- Status refreshes every second while a tunnel is connected or verifying a peer,
+  otherwise every five seconds while the panel is mounted. Refresh also
   runs after each action. Refreshes keep the current controls visible and only
   update profiles when the response changes; connection actions still show a
   busy state. Unavailable status disables actions until a successful refresh,
@@ -341,7 +341,9 @@ directory), then restart Decky Loader.
   within 30 seconds. A late response changes red to green. Green stays until
   deactivation; it does not indicate ongoing peer health, internet access, or protected routing.
   A filled, translucent ripple in the status color expands and fades whenever
-  a probe round is sent, including while green. The solid status circle stays
+  a probe round is sent, including while green. A new connection gets an initial
+  yellow pulse, followed by a green pulse when verification succeeds, even if
+  the handshake completes immediately. The solid status circle stays
   unchanged; it does not pulse merely because status refreshes. Pulsing is
   disabled when reduced motion is requested.
 - Evidence is read with `wg show <interface> latest-handshakes` and
@@ -356,7 +358,11 @@ directory), then restart Decky Loader.
   handshake or newly received authenticated traffic is required.
   Closing and reopening the panel does not reset backend tracking.
 - The plugin sends a small round of probes immediately while unverified and
-  at most once every 10 seconds while the panel is open. It prefers a root NS
+  at most once every five seconds while the panel is open. Active tunnels are
+  polled every second so probe timing is not delayed by a slower status refresh.
+  It also sends one extra round when verification first succeeds, without
+  waiting for the interval; subsequent
+  rounds resume five seconds after that send. It prefers a root NS
   query to the tunnel's configured DNS server when covered by that peer's
   AllowedIPs, and also sends an ICMP echo to a non-local address in its allowed
   ranges. Both IPv4 and IPv6 are supported. Sockets are bound to the WireGuard

@@ -334,7 +334,9 @@ function Content() {
     };
   }, [refresh]);
 
-  const refreshInterval = profiles?.some((profile) => profile.handshake === "waiting") ? 1000 : 5000;
+  const refreshInterval = profiles?.some((profile) =>
+    profile.state === "connected" || profile.handshake === "waiting",
+  ) ? 1000 : 5000;
   useEffect(() => {
     const timer = window.setInterval(() => void refresh(), refreshInterval);
     return () => window.clearInterval(timer);

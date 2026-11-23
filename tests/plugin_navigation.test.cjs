@@ -27,12 +27,13 @@ function plugin(profiles, backend, options = {}) {
   let pluginExits = 0;
   let showAdvanced = options.advanced ?? false;
   const navigations = [];
+  const intervals = [];
   const subscriptions = [];
   const element = (type, props, key) => ({ type, props, key });
   const context = {
     exports: {},
     App: { BHasCurrentUser: () => true, GetServicesInitialized: () => true },
-    window: { setInterval: () => 1, clearInterval: () => {} },
+    window: { setInterval: (_, interval) => { intervals.push(interval); return 1; }, clearInterval: () => {} },
     require: (name) => {
       if (name === "react") return {
         useState: (initial) => {
@@ -97,6 +98,7 @@ function plugin(profiles, backend, options = {}) {
   return {
     navigation: navigation.exports,
     navigations,
+    intervals,
     subscribe: (listener) => subscriptions.at(-1)(listener),
     subscribeToSettings: (listener) => {
       uiSettings.exports.useUISettings();
@@ -277,6 +279,23 @@ for (const handshake of ["waiting", "established", "timeout"]) {
     assert.match(textIn(styles), /status::after \{ animation: none !important/);
   });
 }
+
+test("active tunnels retain fast polling after verification; disconnected tunnels use idle polling", async () => {
+  const connection = { ...profile, state: "connected", handshake: "waiting" };
+  const panel = plugin([connection]);
+  await panel.mount();
+  await panel.update();
+  assert.equal(panel.intervals.at(-1), 1000);
+  connection.handshake = "established";
+  await panel.update();
+  await panel.update();
+  assert.equal(panel.intervals.at(-1), 1000);
+  connection.state = "disconnected";
+  connection.handshake = "inactive";
+  await panel.update();
+  await panel.update();
+  assert.equal(panel.intervals.at(-1), 5000);
+});
 
 for (const logging of [false, true]) {
   test(`connection status hides identifiers with diagnostic logging ${logging ? "on" : "off"}`, async () => {

@@ -907,6 +907,25 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
             self.handshakes.return_value = {"peer": 1000}
             self.assertEqual(await self.handshake_status(), "established")
 
+    async def test_immediate_local_handshake_still_sends_yellow_then_green_probes(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:::\n"
+        with patch("main.time.monotonic", return_value=100) as clock, patch(
+            "main.time.time", return_value=1000,
+        ):
+            await self.plugin.set_connection(HOME, True)
+            self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+            self.handshakes.return_value = {"peer": 1000}
+            result = await self.plugin.get_profiles()
+            self.assertEqual(result["profiles"][0]["handshake"], "waiting")
+            self.assertEqual(result["profiles"][0]["probe_sent"], 100)
+            self.assertEqual(self.probe.await_count, 1)
+            clock.return_value = 101
+            result = await self.plugin.get_profiles()
+            self.assertEqual(result["profiles"][0]["handshake"], "established")
+            self.assertEqual(result["profiles"][0]["probe_sent"], 101)
+            self.assertEqual(self.probe.await_count, 2)
+            self.probe.assert_awaited_with("wg0", self.targets.return_value)
+
     async def test_local_activation_timeout_starts_before_nmcli_up_finishes(self):
         self.nmcli.return_value = f"{HOME}:wireguard:Home:::\n"
         with patch("main.time.monotonic", return_value=100):
@@ -922,6 +941,7 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
         self.handshakes.assert_not_awaited()
         self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
         self.handshakes.return_value = {"peer": 1001}
+        self.assertEqual(await self.handshake_status(), "waiting")
         self.assertEqual(await self.handshake_status(), "established")
 
     async def test_reactivation_between_refreshes_resets_completed_status(self):
@@ -984,7 +1004,7 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.handshake_status(), "waiting")
         self.received.return_value = {"peer": 1032}
         self.assertEqual(await self.handshake_status(), "established")
-        self.probe.assert_awaited_once()
+        self.assertEqual(self.probe.await_count, 2)
 
     async def test_counter_reset_or_new_peer_baseline_is_not_fresh_evidence(self):
         self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
@@ -997,10 +1017,10 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
         self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
         with patch("main.time.monotonic", return_value=100) as clock:
             self.assertEqual(await self.handshake_status(), "waiting")
-            clock.return_value = 109.999
+            clock.return_value = 104.999
             self.assertEqual(await self.handshake_status(), "waiting")
             self.assertEqual(self.probe.await_count, 1)
-            clock.return_value = 110
+            clock.return_value = 105
             self.assertEqual(await self.handshake_status(), "waiting")
             self.assertEqual(self.probe.await_count, 2)
             clock.return_value = 130
@@ -1022,24 +1042,25 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
             self.handshakes.return_value = {"peer": 1000}
             result = await self.plugin.get_profiles()
             self.assertEqual(result["profiles"][0]["handshake"], "established")
-            self.assertIsNone(result["profiles"][0]["probe_sent"])
-            clock.return_value = 109.999
+            self.assertEqual(result["profiles"][0]["probe_sent"], 101)
+            self.assertEqual(self.probe.await_count, 2)
+            clock.return_value = 105.999
             result = await self.plugin.get_profiles()
             self.assertIsNone(result["profiles"][0]["probe_sent"])
-            self.assertEqual(self.probe.await_count, 1)
-            clock.return_value = 110
+            self.assertEqual(self.probe.await_count, 2)
+            clock.return_value = 106
             result = await self.plugin.get_profiles()
             self.assertEqual(result["profiles"][0]["handshake"], "established")
-            self.assertEqual(result["profiles"][0]["probe_sent"], 110)
-            self.assertEqual(self.probe.await_count, 2)
+            self.assertEqual(result["profiles"][0]["probe_sent"], 106)
+            self.assertEqual(self.probe.await_count, 3)
             result = await self.plugin.get_profiles()
             self.assertIsNone(result["profiles"][0]["probe_sent"])
-            self.assertEqual(self.probe.await_count, 2)
+            self.assertEqual(self.probe.await_count, 3)
             clock.return_value = 120
             self.nmcli.return_value = f"{HOME}:wireguard:Home:::\n"
             result = await self.plugin.get_profiles()
             self.assertIsNone(result["profiles"][0]["probe_sent"])
-            self.assertEqual(self.probe.await_count, 2)
+            self.assertEqual(self.probe.await_count, 3)
 
     async def test_failed_verified_probe_reports_error_without_a_pulse_and_can_retry(self):
         self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
@@ -1059,6 +1080,25 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["profiles"][0]["handshake"], "established")
             self.assertEqual(result["profiles"][0]["probe_sent"], 110)
 
+    async def test_failed_verification_followup_retries_before_the_regular_interval(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        with patch("main.time.monotonic", return_value=100) as clock:
+            await self.handshake_status()
+            clock.return_value = 101
+            self.handshakes.return_value = {"peer": 1000}
+            self.probe.side_effect = NetworkManagerError("Probe blocked")
+            with self.assertLogs("decky-wireguard"):
+                result = await self.plugin.get_profiles()
+            self.assertEqual(result["profiles"][0]["handshake"], "unknown")
+            self.assertEqual(result["profiles"][0]["handshake_error"], "Probe blocked")
+            self.assertIsNone(result["profiles"][0]["probe_sent"])
+            clock.return_value = 102
+            self.probe.side_effect = None
+            result = await self.plugin.get_profiles()
+            self.assertEqual(result["profiles"][0]["handshake"], "established")
+            self.assertEqual(result["profiles"][0]["probe_sent"], 102)
+            self.assertEqual(self.probe.await_count, 3)
+
     async def test_receive_baseline_resets_for_reactivation(self):
         self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
         self.received.return_value = {"peer": 1000}
@@ -1067,7 +1107,7 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.handshake_status(), "established")
         self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/2\n"
         self.assertEqual(await self.handshake_status(), "waiting")
-        self.assertEqual(self.probe.await_count, 2)
+        self.assertEqual(self.probe.await_count, 3)
         self.received.return_value = {"peer": 1064}
         self.assertEqual(await self.handshake_status(), "established")
 
@@ -1080,6 +1120,7 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["profiles"][0]["handshake"], "unknown")
         self.assertEqual(result["profiles"][0]["handshake_error"], "Probe blocked")
         self.received.return_value = {"peer": 1032}
+        self.probe.side_effect = None
         self.assertEqual(await self.handshake_status(), "established")
 
 

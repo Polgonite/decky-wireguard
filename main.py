@@ -30,7 +30,8 @@ logger = logging.getLogger("decky-wireguard")
 State = Literal["connected", "connecting", "disconnecting", "disconnected", "unknown"]
 HandshakeState = Literal["inactive", "waiting", "established", "timeout", "unknown"]
 HANDSHAKE_TIMEOUT = 30
-PROBE_INTERVAL = 10
+PROBE_INTERVAL = 5
+DEBUG_SAMPLE_INTERVAL = 10
 Address = IPv4Address | IPv6Address
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 STEAM_READINESS_MAX_AGE = 10
@@ -1134,7 +1135,7 @@ class Plugin:
         if not device:
             return
         now = time.monotonic()
-        if uuid in self._debug_samples and now - self._debug_samples[uuid] < PROBE_INTERVAL:
+        if uuid in self._debug_samples and now - self._debug_samples[uuid] < DEBUG_SAMPLE_INTERVAL:
             return
         self._debug_samples[uuid] = now
         try:
@@ -1545,6 +1546,11 @@ class Plugin:
             handshakes = await _handshakes(profile["device"])
             if activation.baseline is None:
                 activation.baseline = handshakes
+            if activation.since is not None and activation.last_probe is None:
+                # Show the initial probe before accepting an activation's immediate handshake.
+                activation.received = await _received_bytes(profile["device"])
+                await self._probe_activation(profile, activation)
+                return "timeout" if time.monotonic() - activation.started >= HANDSHAKE_TIMEOUT else "waiting"
             verified_peer = next((
                 peer for peer, timestamp in handshakes.items()
                 if timestamp > 0 and (
@@ -1553,9 +1559,10 @@ class Plugin:
                 )
             ), None)
             if verified_peer is not None:
-                activation.completed = True
                 if self._log_handler is not None:
                     self._log(logging.INFO, "%s verified evidence=handshake", self._peer_ref(uuid, verified_peer))
+                await self._probe_activation(profile, activation, force=True)
+                activation.completed = True
                 return "established"
             received = await _received_bytes(profile["device"])
             if activation.received is not None:
@@ -1564,16 +1571,19 @@ class Plugin:
                     if peer in activation.received and amount > activation.received[peer]
                 ), None)
                 if verified_peer is not None:
-                    activation.completed = True
                     if self._log_handler is not None:
                         self._log(logging.INFO, "%s verified evidence=receive", self._peer_ref(uuid, verified_peer))
+                    await self._probe_activation(profile, activation, force=True)
+                    activation.completed = True
                     return "established"
             activation.received = received
             await self._probe_activation(profile, activation)
         return "timeout" if time.monotonic() - activation.started >= HANDSHAKE_TIMEOUT else "waiting"
 
-    async def _probe_activation(self, profile: Profile, activation: Activation) -> None:
-        if activation.last_probe is not None and (
+    async def _probe_activation(
+        self, profile: Profile, activation: Activation, *, force: bool = False,
+    ) -> None:
+        if not force and activation.last_probe is not None and (
             time.monotonic() - activation.last_probe < PROBE_INTERVAL
         ):
             return
