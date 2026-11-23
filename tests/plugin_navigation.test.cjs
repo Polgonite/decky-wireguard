@@ -417,10 +417,14 @@ for (const logging of [false, true]) {
 
 for (const [connection, listStatus, description] of [
   [{ state: "disconnected", handshake: "inactive", device: "", handshake_error: null },
-    "Disconnected", "Disconnected"],
+    "", "Disconnected"],
+  [{ state: "disconnected", handshake: "inactive", device: "", handshake_error: "Peer check failed" },
+    "Peer check failed", "Disconnected \u00b7 Peer check failed"],
   [{ state: "connected", handshake: "waiting", device: "wg0", handshake_error: null },
     "Verifying peer...", "Verifying peer... on wg0"],
   [{ state: "connected", handshake: "timeout", device: "wg0", handshake_error: null },
+    "No peer response after 30 seconds", "No peer response after 30 seconds on wg0"],
+  [{ state: "disconnected", handshake: "timeout", device: "wg0", handshake_error: null },
     "No peer response after 30 seconds", "No peer response after 30 seconds on wg0"],
   [{ state: "connecting", handshake: "established", device: "wg0", handshake_error: null },
     "Connecting...", "Connecting... on wg0"],
@@ -440,6 +444,10 @@ for (const [connection, listStatus, description] of [
       node.type === "ButtonItem" && textIn(node).startsWith("Home"));
     assert.ok(listButton);
     assert.equal(textIn(listButton), `Home${listStatus}`);
+    if (connection.handshake_error) {
+      const alert = elementsIn(listButton).find((node) => node.props?.role === "alert");
+      assert.equal(textIn(alert), connection.handshake_error);
+    }
     panel.navigation.returnToPlugin(uuid);
     await panel.mount();
     const status = connectionStatus(panel.render());

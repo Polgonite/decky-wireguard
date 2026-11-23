@@ -534,29 +534,32 @@ function Content() {
           No profiles found.
         </PanelSectionRow>
       )}
-      {selectedUuid === null && profiles?.map((profile) => (
-        <PanelSectionRow key={profile.uuid}>
-          <ButtonItem layout="below" onClick={() => setSelectedUuid(profile.uuid)}>
-            <span style={{ display: "flex", alignItems: "center", gap: 10, width: "100%" }}>
-              <StatusCircle
-                state={indicatorState(profile)}
-                probeSent={error || pendingUuid === profile.uuid ? null : profile.probe_sent}
-              />
-              <span style={{ flex: 1, textAlign: "left", overflowWrap: "anywhere" }}>
-                {profile.name}
-                <span style={{ display: "block", fontSize: "0.8em", opacity: 0.75 }}>
-                  {error ? "Status unavailable" : pendingUuid === profile.uuid
-                    ? "Applying change..." : profileLabel(profile)}
-                  {profile.handshake_error && <span role="alert" style={{ display: "block" }}>
-                    {profile.handshake_error}
-                  </span>}
+      {selectedUuid === null && profiles?.map((profile) => {
+        const status = profileLabel(profile);
+        return (
+          <PanelSectionRow key={profile.uuid}>
+            <ButtonItem layout="below" onClick={() => setSelectedUuid(profile.uuid)}>
+              <span style={{ display: "flex", alignItems: "center", gap: 10, width: "100%" }}>
+                <StatusCircle
+                  state={indicatorState(profile)}
+                  probeSent={error || pendingUuid === profile.uuid ? null : profile.probe_sent}
+                />
+                <span style={{ flex: 1, textAlign: "left", overflowWrap: "anywhere" }}>
+                  {profile.name}
+                  <span style={{ display: "block", fontSize: "0.8em", opacity: 0.75 }}>
+                    {error ? "Status unavailable" : pendingUuid === profile.uuid
+                      ? "Applying change..." : status === stateLabels.disconnected ? "" : status}
+                    {profile.handshake_error && <span role="alert" style={{ display: "block" }}>
+                      {profile.handshake_error}
+                    </span>}
+                  </span>
                 </span>
+                <FaChevronRight aria-hidden="true" />
               </span>
-              <FaChevronRight aria-hidden="true" />
-            </span>
-          </ButtonItem>
-        </PanelSectionRow>
-      ))}
+            </ButtonItem>
+          </PanelSectionRow>
+        );
+      })}
       {selectedUuid !== null && !selectedProfile && profiles !== null && (
         <PanelSectionRow>Profile no longer available.</PanelSectionRow>
       )}
