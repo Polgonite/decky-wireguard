@@ -254,14 +254,15 @@ for (const handshake of ["waiting", "established", "timeout"]) {
       const indicator = elementsIn(panel.render()).find((node) => node.type?.name === "StatusCircle");
       return indicator.type(indicator.props);
     };
-    assert.equal(circle().props.style.animation, undefined);
+    assert.equal(circle().props.className, "decky-wireguard-status");
     connection.probe_sent = 100;
     await panel.update();
-    assert.equal(circle().props.style.animation, "decky-wireguard-pulse 0.8s ease-out");
+    assert.equal(circle().props.className, "decky-wireguard-status decky-wireguard-status--pulsing");
+    assert.equal(circle().props.style.animation, undefined, "the solid status circle stays unchanged");
     assert.equal(circle().key, 100, "ordinary renders must not restart the pulse");
     connection.probe_sent = null;
     await panel.update();
-    assert.equal(circle().props.style.animation, undefined);
+    assert.equal(circle().props.className, "decky-wireguard-status");
     connection.probe_sent = 110;
     await panel.update();
     assert.equal(circle().key, 110, "a subsequent probe must restart the animation");
@@ -270,10 +271,10 @@ for (const handshake of ["waiting", "established", "timeout"]) {
     const button = elementsIn(panel.render()).find((node) =>
       node.type === "ButtonItem" && node.props.children === "Disconnect");
     const indicator = elementsIn(button.props.label).find((node) => node.type?.name === "StatusCircle");
-    assert.equal(indicator.type(indicator.props).props.style.animation, "decky-wireguard-pulse 0.8s ease-out");
+    assert.equal(indicator.type(indicator.props).props.className, "decky-wireguard-status decky-wireguard-status--pulsing");
     const styles = elementsIn(panel.render()).find((node) => node.type === "style");
     assert.match(textIn(styles), /prefers-reduced-motion: reduce/);
-    assert.match(textIn(styles), /animation: none !important/);
+    assert.match(textIn(styles), /status::after \{ animation: none !important/);
   });
 }
 

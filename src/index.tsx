@@ -146,13 +146,13 @@ function StatusCircle({ state, probeSent }: { state: HandshakeState; probeSent: 
       role={verified ? "img" : undefined}
       aria-label={verified ? handshakeLabels.established : undefined}
       aria-hidden={verified ? undefined : true}
-      className="decky-wireguard-status"
+      className={`decky-wireguard-status${probeSent != null ? " decky-wireguard-status--pulsing" : ""}`}
       style={{
         backgroundColor: stateColors[state],
-        animation: probeSent != null ? "decky-wireguard-pulse 0.8s ease-out" : undefined,
         borderRadius: "50%",
         flexShrink: 0,
         height: 12,
+        position: "relative",
         width: 12,
       }}
     />
@@ -475,12 +475,24 @@ function Content() {
   const panel = (
     <PanelSection title={selectedUuid === null ? "Connections" : "Manage connection"}>
       <style>{`
+        .decky-wireguard-status::after {
+          content: "";
+          position: absolute;
+          inset: 0;
+          background-color: inherit;
+          border-radius: inherit;
+          opacity: 0;
+          pointer-events: none;
+        }
+        .decky-wireguard-status--pulsing::after {
+          animation: decky-wireguard-pulse 0.8s ease-out;
+        }
         @keyframes decky-wireguard-pulse {
-          0%, 100% { opacity: 1; transform: scale(1); }
-          35% { opacity: 0.65; transform: scale(1.35); }
+          0% { opacity: 0.5; transform: scale(1); }
+          100% { opacity: 0; transform: scale(2.5); }
         }
         @media (prefers-reduced-motion: reduce) {
-          .decky-wireguard-status { animation: none !important; }
+          .decky-wireguard-status::after { animation: none !important; }
         }
       `}</style>
       {selectedUuid !== null && (

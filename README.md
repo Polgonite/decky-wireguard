@@ -340,9 +340,10 @@ directory), then restart Decky Loader.
   sends newly received authenticated traffic, and **red** if neither is observed
   within 30 seconds. A late response changes red to green. Green stays until
   deactivation; it does not indicate ongoing peer health, internet access, or protected routing.
-  The circle pulses once whenever a probe round is sent, including while green;
-  it does not pulse merely because status refreshes. Pulsing is disabled when
-  reduced motion is requested.
+  A filled, translucent ripple in the status color expands and fades whenever
+  a probe round is sent, including while green. The solid status circle stays
+  unchanged; it does not pulse merely because status refreshes. Pulsing is
+  disabled when reduced motion is requested.
 - Evidence is read with `wg show <interface> latest-handshakes` and
   `wg show <interface> transfer`, without reading private keys. An increase in
   a peer's receive counter includes authenticated WireGuard keepalives; sent
