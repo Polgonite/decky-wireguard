@@ -335,12 +335,14 @@ directory), then restart Decky Loader.
   used. Missing tools, authorization failures, and NetworkManager errors appear
   in the panel. Actions have a 30-second NetworkManager wait limit; if an action
   times out, refresh before retrying because NetworkManager may still complete it.
-- The status circle is **gray** when deactivated, **gently pulsing yellow**
+- The status circle is **gray** when deactivated, **yellow**
   while verifying a peer, **green** once any peer completes a new handshake or
   sends newly received authenticated traffic, and **red** if neither is observed
   within 30 seconds. A late response changes red to green. Green stays until
   deactivation; it does not indicate ongoing peer health, internet access, or protected routing.
-  Pulsing is disabled when reduced motion is requested.
+  The circle pulses once whenever a probe round is sent, including while green;
+  it does not pulse merely because status refreshes. Pulsing is disabled when
+  reduced motion is requested.
 - Evidence is read with `wg show <interface> latest-handshakes` and
   `wg show <interface> transfer`, without reading private keys. An increase in
   a peer's receive counter includes authenticated WireGuard keepalives; sent
@@ -352,12 +354,14 @@ directory), then restart Decky Loader.
   existing handshake timestamps and received byte counts are baselines: a new
   handshake or newly received authenticated traffic is required.
   Closing and reopening the panel does not reset backend tracking.
-- While unverified, the plugin sends a small round of probes immediately and
+- The plugin sends a small round of probes immediately while unverified and
   at most once every 10 seconds while the panel is open. It prefers a root NS
   query to the tunnel's configured DNS server when covered by that peer's
   AllowedIPs, and also sends an ICMP echo to a non-local address in its allowed
   ranges. Both IPv4 and IPv6 are supported. Sockets are bound to the WireGuard
   interface: probes must not fall back to Wi-Fi or another tunnel.
+  Probes continue after verification, at the same interval. Green still records
+  successful verification for this activation, not a guarantee of ongoing health.
 - No fixed public service, public endpoint ping, or internet access is required.
   For default routes without a known private target, an ICMP probe uses a
   documentation-only address (`192.0.2.1` or `2001:db8::1`); it need not reply.

@@ -17,7 +17,7 @@ const indexCompiled = compile("index.tsx");
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const profile = {
   uuid: "home", name: "Home", device: "", state: "disconnected",
-  handshake: "inactive", handshake_error: null,
+  handshake: "inactive", handshake_error: null, probe_sent: null,
 };
 
 function plugin(profiles, backend, options = {}) {
@@ -28,7 +28,7 @@ function plugin(profiles, backend, options = {}) {
   let showAdvanced = options.advanced ?? false;
   const navigations = [];
   const subscriptions = [];
-  const element = (type, props) => ({ type, props });
+  const element = (type, props, key) => ({ type, props, key });
   const context = {
     exports: {},
     App: { BHasCurrentUser: () => true, GetServicesInitialized: () => true },
@@ -58,7 +58,7 @@ function plugin(profiles, backend, options = {}) {
         definePlugin: (factory) => factory,
         routerHook: { addRoute: () => {}, removeRoute: () => {} },
         callable: (route) => async (...args) => {
-          if (route === "get_profiles") return { success: true, profiles };
+          if (route === "get_profiles") return { success: true, profiles: profiles.map((item) => ({ ...item })) };
           if (route === "get_ui_settings" || route === "set_ui_settings") {
             if (options.uiBackend) return options.uiBackend(route, ...args);
             if (route === "set_ui_settings") showAdvanced = args[0];
@@ -239,6 +239,42 @@ function textIn(node) {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(textIn).join("");
   return node && typeof node === "object" ? textIn(node.props?.children) : "";
+}
+
+for (const handshake of ["waiting", "established", "timeout"]) {
+  test(`${handshake} circle pulses only on new probe sends in the list and details`, async () => {
+    const connection = { ...profile, device: "wg0", state: "connected", handshake };
+    const panel = plugin([connection], (route) => {
+      if (route === "get_startup_settings") return { success: true };
+      if (route === "get_peer_health") return { success: true, peers: [] };
+      assert.fail(`Unexpected backend call: ${route}`);
+    });
+    await panel.mount();
+    const circle = () => {
+      const indicator = elementsIn(panel.render()).find((node) => node.type?.name === "StatusCircle");
+      return indicator.type(indicator.props);
+    };
+    assert.equal(circle().props.style.animation, undefined);
+    connection.probe_sent = 100;
+    await panel.update();
+    assert.equal(circle().props.style.animation, "decky-wireguard-pulse 0.8s ease-out");
+    assert.equal(circle().key, 100, "ordinary renders must not restart the pulse");
+    connection.probe_sent = null;
+    await panel.update();
+    assert.equal(circle().props.style.animation, undefined);
+    connection.probe_sent = 110;
+    await panel.update();
+    assert.equal(circle().key, 110, "a subsequent probe must restart the animation");
+    panel.navigation.returnToPlugin("home");
+    await panel.update();
+    const button = elementsIn(panel.render()).find((node) =>
+      node.type === "ButtonItem" && node.props.children === "Disconnect");
+    const indicator = elementsIn(button.props.label).find((node) => node.type?.name === "StatusCircle");
+    assert.equal(indicator.type(indicator.props).props.style.animation, "decky-wireguard-pulse 0.8s ease-out");
+    const styles = elementsIn(panel.render()).find((node) => node.type === "style");
+    assert.match(textIn(styles), /prefers-reduced-motion: reduce/);
+    assert.match(textIn(styles), /animation: none !important/);
+  });
 }
 
 for (const logging of [false, true]) {

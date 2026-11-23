@@ -1536,6 +1536,8 @@ class Plugin:
                 )
                 self._log(logging.INFO, "%s activation_observed source=%s", self._profile_ref(uuid), source)
         if activation.completed:
+            if profile["state"] == "connected":
+                await self._probe_activation(profile, activation)
             return "established"
         if profile["state"] == "connected":
             if not profile["device"]:
@@ -1567,24 +1569,31 @@ class Plugin:
                         self._log(logging.INFO, "%s verified evidence=receive", self._peer_ref(uuid, verified_peer))
                     return "established"
             activation.received = received
-            if activation.last_probe is None or (
-                time.monotonic() - activation.last_probe >= PROBE_INTERVAL
-            ):
-                stage = "targets"
-                try:
-                    if activation.targets is None:
-                        activation.targets = await _probe_targets(profile["device"])
-                    stage = "send"
-                    failures = await _send_probe(profile["device"], activation.targets)
-                except NetworkManagerError:
-                    if self._log_handler is not None:
-                        self._log(logging.DEBUG, "%s probe_failed stage=%s", self._profile_ref(uuid), stage)
-                    raise
-                if self._log_handler is not None:
-                    self._log(logging.DEBUG, "%s probe_round targets=%d send_failures=%s",
-                              self._profile_ref(uuid), len(activation.targets), failures)
-                activation.last_probe = time.monotonic()
+            await self._probe_activation(profile, activation)
         return "timeout" if time.monotonic() - activation.started >= HANDSHAKE_TIMEOUT else "waiting"
+
+    async def _probe_activation(self, profile: Profile, activation: Activation) -> None:
+        if activation.last_probe is not None and (
+            time.monotonic() - activation.last_probe < PROBE_INTERVAL
+        ):
+            return
+        if not profile["device"]:
+            raise NetworkManagerError("NetworkManager did not report a WireGuard interface.")
+        uuid = profile["uuid"]
+        stage = "targets"
+        try:
+            if activation.targets is None:
+                activation.targets = await _probe_targets(profile["device"])
+            stage = "send"
+            failures = await _send_probe(profile["device"], activation.targets)
+        except NetworkManagerError:
+            if self._log_handler is not None:
+                self._log(logging.DEBUG, "%s probe_failed stage=%s", self._profile_ref(uuid), stage)
+            raise
+        if self._log_handler is not None:
+            self._log(logging.DEBUG, "%s probe_round targets=%d send_failures=%s",
+                      self._profile_ref(uuid), len(activation.targets), failures)
+        activation.last_probe = time.monotonic()
 
     def _failure(self, error: Exception) -> dict[str, object]:
         logger.warning("WireGuard request failed; details returned to the caller.")
@@ -1607,6 +1616,8 @@ class Plugin:
                 statuses: list[dict[str, object]] = []
                 for profile in profiles:
                     error_message = None
+                    activation = self._activations.get(profile["uuid"])
+                    previous_probe = activation.last_probe if activation else None
                     try:
                         handshake = await self._handshake_status(profile)
                     except NetworkManagerError as error:
@@ -1616,6 +1627,11 @@ class Plugin:
                     status: dict[str, object] = {
                         **profile, "handshake": handshake, "handshake_error": error_message,
                     }
+                    activation = self._activations.get(profile["uuid"])
+                    status["probe_sent"] = (
+                        activation.last_probe if activation and activation.last_probe != previous_probe
+                        else None
+                    )
                     if self._log_handler is not None:
                         uuid = profile["uuid"]
                         reference = self._profile_ref(uuid)

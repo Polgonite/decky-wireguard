@@ -585,16 +585,18 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
             f"{WIFI}:802-11-wireless:Wi-Fi:wlan0:activated:/active/2\n"
             f"{HOME}:wireguard:home:::\n"
         )
-        self.assertEqual(await self.plugin.get_profiles(), {
+        with patch("main.time.monotonic", return_value=100):
+            result = await self.plugin.get_profiles()
+        self.assertEqual(result, {
             "success": True,
             "profiles": [
                 {
                     "uuid": HOME, "name": "home", "device": "", "state": "disconnected",
-                    "handshake": "inactive", "handshake_error": None,
+                    "handshake": "inactive", "handshake_error": None, "probe_sent": None,
                 },
                 {
                     "uuid": WORK, "name": "Work: VPN\\Office", "device": "wg0", "state": "connected",
-                    "handshake": "waiting", "handshake_error": None,
+                    "handshake": "waiting", "handshake_error": None, "probe_sent": 100,
                 },
             ],
         })
@@ -1007,6 +1009,55 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
             self.received.return_value = {"peer": 0}
             # First observations are baselines, not newly received traffic.
             self.assertEqual(await self.handshake_status(), "timeout")
+
+    async def test_probe_events_continue_after_verification_and_only_report_new_sends(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        with patch("main.time.monotonic", return_value=100) as clock:
+            result = await self.plugin.get_profiles()
+            self.assertEqual(result["profiles"][0]["probe_sent"], 100)
+            self.assertEqual(result["profiles"][0]["handshake"], "waiting")
+            clock.return_value = 101
+            result = await self.plugin.get_profiles()
+            self.assertIsNone(result["profiles"][0]["probe_sent"])
+            self.handshakes.return_value = {"peer": 1000}
+            result = await self.plugin.get_profiles()
+            self.assertEqual(result["profiles"][0]["handshake"], "established")
+            self.assertIsNone(result["profiles"][0]["probe_sent"])
+            clock.return_value = 109.999
+            result = await self.plugin.get_profiles()
+            self.assertIsNone(result["profiles"][0]["probe_sent"])
+            self.assertEqual(self.probe.await_count, 1)
+            clock.return_value = 110
+            result = await self.plugin.get_profiles()
+            self.assertEqual(result["profiles"][0]["handshake"], "established")
+            self.assertEqual(result["profiles"][0]["probe_sent"], 110)
+            self.assertEqual(self.probe.await_count, 2)
+            result = await self.plugin.get_profiles()
+            self.assertIsNone(result["profiles"][0]["probe_sent"])
+            self.assertEqual(self.probe.await_count, 2)
+            clock.return_value = 120
+            self.nmcli.return_value = f"{HOME}:wireguard:Home:::\n"
+            result = await self.plugin.get_profiles()
+            self.assertIsNone(result["profiles"][0]["probe_sent"])
+            self.assertEqual(self.probe.await_count, 2)
+
+    async def test_failed_verified_probe_reports_error_without_a_pulse_and_can_retry(self):
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        with patch("main.time.monotonic", return_value=100) as clock:
+            await self.handshake_status()
+            self.handshakes.return_value = {"peer": 1000}
+            self.assertEqual(await self.handshake_status(), "established")
+            clock.return_value = 110
+            self.probe.side_effect = NetworkManagerError("Probe blocked")
+            with self.assertLogs("decky-wireguard"):
+                result = await self.plugin.get_profiles()
+            self.assertEqual(result["profiles"][0]["handshake"], "unknown")
+            self.assertEqual(result["profiles"][0]["handshake_error"], "Probe blocked")
+            self.assertIsNone(result["profiles"][0]["probe_sent"])
+            self.probe.side_effect = None
+            result = await self.plugin.get_profiles()
+            self.assertEqual(result["profiles"][0]["handshake"], "established")
+            self.assertEqual(result["profiles"][0]["probe_sent"], 110)
 
     async def test_receive_baseline_resets_for_reactivation(self):
         self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"

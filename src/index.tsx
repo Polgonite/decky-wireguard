@@ -20,6 +20,7 @@ interface Profile {
   state: ConnectionState;
   handshake: HandshakeState;
   handshake_error: string | null;
+  probe_sent: number | null;
   diagnostic_ref?: string;
 }
 
@@ -137,17 +138,18 @@ function profileLabel(profile: Profile): string {
     ? handshakeLabels[profile.handshake] : stateLabels[profile.state];
 }
 
-function StatusCircle({ state }: { state: HandshakeState }) {
+function StatusCircle({ state, probeSent }: { state: HandshakeState; probeSent: number | null }) {
   const verified = state === "established";
   return (
     <span
+      key={probeSent ?? "idle"}
       role={verified ? "img" : undefined}
       aria-label={verified ? handshakeLabels.established : undefined}
       aria-hidden={verified ? undefined : true}
       className="decky-wireguard-status"
       style={{
         backgroundColor: stateColors[state],
-        animation: state === "waiting" ? "decky-wireguard-pulse 1.6s ease-in-out infinite" : undefined,
+        animation: probeSent != null ? "decky-wireguard-pulse 0.8s ease-out" : undefined,
         borderRadius: "50%",
         flexShrink: 0,
         height: 12,
@@ -296,6 +298,7 @@ function Content() {
             profile.name === next.name && profile.device === next.device &&
             profile.state === next.state && profile.handshake === next.handshake &&
             profile.handshake_error === next.handshake_error &&
+            profile.probe_sent === next.probe_sent &&
             profile.diagnostic_ref === next.diagnostic_ref;
         }) ? previous : result.profiles,
       );
@@ -474,7 +477,7 @@ function Content() {
       <style>{`
         @keyframes decky-wireguard-pulse {
           0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: 0.65; transform: scale(0.9); }
+          35% { opacity: 0.65; transform: scale(1.35); }
         }
         @media (prefers-reduced-motion: reduce) {
           .decky-wireguard-status { animation: none !important; }
@@ -521,7 +524,10 @@ function Content() {
         <PanelSectionRow key={profile.uuid}>
           <ButtonItem layout="below" onClick={() => setSelectedUuid(profile.uuid)}>
             <span style={{ display: "flex", alignItems: "center", gap: 10, width: "100%" }}>
-              <StatusCircle state={indicatorState(profile)} />
+              <StatusCircle
+                state={indicatorState(profile)}
+                probeSent={error || pendingUuid === profile.uuid ? null : profile.probe_sent}
+              />
               <span style={{ flex: 1, textAlign: "left", overflowWrap: "anywhere" }}>
                 {profile.name}
                 <span style={{ display: "block", fontSize: "0.8em", opacity: 0.75 }}>
@@ -545,7 +551,10 @@ function Content() {
           <ButtonItem
             layout="below"
             label={<span style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <StatusCircle state={indicatorState(selectedProfile)} />
+              <StatusCircle
+                state={indicatorState(selectedProfile)}
+                probeSent={error || pendingUuid === selectedProfile.uuid ? null : selectedProfile.probe_sent}
+              />
               {selectedProfile.name}
             </span>}
             description={[selectedDescription, selectedProfile.handshake_error].filter(Boolean).join(" \u00b7 ")}
