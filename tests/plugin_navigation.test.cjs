@@ -243,6 +243,56 @@ function textIn(node) {
   return node && typeof node === "object" ? textIn(node.props?.children) : "";
 }
 
+function connectionStatus(node) {
+  return elementsIn(node).find((element) => element.type === "div" &&
+    elementsIn(element).some((child) => child.type?.name === "StatusCircle"));
+}
+
+for (const state of ["disconnected", "connected"]) {
+  test(`connection control precedes the status and peer details when ${state}`, async () => {
+    const connection = {
+      ...profile, device: "wg0", state,
+      handshake: state === "connected" ? "established" : "inactive",
+    };
+    const calls = [];
+    const panel = plugin([connection], (route, ...args) => {
+      if (route === "get_startup_settings") return { success: true };
+      if (route === "get_peer_health") return { success: true, peers: [{
+        public_key: "peer-key", endpoint_ip: "203.0.113.1", last_handshake: null,
+        received_bytes: 0, sent_bytes: 0,
+      }] };
+      if (route === "set_connection") {
+        calls.push(args);
+        return { success: true };
+      }
+      assert.fail(`Unexpected backend call: ${route}`);
+    });
+    panel.navigation.returnToPlugin("home");
+    await panel.mount();
+    await panel.update();
+
+    const details = panel.render();
+    const nodes = elementsIn(details);
+    const button = nodes.find((node) =>
+      node.type === "ButtonItem" && node.props.children === (state === "connected" ? "Disconnect" : "Connect"));
+    const status = connectionStatus(details);
+    const peerDetails = nodes.find((node) => node.type === "div" && (state === "connected"
+      ? textIn(node).startsWith("Peer 1 \u00b7 203.0.113.1")
+      : textIn(node) === "Available when connected."));
+    const edit = nodes.find((node) => node.type === "ButtonItem" && node.props.children === "Edit configuration");
+    assert.ok(button && status && peerDetails && edit);
+    assert.ok(nodes.indexOf(button) < nodes.indexOf(status));
+    assert.ok(nodes.indexOf(status) < nodes.indexOf(peerDetails));
+    assert.ok(nodes.indexOf(peerDetails) < nodes.indexOf(edit));
+    assert.equal(textIn(status), state === "connected" ? "Home" : "HomeDisconnected on wg0");
+    assert.equal(button.props.disabled, false);
+
+    button.props.onClick();
+    await flush();
+    assert.deepEqual(calls, [["home", state === "disconnected"]]);
+  });
+}
+
 for (const handshake of ["waiting", "established", "timeout"]) {
   test(`${handshake} circle pulses only on new probe sends in the list and details`, async () => {
     const connection = { ...profile, device: "wg0", state: "connected", handshake };
@@ -270,9 +320,10 @@ for (const handshake of ["waiting", "established", "timeout"]) {
     assert.equal(circle().key, 110, "a subsequent probe must restart the animation");
     panel.navigation.returnToPlugin("home");
     await panel.update();
-    const button = elementsIn(panel.render()).find((node) =>
-      node.type === "ButtonItem" && node.props.children === "Disconnect");
-    const indicator = elementsIn(button.props.label).find((node) => node.type?.name === "StatusCircle");
+    const status = connectionStatus(panel.render());
+    assert.ok(status);
+    const indicator = elementsIn(status).find((node) => node.type?.name === "StatusCircle");
+    assert.ok(indicator);
     assert.equal(indicator.type(indicator.props).props.className, "decky-wireguard-status decky-wireguard-status--pulsing");
     const styles = elementsIn(panel.render()).find((node) => node.type === "style");
     assert.match(textIn(styles), /prefers-reduced-motion: reduce/);
@@ -335,8 +386,11 @@ for (const logging of [false, true]) {
     const connection = elementsIn(details).find((node) =>
       node.type === "ButtonItem" && node.props.children === "Disconnect");
     assert.ok(connection);
-    assert.equal(connection.props.description, "wg0");
-    const detailIndicator = elementsIn(connection.props.label).find((node) => node.type?.name === "StatusCircle");
+    assert.equal(connection.props.description, undefined);
+    const status = connectionStatus(details);
+    assert.ok(status);
+    assert.equal(textIn(status), "Home");
+    const detailIndicator = elementsIn(status).find((node) => node.type?.name === "StatusCircle");
     assert.ok(detailIndicator);
     const detailCircle = detailIndicator.type(detailIndicator.props);
     assert.equal(detailCircle.props.role, "img");
@@ -371,6 +425,9 @@ for (const [connection, listStatus, description] of [
   [{
     state: "connected", handshake: "unknown", device: "wg0", handshake_error: "Peer check failed",
   }, "Peer status unavailablePeer check failed", "Peer status unavailable on wg0 \u00b7 Peer check failed"],
+  [{
+    state: "connected", handshake: "established", device: "wg0", handshake_error: "Peer check failed",
+  }, "Peer check failed", "Peer check failed"],
 ]) {
   test(`connection status retains its details without an identifier: ${description || "verified"}`, async () => {
     const uuid = "12345678-1234-1234-1234-123456789abc";
@@ -382,10 +439,9 @@ for (const [connection, listStatus, description] of [
     assert.equal(textIn(listButton), `Home${listStatus}`);
     panel.navigation.returnToPlugin(uuid);
     await panel.mount();
-    const button = elementsIn(panel.render()).find((node) =>
-      node.type === "ButtonItem" && typeof node.props.description === "string");
-    assert.ok(button);
-    assert.equal(button.props.description, description);
+    const status = connectionStatus(panel.render());
+    assert.ok(status);
+    assert.equal(textIn(status), `Home${description}`);
   });
 }
 
