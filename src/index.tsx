@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
 import { CONFIG_ROUTE, ConfigPage, configPath } from "./config-page";
 import { useSelectedConnection } from "./plugin-navigation";
+import { loadUISettings, saveUISettings, useUISettings } from "./ui-settings";
 import { UpdateButton } from "./updater";
 
 type ConnectionState = "connected" | "connecting" | "disconnecting" | "disconnected" | "unknown";
@@ -249,6 +250,7 @@ function Content() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [pendingUuid, setPendingUuid] = useState<string | null>(null);
+  const uiSettings = useUISettings();
   const [selectedUuid, setSelectedUuid] = useSelectedConnection();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [startup, setStartupSettings] = useState<(StartupSettings & { uuid: string }) | null>(null);
@@ -431,6 +433,29 @@ function Content() {
               Back to connections
             </ButtonItem>
           </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField
+              label="Show advanced settings"
+              description="Show advanced editor options and after-boot wait controls."
+              checked={uiSettings.showAdvanced}
+              disabled={!uiSettings.loaded || uiSettings.saving}
+              onChange={(checked) => void saveUISettings(checked)}
+            />
+          </PanelSectionRow>
+          {uiSettings.error && (
+            <PanelSectionRow>
+              <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
+                Advanced settings: {uiSettings.error}
+              </div>
+            </PanelSectionRow>
+          )}
+          {uiSettings.error && !uiSettings.loaded && !uiSettings.loading && (
+            <PanelSectionRow>
+              <ButtonItem layout="below" onClick={() => void loadUISettings()}>
+                Retry loading settings
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
           <LoggingControls onChange={() => void refresh()} />
           <UpdateButton />
         </PanelSection>
@@ -461,6 +486,13 @@ function Content() {
           <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
             {error}
             {profiles !== null && <div>Displayed status may be out of date.</div>}
+          </div>
+        </PanelSectionRow>
+      )}
+      {uiSettings.error && (
+        <PanelSectionRow>
+          <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
+            Advanced settings: {uiSettings.error}
           </div>
         </PanelSectionRow>
       )}
@@ -613,7 +645,7 @@ function Content() {
               )}
             />
           </PanelSectionRow>
-          {selectedStartup?.after_boot && (
+          {uiSettings.showAdvanced && selectedStartup?.after_boot && (
             <>
               <PanelSectionRow>
                 <ToggleField

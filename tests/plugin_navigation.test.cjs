@@ -12,6 +12,7 @@ function compile(file) {
 }
 
 const navigationCompiled = compile("plugin-navigation.ts");
+const settingsCompiled = compile("ui-settings.ts");
 const indexCompiled = compile("index.tsx");
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const profile = {
@@ -19,11 +20,12 @@ const profile = {
   handshake: "inactive", handshake_error: null,
 };
 
-function plugin(profiles, backend) {
+function plugin(profiles, backend, options = {}) {
   let hooks = [];
   let cursor = 0;
   let effects = [];
   let pluginExits = 0;
+  let showAdvanced = options.advanced ?? false;
   const navigations = [];
   const subscriptions = [];
   const element = (type, props) => ({ type, props });
@@ -57,6 +59,11 @@ function plugin(profiles, backend) {
         routerHook: { addRoute: () => {}, removeRoute: () => {} },
         callable: (route) => async (...args) => {
           if (route === "get_profiles") return { success: true, profiles };
+          if (route === "get_ui_settings" || route === "set_ui_settings") {
+            if (options.uiBackend) return options.uiBackend(route, ...args);
+            if (route === "set_ui_settings") showAdvanced = args[0];
+            return { success: true, show_advanced_settings: showAdvanced };
+          }
           if (backend && route !== "set_steam_readiness") return backend(route, ...args);
           if (route === "get_startup_settings" || route === "set_steam_readiness") {
             return { success: true };
@@ -74,6 +81,7 @@ function plugin(profiles, backend) {
         ButtonItem: "ButtonItem", ToggleField: "ToggleField",
       };
       if (name === "./plugin-navigation") return navigation.exports;
+      if (name === "./ui-settings") return uiSettings.exports;
       if (name === "./config-page") return { configPath: (uuid) => `/config/${uuid}` };
       if (name === "./updater") return { UpdateButton: "UpdateButton" };
       if (name === "react-icons/fa") return {};
@@ -81,13 +89,19 @@ function plugin(profiles, backend) {
     },
   };
   const navigation = { exports: {}, require: context.require };
+  const uiSettings = { exports: {}, require: context.require };
   runInNewContext(navigationCompiled, navigation);
+  runInNewContext(settingsCompiled, uiSettings);
   runInNewContext(indexCompiled, context);
   const content = context.exports.default().content.type;
   return {
     navigation: navigation.exports,
     navigations,
     subscribe: (listener) => subscriptions.at(-1)(listener),
+    subscribeToSettings: (listener) => {
+      uiSettings.exports.useUISettings();
+      return subscriptions.at(-1)(listener);
+    },
     render: () => {
       cursor = 0;
       return content();
@@ -268,25 +282,29 @@ function toggles(panel) {
 }
 
 for (const mode of ["off", "on_boot", "after_boot"]) {
-  test(`startup wait switches are ${mode === "after_boot" ? "visible" : "hidden"} in ${mode} mode`, async () => {
-    const panel = plugin([profile], (route) => {
-      assert.equal(route, "get_startup_settings");
-      return {
-        success: true, on_boot: mode === "on_boot", after_boot: mode === "after_boot",
-        wait_for_steam: true, wait_for_internet: true, waiting: null,
-      };
-    });
-    panel.navigation.returnToPlugin("home");
-    await panel.mount();
-    const fields = toggles(panel);
-    for (const label of ["Wait for Steam login", "Wait for internet"]) {
-      assert.equal(fields[label] !== undefined, mode === "after_boot");
-      if (mode === "after_boot") {
-        assert.equal(fields[label].checked, true);
-        assert.equal(fields[label].disabled, false);
+  for (const advanced of [false, true]) {
+    test(`startup wait switches require advanced settings and after-boot mode (${mode}, ${advanced})`, async () => {
+      const panel = plugin([profile], (route) => {
+        assert.equal(route, "get_startup_settings");
+        return {
+          success: true, on_boot: mode === "on_boot", after_boot: mode === "after_boot",
+          wait_for_steam: true, wait_for_internet: true, waiting: null,
+        };
+      }, { advanced });
+      panel.navigation.returnToPlugin("home");
+      await panel.mount();
+      const fields = toggles(panel);
+      assert.ok(fields["Connect during boot"]);
+      assert.ok(fields["Connect after boot"]);
+      for (const label of ["Wait for Steam login", "Wait for internet"]) {
+        assert.equal(fields[label] !== undefined, advanced && mode === "after_boot");
+        if (advanced && mode === "after_boot") {
+          assert.equal(fields[label].checked, true);
+          assert.equal(fields[label].disabled, false);
+        }
       }
-    }
-  });
+    });
+  }
 }
 
 test("startup wait choices survive hiding, showing, and remounting the panel", async () => {
@@ -306,7 +324,7 @@ test("startup wait choices survive hiding, showing, and remounting the panel", a
       settings.after_boot = first === "after_boot";
     }
     return { success: true };
-  });
+  }, { advanced: true });
   panel.navigation.returnToPlugin("home");
   await panel.mount();
   for (const label of ["Wait for Steam login", "Wait for internet"]) {
@@ -323,4 +341,155 @@ test("startup wait choices survive hiding, showing, and remounting the panel", a
   await panel.mount();
   assert.equal(toggles(panel)["Wait for Steam login"].checked, false);
   assert.equal(toggles(panel)["Wait for internet"].checked, false);
+});
+
+test("the settings toggle hides wait switches without changing their saved values", async () => {
+  const startup = {
+    on_boot: false, after_boot: true,
+    wait_for_steam: false, wait_for_internet: true, waiting: null,
+  };
+  const calls = [];
+  let showAdvanced = false;
+  const uiBackend = (route, enabled) => {
+    if (route === "set_ui_settings") showAdvanced = enabled;
+    return { success: true, show_advanced_settings: showAdvanced };
+  };
+  const panel = plugin([profile], (route) => {
+    calls.push(route);
+    assert.equal(route, "get_startup_settings");
+    return { success: true, ...startup };
+  }, { uiBackend });
+  await panel.mount();
+
+  const openSettings = () => {
+    elementsIn(panel.render()).find((node) =>
+      node.type === "ButtonItem" && node.props.children === "Settings").props.onClick();
+  };
+  const closeSettings = () => {
+    elementsIn(panel.render()).find((node) =>
+      node.type === "ButtonItem" && node.props.children === "Back to connections").props.onClick();
+  };
+  const openConnection = async () => {
+    panel.navigation.returnToPlugin("home");
+    await panel.mount();
+  };
+  const openList = async () => {
+    panel.navigation.returnToPlugin(null);
+    await panel.mount();
+  };
+
+  openSettings();
+  assert.equal(toggles(panel)["Show advanced settings"].checked, false);
+  toggles(panel)["Show advanced settings"].onChange(true);
+  await flush();
+  assert.equal(toggles(panel)["Show advanced settings"].checked, true);
+  closeSettings();
+  await openConnection();
+  assert.equal(toggles(panel)["Wait for Steam login"].checked, false);
+  assert.equal(toggles(panel)["Wait for internet"].checked, true);
+
+  await openList();
+  openSettings();
+  toggles(panel)["Show advanced settings"].onChange(false);
+  await flush();
+  closeSettings();
+  await openConnection();
+  assert.equal(toggles(panel)["Wait for Steam login"], undefined);
+  assert.equal(toggles(panel)["Wait for internet"], undefined);
+  assert.equal(toggles(panel)["Connect after boot"].checked, true);
+
+  await openList();
+  openSettings();
+  toggles(panel)["Show advanced settings"].onChange(true);
+  await flush();
+  closeSettings();
+  await openConnection();
+  assert.equal(toggles(panel)["Wait for Steam login"].checked, false);
+  assert.equal(toggles(panel)["Wait for internet"].checked, true);
+  assert.ok(calls.every((route) => route === "get_startup_settings"));
+
+  const reloaded = plugin([profile], undefined, { uiBackend });
+  await reloaded.mount();
+  elementsIn(reloaded.render()).find((node) =>
+    node.type === "ButtonItem" && node.props.children === "Settings").props.onClick();
+  assert.equal(toggles(reloaded)["Show advanced settings"].checked, true);
+});
+
+test("advanced preference updates notify all screens and serialize pending saves", async () => {
+  let finishLoad;
+  let finishSave;
+  let reads = 0;
+  let writes = 0;
+  const panel = plugin([], undefined, {
+    uiBackend: (route) => {
+      if (route === "get_ui_settings") {
+        reads++;
+        return new Promise((resolve) => { finishLoad = resolve; });
+      }
+      writes++;
+      return new Promise((resolve) => { finishSave = resolve; });
+    },
+  });
+  await panel.mount();
+  await panel.mount();
+  assert.equal(reads, 1);
+  elementsIn(panel.render()).find((node) =>
+    node.type === "ButtonItem" && node.props.children === "Settings").props.onClick();
+  assert.equal(toggles(panel)["Show advanced settings"].disabled, true);
+  finishLoad({ success: true, show_advanced_settings: false });
+  await flush();
+  let firstUpdates = 0;
+  let secondUpdates = 0;
+  const unsubscribeFirst = panel.subscribeToSettings(() => { firstUpdates++; });
+  const unsubscribeSecond = panel.subscribeToSettings(() => { secondUpdates++; });
+  const toggle = toggles(panel)["Show advanced settings"];
+  toggle.onChange(true);
+  toggle.onChange(false);
+  assert.equal(writes, 1);
+  assert.equal(toggles(panel)["Show advanced settings"].checked, false);
+  assert.equal(toggles(panel)["Show advanced settings"].disabled, true);
+  finishSave({ success: true, show_advanced_settings: true });
+  await flush();
+  assert.equal(toggles(panel)["Show advanced settings"].checked, true);
+  assert.equal(toggles(panel)["Show advanced settings"].disabled, false);
+  assert.equal(firstUpdates, 2);
+  assert.equal(secondUpdates, 2);
+  unsubscribeFirst();
+  unsubscribeSecond();
+});
+
+test("advanced preference errors are visible, retryable, and do not change the toggle", async () => {
+  let loadFails = true;
+  let saveFails = true;
+  const panel = plugin([], undefined, {
+    uiBackend: (route) => {
+      if (route === "get_ui_settings") {
+        return loadFails ? { success: false, error: "Read failed" }
+          : { success: true, show_advanced_settings: false };
+      }
+      return saveFails ? { success: false, error: "Write failed" }
+        : { success: true, show_advanced_settings: true };
+    },
+  });
+  await panel.mount();
+  elementsIn(panel.render()).find((node) =>
+    node.type === "ButtonItem" && node.props.children === "Settings").props.onClick();
+  assert.equal(toggles(panel)["Show advanced settings"].disabled, true);
+  assert.ok(elementsIn(panel.render()).some((node) =>
+    node.props?.role === "alert" && JSON.stringify(node.props.children).includes("Read failed")));
+  loadFails = false;
+  elementsIn(panel.render()).find((node) =>
+    node.type === "ButtonItem" && node.props.children === "Retry loading settings").props.onClick();
+  await flush();
+  assert.equal(toggles(panel)["Show advanced settings"].disabled, false);
+  toggles(panel)["Show advanced settings"].onChange(true);
+  await flush();
+  assert.equal(toggles(panel)["Show advanced settings"].checked, false);
+  assert.ok(elementsIn(panel.render()).some((node) =>
+    node.props?.role === "alert" && JSON.stringify(node.props.children).includes("Write failed")));
+  saveFails = false;
+  toggles(panel)["Show advanced settings"].onChange(true);
+  await flush();
+  assert.equal(toggles(panel)["Show advanced settings"].checked, true);
+  assert.equal(elementsIn(panel.render()).some((node) => node.props?.role === "alert"), false);
 });

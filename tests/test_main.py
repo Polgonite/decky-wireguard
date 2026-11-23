@@ -32,6 +32,61 @@ WIFI = "33333333-3333-4333-8333-333333333333"
 FIELDS = ("--fields", "UUID,TYPE,NAME,DEVICE,STATE,ACTIVE-PATH", "connection", "show")
 
 
+class UISettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.dict(os.environ, {"DECKY_PLUGIN_SETTINGS_DIR": directory}))
+        self.directory = Path(directory)
+        self.path = self.directory / "ui.json"
+        self.plugin = Plugin()
+
+    async def test_default_and_persistence_across_plugin_instances(self):
+        startup = self.directory / "startup.json"
+        startup.write_text('{"after_boot": [], "last_boot_id": null, "requirements": {}}')
+        self.assertEqual(await self.plugin.get_ui_settings(), {
+            "success": True, "show_advanced_settings": False,
+        })
+        self.assertFalse(self.path.exists())
+
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                self.assertEqual(await self.plugin.set_ui_settings(enabled), {
+                    "success": True, "show_advanced_settings": enabled,
+                })
+                self.assertEqual(await Plugin().get_ui_settings(), {
+                    "success": True, "show_advanced_settings": enabled,
+                })
+                self.assertEqual(json.loads(self.path.read_text()), {"show_advanced_settings": enabled})
+        self.assertEqual(
+            startup.read_text(), '{"after_boot": [], "last_boot_id": null, "requirements": {}}',
+        )
+
+    async def test_invalid_or_unavailable_settings_are_reported(self):
+        for content in ('not json', '{}', '{"show_advanced_settings": "true"}', '[]'):
+            with self.subTest(content=content), self.assertLogs("decky-wireguard"):
+                self.path.write_text(content)
+                result = await self.plugin.get_ui_settings()
+                self.assertFalse(result["success"])
+                self.assertIn("Unable to read UI settings", result["error"])
+        with patch.dict(os.environ, {"DECKY_PLUGIN_SETTINGS_DIR": ""}), self.assertLogs("decky-wireguard"):
+            result = await self.plugin.get_ui_settings()
+            self.assertFalse(result["success"])
+            self.assertIn("settings directory is unavailable", result["error"])
+
+    async def test_invalid_or_failed_writes_preserve_the_saved_preference(self):
+        await self.plugin.set_ui_settings(True)
+        with self.assertLogs("decky-wireguard"):
+            self.assertFalse((await self.plugin.set_ui_settings("yes"))["success"])
+        with patch("main.os.replace", side_effect=PermissionError("Read-only disk")), self.assertLogs(
+            "decky-wireguard",
+        ):
+            result = await self.plugin.set_ui_settings(False)
+        self.assertFalse(result["success"])
+        self.assertIn("Unable to save UI settings", result["error"])
+        self.assertEqual((await Plugin().get_ui_settings())["show_advanced_settings"], True)
+        self.assertEqual(list(self.directory.iterdir()), [self.path])
+
+
 class StartupTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         directory = tempfile.TemporaryDirectory()

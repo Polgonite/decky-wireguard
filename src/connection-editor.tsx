@@ -19,10 +19,11 @@ function Heading({ children }: { children: ReactNode }) {
  * Controlled editor for a WireGuard connection, laid out like a .conf file.
  * It owns no persistence so it can serve both existing and new connections.
  */
-export function ConnectionEditor({ draft, onChange, disabled }: {
+export function ConnectionEditor({ draft, onChange, disabled, allowAdvanced }: {
   draft: EditorDraft;
   onChange: Dispatch<SetStateAction<EditorDraft>>;
   disabled: boolean;
+  allowAdvanced: boolean;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const nextId = useRef(0);
@@ -115,7 +116,7 @@ export function ConnectionEditor({ draft, onChange, disabled }: {
           Add peer
         </ButtonItem>
       </PanelSectionRow>
-      {showAdvanced && (
+      {allowAdvanced && showAdvanced && (
         <>
           <Heading>Advanced interface</Heading>
           {configField("listen_port", "Listen port", "UDP port; empty or 0 selects one automatically.")}
@@ -162,15 +163,17 @@ export function ConnectionEditor({ draft, onChange, disabled }: {
           </PanelSectionRow>
         </>
       )}
-      <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          aria-expanded={showAdvanced}
-          onClick={() => setShowAdvanced((current) => !current)}
-        >
-          {showAdvanced ? "Hide advanced" : "Show advanced"}
-        </ButtonItem>
-      </PanelSectionRow>
+      {allowAdvanced && (
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            aria-expanded={showAdvanced}
+            onClick={() => setShowAdvanced((current) => !current)}
+          >
+            {showAdvanced ? "Hide advanced" : "Show advanced"}
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
     </>
   );
 }

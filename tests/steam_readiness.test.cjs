@@ -46,6 +46,7 @@ function monitor(app) {
       if (name === "react/jsx-runtime") return { jsx: () => ({}), jsxs: () => ({}) };
       if (name === "./config-page") return { CONFIG_ROUTE: "/config/:uuid", ConfigPage: configPage };
       if (name === "./plugin-navigation") return {};
+      if (name === "./ui-settings") return {};
       if (name === "./updater") return { UpdateButton: () => null };
       if (name === "react" || name === "react-icons/fa") return {};
       throw new Error(`Unexpected module: ${name}`);

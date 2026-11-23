@@ -6,6 +6,7 @@ import {
 import { SetStateAction, useCallback, useEffect, useRef, useState } from "react";
 import { ConnectionEditor } from "./connection-editor";
 import { returnToPlugin } from "./plugin-navigation";
+import { useUISettings } from "./ui-settings";
 import {
   AdvancedProperty, draftChanged, EditorDraft, emptyDraft, fromDraft, importConf, toDraft, WireGuardConfig,
 } from "./wireguard-config";
@@ -50,6 +51,7 @@ function Message({ error, children }: { error: boolean; children: string }) {
 /** Full-screen page for editing a connection, opened from the quick access panel. */
 export function ConfigPage() {
   const { uuid } = useParams<{ uuid: string }>();
+  const uiSettings = useUISettings();
   const [draft, setDraft] = useState<EditorDraft | null>(null);
   const [saved, setSaved] = useState<EditorDraft | null>(null);
   const [loading, setLoading] = useState(false);
@@ -230,6 +232,7 @@ export function ConfigPage() {
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={saving || importing} onClick={leave}>Back</ButtonItem>
           </PanelSectionRow>
+          {uiSettings.error && <Message error>{`Advanced settings: ${uiSettings.error}`}</Message>}
           {loading && draft === null && <Message error={false}>Loading configuration...</Message>}
           {error && draft === null && (
             <>
@@ -252,7 +255,12 @@ export function ConfigPage() {
                   {importing ? "Importing..." : "Import .conf file"}
                 </ButtonItem>
               </PanelSectionRow>
-              <ConnectionEditor draft={draft} onChange={change} disabled={saving || importing} />
+              <ConnectionEditor
+                draft={draft}
+                onChange={change}
+                disabled={saving || importing}
+                allowAdvanced={uiSettings.showAdvanced}
+              />
               {(error || notice) && <Message error={error !== null}>{error ?? notice ?? ""}</Message>}
               <PanelSectionRow>
                 <ButtonItem

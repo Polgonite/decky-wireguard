@@ -76,6 +76,10 @@ class LoggingSettings(TypedDict):
     debug: bool
 
 
+class UISettings(TypedDict):
+    show_advanced_settings: bool
+
+
 class Profile(TypedDict):
     uuid: str
     name: str
@@ -982,7 +986,9 @@ class Plugin:
         self._write_json(self._settings_path(), settings, "startup")
 
     @staticmethod
-    def _write_json(path: Path, settings: StartupSettings | LoggingSettings, label: str) -> None:
+    def _write_json(
+        path: Path, settings: StartupSettings | LoggingSettings | UISettings, label: str,
+    ) -> None:
         temporary: str | None = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -998,6 +1004,28 @@ class Plugin:
                     Path(temporary).unlink(missing_ok=True)
         except OSError as error:
             raise NetworkManagerError(f"Unable to save {label} settings: {error}") from error
+
+    async def get_ui_settings(self) -> dict[str, object]:
+        try:
+            try:
+                settings = json.loads(self._settings_path("ui.json").read_text())
+            except FileNotFoundError:
+                return {"success": True, "show_advanced_settings": False}
+            if not isinstance(settings, dict) or not isinstance(settings.get("show_advanced_settings"), bool):
+                raise ValueError("Invalid UI settings")
+            return {"success": True, "show_advanced_settings": settings["show_advanced_settings"]}
+        except (OSError, ValueError, NetworkManagerError) as error:
+            return self._failure(NetworkManagerError(f"Unable to read UI settings: {error}"))
+
+    async def set_ui_settings(self, show_advanced_settings: bool) -> dict[str, object]:
+        if not isinstance(show_advanced_settings, bool):
+            return self._failure(NetworkManagerError("Show advanced settings must be a boolean."))
+        settings: UISettings = {"show_advanced_settings": show_advanced_settings}
+        try:
+            self._write_json(self._settings_path("ui.json"), settings, "UI")
+        except NetworkManagerError as error:
+            return self._failure(error)
+        return {"success": True, **settings}
 
     def _open_diagnostic_log(self) -> RotatingFileHandler:
         directory = os.environ.get("DECKY_PLUGIN_LOG_DIR")

@@ -78,6 +78,9 @@ function page(draft = saved, backend = () => assert.fail("Unexpected backend cal
       if (name === "./connection-editor") return { ConnectionEditor: "ConnectionEditor" };
       if (name === "./wireguard-config") return config;
       if (name === "./plugin-navigation") return navigation.exports;
+      if (name === "./ui-settings") return {
+        useUISettings: () => options.uiSettings ?? { showAdvanced: false, error: null },
+      };
       throw new Error(`Unexpected module: ${name}`);
     },
   };
@@ -103,6 +106,7 @@ function page(draft = saved, backend = () => assert.fail("Unexpected backend cal
       save: () => find(tree, "ButtonItem", (node) => node.props.children === "Save").props.onClick(),
       importFile: () => find(tree, "ButtonItem", (node) => node.props.children === "Import .conf file").props.onClick(),
       draft: find(tree, "ConnectionEditor")?.props.draft,
+      allowAdvanced: find(tree, "ConnectionEditor")?.props.allowAdvanced,
       messages: (function collect(node) {
         if (!node || typeof node !== "object") return [];
         const children = node.props?.children;
@@ -307,4 +311,85 @@ test("an untouched new connection can be closed without creating a profile", asy
   editor.render().back();
   assert.equal(editor.modals.length, 0);
   assert.deepEqual(editor.openedPanels, [{ tab: 999, uuid: null }]);
+});
+
+test("the editor receives the current advanced settings preference", () => {
+  const uiSettings = { showAdvanced: false, error: null };
+  const editor = page(saved, undefined, { uiSettings });
+  assert.equal(editor.render().allowAdvanced, false);
+  uiSettings.showAdvanced = true;
+  assert.equal(editor.render().allowAdvanced, true);
+  uiSettings.showAdvanced = false;
+  assert.equal(editor.render().allowAdvanced, false);
+  uiSettings.error = "Read failed";
+  assert.ok(editor.render().messages.some((message) => message.includes("Read failed")));
+});
+
+test("advanced editor controls disappear when disabled without losing draft edits", () => {
+  const compiledEditor = compile("connection-editor.tsx");
+  const hooks = [];
+  let cursor = 0;
+  let draft = config.toDraft({ ...saved.config, mtu: "1380" }, [
+    { key: "ipv4.dns-priority", value: "0" },
+  ]);
+  const element = (type, props) => ({ type, props });
+  const context = {
+    exports: {},
+    require: (name) => {
+      if (name === "@decky/ui") return {
+        staticClasses: { PanelSectionTitle: "title" },
+        ButtonItem: "ButtonItem", PanelSectionRow: "PanelSectionRow", TextField: "TextField",
+      };
+      if (name === "react/jsx-runtime") return { jsx: element, jsxs: element };
+      if (name === "react") return {
+        useState: (initial) => {
+          const index = cursor++;
+          if (!(index in hooks)) hooks[index] = initial;
+          return [hooks[index], (update) => {
+            hooks[index] = typeof update === "function" ? update(hooks[index]) : update;
+          }];
+        },
+        useRef: (initial) => hooks[cursor++] ??= { current: initial },
+      };
+      if (name === "./wireguard-config") return config;
+      throw new Error(`Unexpected module: ${name}`);
+    },
+  };
+  runInNewContext(compiledEditor, context);
+  const render = (allowAdvanced) => {
+    cursor = 0;
+    const tree = context.exports.ConnectionEditor({
+      draft, allowAdvanced, disabled: false,
+      onChange: (update) => { draft = typeof update === "function" ? update(draft) : update; },
+    });
+    const nodes = [];
+    function collect(node) {
+      if (Array.isArray(node)) {
+        node.forEach(collect);
+        return;
+      }
+      if (!node || typeof node !== "object") return;
+      nodes.push(node);
+      const children = node.props?.children;
+      (Array.isArray(children) ? children : [children]).forEach(collect);
+    }
+    collect(tree);
+    return nodes;
+  };
+  const button = (nodes, label) => nodes.find((node) =>
+    node.type === "ButtonItem" && node.props.children === label);
+  const field = (nodes, label) => nodes.find((node) =>
+    node.type === "TextField" && node.props.label === label);
+
+  assert.equal(button(render(false), "Show advanced"), undefined);
+  assert.equal(field(render(false), "MTU"), undefined);
+  button(render(true), "Show advanced").props.onClick();
+  field(render(true), "MTU").props.onChange({ target: { value: "1420" } });
+  field(render(true), "IPv4: DNS Priority").props.onChange({ target: { value: "-50" } });
+  assert.equal(button(render(false), "Hide advanced"), undefined);
+  assert.equal(field(render(false), "MTU"), undefined);
+  assert.equal(field(render(true), "MTU").props.value, "1420");
+  assert.equal(field(render(true), "IPv4: DNS Priority").props.value, "-50");
+  assert.equal(config.fromDraft(draft).config.mtu, "1420");
+  assert.equal(config.fromDraft(draft).advanced[0].value, "-50");
 });

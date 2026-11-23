@@ -253,13 +253,16 @@ directory), then restart Decky Loader.
   connect or disconnect it; press B or select Back to return to the list without
   closing the sidebar. B on the connection list returns to Decky's plugin list,
   including while profiles are loading or when no profiles are available.
-  The short UUID appears beside each status. **Settings** opens the logging and
-  update controls; press B or select Back to return to the connection list.
+  The short UUID appears beside each status. **Settings** contains
+  **Show advanced settings**, logging and update controls; press B or select Back
+  to return to the connection list. Advanced settings are hidden by default;
+  this preference persists across reloads.
 - Select **Edit configuration** to open a full-screen editor that lays out the
   profile like a WireGuard `.conf` file: **Interface** (private key with its derived public key, addresses,
   DNS servers and search domains) followed by each **Peer** (public key, preshared
   key, allowed IPs, endpoint, persistent keepalive). Peers can be added and
-  removed. **Show advanced**, above Save, reveals listen port, MTU, and the
+  removed. Enable **Show advanced settings** in **Settings** to make
+  **Show advanced** available above Save. It reveals listen port, MTU, and the
   remaining raw NetworkManager properties, including adding one; hiding them
   preserves any edits. Interface and peer fields are read and saved through
   NetworkManager's D-Bus API with `busctl`, because SteamOS's `nmcli` cannot edit
@@ -278,8 +281,9 @@ directory), then restart Decky Loader.
 - Two independent per-connection checkboxes control plugin-managed startup:
   **Wait for Steam login** and **Wait for internet**. Both default to enabled,
   including for connections configured before these options were added. They
-  only appear when **Connect after boot** is enabled, and their saved values
-  are preserved when it is turned off and on again. They do not affect
+  only appear when **Show advanced settings** and **Connect after boot** are
+  enabled, and their saved values are preserved when either is turned off and
+  on again. Hiding them does not change startup behavior. They do not affect
   NetworkManager boot autoconnect or manual Connect actions.
   Turn off the internet requirement for private/offline-only VPNs if needed.
 - Steam readiness is monitored from plugin initialization, even with the panel
