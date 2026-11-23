@@ -102,123 +102,18 @@ Sources: [WireGuard's configuration format (`wg(8)`)](https://git.zx2c4.com/wire
 [NetworkManager IPv4 settings](https://www.networkmanager.dev/docs/api/latest/settings-ipv4.html),
 and [NetworkManager's WireGuard verifier](https://github.com/NetworkManager/NetworkManager/blob/main/src/libnm-core-impl/nm-setting-wireguard.c).
 
-## Build
+## Development
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git.
-uv downloads Python 3.13 and installs the pinned Node.js 22/npm and development
-tools in the repository's `.venv`; no system Node.js installation is needed:
-
-```sh
-uv sync --locked
-uv run --locked npm ci
-uv run --locked npm test
-uv run --locked npm run package
-```
-
-The installable archive is `out/decky-wireguard-0.1.0.zip`. Its single top-level
-`decky-wireguard` directory contains the backend, plugin metadata, and compiled
-`dist/index.js`. No Python packages or runtime npm installation are needed.
-
-For frontend development, use `uv run --locked npm run watch`;
-`uv run --locked npm run typecheck` checks the UI.
-The build uses Decky's official Rollup tooling and externalizes React and
-`@decky/ui`, provided by the loader. TypeScript is pinned to 5.9 because the
-current Decky Rollup plugin requires its JavaScript compiler API, which is not
-available in TypeScript 7.
-
-The official build tooling currently has transitive npm advisories in its
-development dependencies, including `glob`, `minimatch`, and `deepmerge`.
-These packages are not shipped in the plugin archive; avoid building untrusted
-source trees. `npm audit --omit=dev` reports no runtime dependency advisories
-for the committed lockfile at creation time.
-
-## Development releases
-
-Every push to `main` runs `.github/workflows/development-release.yml`, which
-tests the backend, type-checks and builds the frontend, verifies the ZIP, then
-publishes it on the [GitHub Releases page](https://github.com/Polgonite/decky-wireguard/releases).
-All releases are marked **prerelease**, not stable or latest.
-
-Both CI jobs use Ubuntu 24.04 runners to avoid automatic OS migrations.
-The checkout and setup actions use Node.js 24 internally; the project still
-builds with Node.js 22.
-
-Each build gets a version such as `0.1.0-dev.123456789.1.shaabcdef0`, containing
-the workflow run ID, attempt number, and short commit SHA. Reruns create distinct
-releases instead of overwriting previous assets. That version is embedded in the
-packaged `package.json` and ZIP filename; source versions are not committed back.
-Releases target the exact pushed commit. The pre-commit checks job uses the same
-locked uv environment as local development. It is currently disabled because
-checks run locally before pushing. To enforce checks on pull requests and pushes
-and block publication on failure, remove its `if: ${{ false }}` and uncomment
-`needs: checks` on the release job.
-Runs are not canceled or grouped by a
-concurrency limit, so each push can publish its own build after successful checks.
-
-The workflow uses the automatic `GITHUB_TOKEN` with `contents: write`; no
-additional secret is required. Repository or organization policies must allow
-GitHub Actions to create releases.
-
-## Development environment and pre-commit
-
-From the repository root, create the uv venv, install npm dependencies, and
-install the Git pre-commit hook:
-
-```sh
-uv sync --locked
-uv run --locked npm ci
-uv run --locked pre-commit install
-uv run --locked pre-commit run --all-files
-uv run --locked npm run package
-```
-
-The hooks lint Python with Ruff, lint JavaScript/TypeScript with ESLint, check
-frontend types, run backend tests, and validate Actions workflows (including
-embedded shell) with actionlint/ShellCheck. Python is selected by
-`.python-version`; `pyproject.toml` pins Node.js, pre-commit, Ruff, actionlint, and
-ShellCheck, and `uv.lock` locks their dependencies. Node.js, actionlint, and
-ShellCheck are supplied through Python wrapper packages. Local and CI commands
-use `--locked` so dependency changes require an explicit `uv lock`.
-
-The hooks invoke tools through `uv run --locked`, so they work without activating
-the venv, provided uv and Git are on your `PATH`. For an interactive shell with
-plain `npm`, `python3`, and `pre-commit` commands, activate it:
-
-```sh
-source .venv/bin/activate
-```
-
-VS Code retains the ESLint and Ruff extension recommendations in
-`.vscode/extensions.json`. Launch it from the activated shell so extensions can
-find the venv's Node.js and Python tools.
-
-### Committing from the terminal
-
-After the setup above, run these commands from the repository root:
-
-```sh
-git status --short
-git diff
-git add README.md src/index.tsx # Replace with the files you intend to commit.
-git diff --cached --check
-git diff --cached
-```
-
-Commit normally; the installed hook uses the uv environment and your existing
-Git identity:
-
-```sh
-git commit -m "Describe the change"
-git status --short
-git --no-pager log --oneline -1
-```
-
-If Git cannot resolve your identity, configure it first. If a hook
-fails, fix the reported issue and retry without bypassing hooks. If a hook
-rewrites files, review and stage those changes before retrying. An empty final
-status means the working tree is clean.
+See the [development guide](docs/development.md) for building from source,
+setting up the development environment, testing, committing, and publishing
+development releases.
 
 ## Install on Steam Deck
+
+Download an installable ZIP from the
+[GitHub Releases page](https://github.com/Polgonite/decky-wireguard/releases).
+All releases are marked **prerelease**, not stable or latest.
+No Python packages or runtime npm installation are needed.
 
 1. Enable Developer Mode in Decky Loader settings.
 2. Use Decky's **Install Plugin from ZIP File** developer option and select the
@@ -420,8 +315,3 @@ traffic still worked. Aliases such as `tunnel-1-peer-2` are local to one backend
 session. The log does not include IP addresses, names, UUIDs, keys, or raw
 command output. Disabling logging also disables debug and stops recording
 without deleting the existing files.
-
-Backend tests mock `nmcli`, `busctl`, and `wg`; they do not activate any host network connections.
-`npm test` also exercises the frontend readiness monitor with mocked Steam APIs,
-including online/offline login, unfinished initialization, API errors, and unloading.
-Real Steam Deck/Decky integration must be checked on the device.
