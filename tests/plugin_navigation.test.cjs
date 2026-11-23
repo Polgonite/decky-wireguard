@@ -78,8 +78,8 @@ function plugin(profiles, backend, options = {}) {
           NavigateBack: () => {}, OpenQuickAccessMenu: () => {},
           Navigate: (path) => navigations.push(path), CloseSideMenus: () => navigations.push("close"),
         },
-        QuickAccessTab: { Decky: 999 }, PanelSection: "PanelSection", Focusable: "Focusable",
-        ButtonItem: "ButtonItem", ToggleField: "ToggleField",
+        QuickAccessTab: { Decky: 999 }, PanelSection: "PanelSection", PanelSectionRow: "PanelSectionRow",
+        Focusable: "Focusable", ButtonItem: "ButtonItem", ToggleField: "ToggleField",
       };
       if (name === "./plugin-navigation") return navigation.exports;
       if (name === "./ui-settings") return uiSettings.exports;
@@ -244,8 +244,8 @@ function textIn(node) {
 }
 
 function connectionStatus(node) {
-  return elementsIn(node).find((element) => element.type === "div" &&
-    elementsIn(element).some((child) => child.type?.name === "StatusCircle"));
+  return elementsIn(node).filter((element) => element.type === "div" &&
+    elementsIn(element).some((child) => child.type?.name === "StatusCircle")).at(-1);
 }
 
 for (const state of ["disconnected", "connected"]) {
@@ -281,10 +281,13 @@ for (const state of ["disconnected", "connected"]) {
       : textIn(node) === "Available when connected."));
     const edit = nodes.find((node) => node.type === "ButtonItem" && node.props.children === "Edit configuration");
     assert.ok(button && status && peerDetails && edit);
+    const statusRow = nodes.find((node) =>
+      node.type === "PanelSectionRow" && elementsIn(node).includes(status));
+    assert.ok(statusRow && elementsIn(statusRow).includes(button));
     assert.ok(nodes.indexOf(button) < nodes.indexOf(status));
     assert.ok(nodes.indexOf(status) < nodes.indexOf(peerDetails));
     assert.ok(nodes.indexOf(peerDetails) < nodes.indexOf(edit));
-    assert.equal(textIn(status), state === "connected" ? "Home" : "HomeDisconnected on wg0");
+    assert.equal(textIn(status), state === "connected" ? "HomeConnected on wg0" : "HomeDisconnected on wg0");
     assert.equal(button.props.disabled, false);
 
     button.props.onClick();
@@ -389,7 +392,7 @@ for (const logging of [false, true]) {
     assert.equal(connection.props.description, undefined);
     const status = connectionStatus(details);
     assert.ok(status);
-    assert.equal(textIn(status), "Home");
+    assert.equal(textIn(status), "HomeConnected on wg0");
     const detailIndicator = elementsIn(status).find((node) => node.type?.name === "StatusCircle");
     assert.ok(detailIndicator);
     const detailCircle = detailIndicator.type(detailIndicator.props);
@@ -421,13 +424,13 @@ for (const [connection, listStatus, description] of [
     "No peer response after 30 seconds", "No peer response after 30 seconds on wg0"],
   [{ state: "connecting", handshake: "established", device: "wg0", handshake_error: null },
     "Connecting...", "Connecting... on wg0"],
-  [{ state: "connected", handshake: "established", device: "", handshake_error: null }, "", ""],
+  [{ state: "connected", handshake: "established", device: "", handshake_error: null }, "", "Connected"],
   [{
     state: "connected", handshake: "unknown", device: "wg0", handshake_error: "Peer check failed",
   }, "Peer status unavailablePeer check failed", "Peer status unavailable on wg0 \u00b7 Peer check failed"],
   [{
     state: "connected", handshake: "established", device: "wg0", handshake_error: "Peer check failed",
-  }, "Peer check failed", "Peer check failed"],
+  }, "Peer check failed", "Connected on wg0 \u00b7 Peer check failed"],
 ]) {
   test(`connection status retains its details without an identifier: ${description || "verified"}`, async () => {
     const uuid = "12345678-1234-1234-1234-123456789abc";

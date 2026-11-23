@@ -413,7 +413,7 @@ function Content() {
   const transitioning = selectedProfile?.state === "connecting" || selectedProfile?.state === "disconnecting";
   const selectedStatus = error ? "Status unavailable" : pendingUuid === selectedProfile?.uuid
     ? "Applying change..."
-    : selectedProfile ? profileLabel(selectedProfile) : "";
+    : selectedProfile ? profileLabel(selectedProfile) || stateLabels[selectedProfile.state] : "";
   const selectedDescription = selectedStatus && selectedProfile?.device
     ? `${selectedStatus} on ${selectedProfile.device}` : selectedStatus;
 
@@ -561,8 +561,8 @@ function Content() {
         <PanelSectionRow>Profile no longer available.</PanelSectionRow>
       )}
       {selectedProfile && (
-        <>
-          <PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ width: "100%" }}>
             <ButtonItem
               layout="below"
               disabled={busy || error !== null || transitioning || selectedProfile.state === "unknown"}
@@ -577,8 +577,6 @@ function Content() {
                   ? stateLabels[selectedProfile.state]
                   : selectedProfile.state === "connected" ? "Disconnect" : "Connect"}
             </ButtonItem>
-          </PanelSectionRow>
-          <PanelSectionRow>
             <div style={{ padding: "8px 0", width: "100%", overflowWrap: "anywhere" }}>
               <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <StatusCircle
@@ -593,8 +591,8 @@ function Content() {
                 </div>
               )}
             </div>
-          </PanelSectionRow>
-        </>
+          </div>
+        </PanelSectionRow>
       )}
       {selectedProfile && (
         <>
