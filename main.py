@@ -820,7 +820,11 @@ async def _probe_targets(device: str) -> list[ProbeTarget]:
         local: set[Address] = set()
         dns: list[Address] = []
         for line in device_output.splitlines():
-            key, value = _split_fields(line)
+            fields = _split_fields(line)
+            if len(fields) < 2:
+                raise ValueError("Missing device field value")
+            # nmcli's multiline output can leave IPv6 colons unescaped.
+            key, value = fields[0], ":".join(fields[1:])
             if not value or value == "--":
                 continue
             if key.startswith(("IP4.ADDRESS[", "IP6.ADDRESS[")):

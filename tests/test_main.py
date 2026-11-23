@@ -1830,6 +1830,15 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             ProbeTarget(ip_address("2001:db8::1")),
         ])
 
+    async def test_ipv6_device_output_with_unescaped_colons(self):
+        self.assertEqual(await self.targets(
+            "peer\tfd00::/64\n",
+            "IP6.ADDRESS[1]:fd00::1/64\nIP6.DNS[1]:fd00::2\n",
+        ), [
+            ProbeTarget(ip_address("fd00::2"), dns=True),
+            ProbeTarget(ip_address("fd00::2")),
+        ])
+
     async def test_dns_outside_allowed_ips_is_never_probed(self):
         self.assertEqual(await self.targets(
             "peer\t10.0.0.9/32\n", "IP4.ADDRESS[1]:10.0.0.2/32\nIP4.DNS[1]:192.0.2.53\n",
@@ -1852,6 +1861,8 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             ("peer\t127.0.0.0/8 224.0.0.0/4 169.254.0.0/16\n", ""),
             ("peer\tbad-network\n", ""),
             ("peer\t10.0.0.0/24\n", "unexpected:field:shape\n"),
+            ("peer\t::/0\n", "IP6.DNS[1]:fd00::not-an-address\n"),
+            ("peer\t::/0\n", "IP6.ADDRESS[1]\n"),
         ]:
             with self.subTest(allowed=allowed, device=device), self.assertRaises(NetworkManagerError):
                 await self.targets(allowed, device)
