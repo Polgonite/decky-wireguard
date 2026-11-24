@@ -9,9 +9,29 @@ symptoms and diagnostic steps, see
 
 The Decky frontend lists NetworkManager profiles and sends actions to a Python
 backend. The backend uses `nmcli` for profile listing, activation, autoconnect, and
-advanced properties. It uses NetworkManager's D-Bus API through `busctl` to
-read and update structured WireGuard settings, including peer data that
-SteamOS's `nmcli` cannot edit.
+advanced properties. It uses NetworkManager's D-Bus API directly to
+read structured WireGuard settings, including peer data that SteamOS's `nmcli`
+cannot edit. Settings writes use Python's standard-library D-Bus transport so
+WireGuard keys do not appear in subprocess arguments.
+
+The backend checks the system bus socket's Linux peer credentials before sending
+settings. It accepts only root or the system D-Bus service account. Only
+[listed non-secret properties](configuration.md#validation) can be passed as
+arguments to `nmcli --offline`; WireGuard keys travel in the keyfile pipe.
+
+The editor uses the system `libnm` to prepare the full draft before changing a
+live profile. It retains unrelated settings from the original D-Bus profile.
+The snapshot identifies the system bus instance, NetworkManager service owner,
+profile object path, and version. Reading keys can advance that version, so the
+editor records the revision after the secret read and does not reread keys on
+save. The backend holds only the latest editor snapshot, in memory for at most
+30 minutes. If it expires, reload to keep non-conflicting edits. During a save,
+owner lookup and write use the same authenticated connection. One `Update2` persists the result on that same object only
+if its version still matches. It does not reapply the firewall zone or metered
+setting to an active tunnel. New profiles use a single `AddConnection`. There is no
+temporary live profile or rollback write. If the reply is lost, the backend
+checks for matching, persisted settings. When it cannot confirm the result it
+reports that uncertainty instead of overwriting potentially newer settings.
 
 The backend invokes system tools directly; it does not use a shell. Profile
 operations are serialized and restricted to native NetworkManager WireGuard

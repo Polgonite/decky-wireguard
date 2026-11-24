@@ -18,8 +18,15 @@ uv run --locked npm run package
 
 The installable archive is `out/decky-wireguard-0.1.0.zip`. Its single top-level
 `decky-wireguard` directory contains the backend, plugin metadata, compiled
-`dist/index.js`, the README, and Markdown guides in `docs/`. No Python packages
-or runtime npm installation are needed.
+`dist/index.js`, the README, and four allowlisted Markdown guides in `docs/`.
+No third-party Python packages or runtime npm installation are needed. The
+bundled `py_modules/nm_keyfile.py` uses `ctypes` with the system's `libnm` for
+offline advanced-property conversion. Profile editing requires NetworkManager
+1.44+ for revision-checked writes. Secret-bearing writes go directly over the
+configured Unix system bus; keyfiles for `nmcli --offline` travel only by pipe.
+Profile reads also use D-Bus directly. `nmcli` and `busctl` are still used
+for status and readiness. File import runs `py_modules/read_conf.py` with
+`/usr/bin/python3` under the account identified by Decky's `DECKY_USER`.
 See [Install](../README.md#install) to install it.
 
 For frontend development, use `uv run --locked npm run watch`;
@@ -129,7 +136,9 @@ Run the backend and frontend tests with:
 uv run --locked npm test
 ```
 
-Backend tests mock `nmcli`, `busctl`, and `wg`; they do not activate any host network connections.
+Backend tests mock live NetworkManager and `wg` operations. When `nmcli` is
+installed they also exercise real offline profile conversion without accessing
+host network connections.
 `npm test` also exercises the frontend readiness monitor with mocked Steam APIs,
 including online/offline login, unfinished initialization, API errors, and unloading.
 Real Steam Deck/Decky integration must be checked on the device.

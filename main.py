@@ -4,12 +4,13 @@ import copy
 import json
 import logging
 import os
+import pwd
 import re
 import socket
-import stat
 import struct
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from ipaddress import (
     IPv4Address,
@@ -23,6 +24,7 @@ from ipaddress import (
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Literal, TypedDict
+from urllib.parse import unquote_to_bytes
 from uuid import UUID, uuid4
 
 logger = logging.getLogger("decky-wireguard")
@@ -39,6 +41,12 @@ DIAGNOSTIC_LOG = "wireguard-diagnostics.log"
 NM_SERVICE = "org.freedesktop.NetworkManager"
 NM_SETTINGS_PATH = "/org/freedesktop/NetworkManager/Settings"
 NM_CONNECTION_INTERFACE = "org.freedesktop.NetworkManager.Settings.Connection"
+DBUS_SERVICE = "org.freedesktop.DBus"
+DBUS_SYSTEM_SOCKET = "/run/dbus/system_bus_socket"
+DBUS_TIMEOUT = 15
+EDITOR_SNAPSHOT_TTL = 30 * 60
+NM_UPDATE_TO_DISK = 0x01
+NM_UPDATE_NO_REAPPLY = 0x40
 SECRET_NOT_REQUIRED = 4
 # IP methods that NetworkManager rejects alongside addresses, DNS servers or search domains.
 NO_ADDRESS_METHODS = (None, "disabled", "ignore", "link-local")
@@ -54,6 +62,17 @@ STRUCTURED_PROPERTIES = frozenset({
     "ipv4.dns", "ipv6.dns", "ipv4.dns-search", "ipv6.dns-search",
 })
 IDENTITY_PROPERTIES = frozenset({"connection.uuid", "connection.type"})
+DIRECT_PROPERTIES = frozenset({"ipv4.method", "ipv6.method", "connection.interface-name", "wireguard.fwmark"})
+# Only these non-secret properties may be passed as arguments to offline nmcli.
+OFFLINE_PROPERTIES = frozenset({
+    "connection.zone", "connection.metered", "connection.autoconnect-priority",
+    "wireguard.peer-routes", "wireguard.ip4-auto-default-route", "wireguard.ip6-auto-default-route",
+    "ipv6.addr-gen-mode", "ipv6.ip6-privacy",
+    *(f"{family}.{field}" for family in ("ipv4", "ipv6") for field in (
+        "gateway", "routes", "routing-rules", "route-table", "route-metric", "never-default",
+        "dns-priority", "dns-options", "ignore-auto-dns", "ignore-auto-routes", "may-fail",
+    )),
+})
 Settings = dict[str, dict[str, dict[str, object]]]
 
 
@@ -90,6 +109,28 @@ class Profile(TypedDict):
 
 class NetworkManagerError(Exception):
     pass
+
+
+class UnconfirmedWrite(NetworkManagerError):
+    pass
+
+
+class ProfileConflict(NetworkManagerError):
+    pass
+
+
+class DuplicateUuid(NetworkManagerError):
+    pass
+
+
+@dataclass(frozen=True)
+class ProfileRef:
+    owner: str
+    path: str
+    bus_id: str
+
+    def revision_token(self, version: int) -> str:
+        return f"{self.bus_id}|{self.owner}|{self.path}|{version}"
 
 
 @dataclass
@@ -132,17 +173,25 @@ def _split_fields(line: str) -> list[str]:
     return fields
 
 
-async def _command(executable: str, *arguments: str, wait: int = 10) -> str:
+async def _command(executable: str, *arguments: str, wait: int = 10, input_data: bytes | None = None,
+                   desktop_user: pwd.struct_passwd | None = None) -> str:
+    credentials = {}
+    if desktop_user is not None and os.geteuid() == 0:
+        credentials = {"user": desktop_user.pw_uid, "group": desktop_user.pw_gid,
+                       "extra_groups": os.getgrouplist(desktop_user.pw_name, desktop_user.pw_gid)}
     try:
         process = await asyncio.create_subprocess_exec(
             executable,
             *arguments,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL if input_data is None else asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            env={"LC_ALL": "C"} if desktop_user else {**os.environ, "LC_ALL": "C", "LANG": "C"},
+            **credentials,
         )
     except FileNotFoundError as error:
+        if desktop_user:
+            raise NetworkManagerError("Import requires the system Python interpreter at /usr/bin/python3.") from error
         raise NetworkManagerError(
             f"{executable} is not installed. "
             + ("This plugin requires NetworkManager and nmcli." if executable == "nmcli"
@@ -155,7 +204,7 @@ async def _command(executable: str, *arguments: str, wait: int = 10) -> str:
         raise NetworkManagerError(f"Unable to start {executable}: {error}") from error
 
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=wait + 5)
+        stdout, stderr = await asyncio.wait_for(process.communicate(input_data), timeout=wait + 5)
     except (TimeoutError, asyncio.CancelledError) as error:
         if process.returncode is None:
             try:
@@ -170,6 +219,11 @@ async def _command(executable: str, *arguments: str, wait: int = 10) -> str:
         ) from error
 
     if process.returncode != 0:
+        if desktop_user:
+            raise NetworkManagerError("Unable to import. Select a user-readable, regular UTF-8 .conf file of at most 1 MiB.")
+        if input_data is not None:
+            # Neither stream is safe to echo when nmcli is processing a private keyfile.
+            raise NetworkManagerError("NetworkManager rejected the offline advanced settings.")
         detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
         raise NetworkManagerError(
             f"{executable} failed ({process.returncode}): {detail[:600] or 'No error details.'}"
@@ -213,73 +267,418 @@ def _split_signature(signature: str) -> list[str]:
     return types
 
 
-def _encode_bus_value(signature: str, value: object) -> list[str]:
-    """Encode busctl JSON-shaped data as busctl call arguments for one complete type."""
+def _dbus_alignment(signature: str) -> int:
+    if not signature:
+        raise ValueError("Missing D-Bus type")
+    code = signature[0]
+    if code in "yvg":
+        return 1
+    if code in "nq":
+        return 2
+    if code in "biuso":
+        return 4
+    if code in "xtd({":
+        return 8
+    if code == "a":
+        return 4
+    raise ValueError(f"Unsupported D-Bus type {code!r}")
+
+
+def _dbus_pad(buffer: bytearray, alignment: int) -> None:
+    buffer.extend(b"\0" * (-len(buffer) % alignment))
+
+
+def _dbus_signature_bytes(signature: str) -> bytes:
+    encoded = signature.encode("ascii")
+    if len(encoded) > 255:
+        raise ValueError("D-Bus signature is too long")
+    return bytes((len(encoded),)) + encoded + b"\0"
+
+
+def _dbus_encode_value(buffer: bytearray, signature: str, value: object) -> None:
+    _dbus_pad(buffer, _dbus_alignment(signature))
     code = signature[0]
     if code == "a":
         element = signature[1:]
+        length_offset = len(buffer)
+        buffer.extend(b"\0\0\0\0")
+        _dbus_pad(buffer, _dbus_alignment(element))
+        start = len(buffer)
         if element.startswith("{"):
-            key_type, value_type = _split_signature(element[1:-1])
             if not isinstance(value, dict):
                 raise TypeError("Expected a D-Bus dictionary")
-            arguments = [str(len(value))]
             for key, item in value.items():
-                arguments += _encode_bus_value(key_type, key) + _encode_bus_value(value_type, item)
-            return arguments
-        if not isinstance(value, list):
-            raise TypeError("Expected a D-Bus array")
-        return [str(len(value)), *(
-            argument for item in value for argument in _encode_bus_value(element, item)
-        )]
+                _dbus_encode_value(buffer, element, (key, item))
+        else:
+            if not isinstance(value, list):
+                raise TypeError("Expected a D-Bus array")
+            for item in value:
+                _dbus_encode_value(buffer, element, item)
+        struct.pack_into("<I", buffer, length_offset, len(buffer) - start)
+        return
+    if code == "{":
+        _dbus_pad(buffer, 8)
+        key_type, value_type = _split_signature(signature[1:-1])
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            raise TypeError("Expected a D-Bus dictionary entry")
+        _dbus_encode_value(buffer, key_type, value[0])
+        _dbus_encode_value(buffer, value_type, value[1])
+        return
     if code == "(":
         types = _split_signature(signature[1:-1])
-        if not isinstance(value, list) or len(value) != len(types):
+        if not isinstance(value, (tuple, list)) or len(value) != len(types):
             raise TypeError("Expected a D-Bus struct")
-        return [
-            argument for kind, item in zip(types, value)
-            for argument in _encode_bus_value(kind, item)
-        ]
+        for kind, item in zip(types, value):
+            _dbus_encode_value(buffer, kind, item)
+        return
     if code == "v":
         if (
             not isinstance(value, dict) or set(value) != {"type", "data"}
-            or not isinstance(value["type"], str) or len(_split_signature(value["type"])) != 1
+            or not isinstance(value["type"], str)
+            or len(_split_signature(value["type"])) != 1
         ):
             raise TypeError("Expected a D-Bus variant")
-        return [value["type"], *_encode_bus_value(value["type"], value["data"])]
+        buffer.extend(_dbus_signature_bytes(value["type"]))
+        _dbus_encode_value(buffer, value["type"], value["data"])
+        return
+    if code in "so":
+        if not isinstance(value, str):
+            raise TypeError("Expected a D-Bus string")
+        encoded = value.encode("utf-8")
+        buffer.extend(struct.pack("<I", len(encoded)))
+        buffer.extend(encoded)
+        buffer.append(0)
+        return
+    if code == "g":
+        if not isinstance(value, str):
+            raise TypeError("Expected a D-Bus signature")
+        buffer.extend(_dbus_signature_bytes(value))
+        return
     if code == "b":
         if not isinstance(value, bool):
             raise TypeError("Expected a D-Bus boolean")
-        return ["true" if value else "false"]
-    if code in "sog":
-        if not isinstance(value, str):
-            raise TypeError("Expected a D-Bus string")
-        return [value]
+        buffer.extend(struct.pack("<I", value))
+        return
     if code == "d":
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise TypeError("Expected a D-Bus double")
-        return [repr(float(value))]
-    # Integer dictionary keys arrive as JSON object keys, so accept decimal strings too.
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise TypeError("Expected a D-Bus integer")
-    return [str(int(value))]
+        buffer.extend(struct.pack("<d", value))
+        return
+    if code in "ynqiuxt":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("Expected a D-Bus integer")
+        format_code = {"y": "B", "n": "h", "q": "H", "u": "I", "x": "q", "t": "Q"}.get(
+            code, code,
+        )
+        try:
+            buffer.extend(struct.pack("<" + format_code, value))
+        except struct.error as error:
+            raise ValueError("D-Bus integer is out of range") from error
+        return
+    raise ValueError(f"Unsupported D-Bus type {code!r}")
 
 
-async def _busctl(
-    path: str, interface: str, method: str, signature: str = "", *arguments: str,
-) -> list[object]:
-    output = await _command(
-        "busctl", "--system", "--json=short", "--timeout=10", "--",
-        "call", NM_SERVICE, path, interface, method, signature, *arguments,
+def _dbus_encode(signature: str, values: list[object]) -> bytes:
+    types = _split_signature(signature)
+    if len(values) != len(types):
+        raise ValueError("D-Bus argument count does not match its signature")
+    body = bytearray()
+    for kind, value in zip(types, values):
+        _dbus_encode_value(body, kind, value)
+    return bytes(body)
+
+
+class _DBusReader:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.offset = 0
+
+    def _align(self, alignment: int) -> None:
+        self.offset += -self.offset % alignment
+        if self.offset > len(self.data):
+            raise ValueError("Truncated D-Bus value")
+
+    def _read(self, length: int) -> bytes:
+        end = self.offset + length
+        if end > len(self.data):
+            raise ValueError("Truncated D-Bus value")
+        value = self.data[self.offset:end]
+        self.offset = end
+        return value
+
+    def _signature(self) -> str:
+        length = self._read(1)[0]
+        try:
+            value = self._read(length).decode("ascii")
+        except UnicodeError as error:
+            raise ValueError("Invalid D-Bus signature") from error
+        if self._read(1) != b"\0":
+            raise ValueError("Invalid D-Bus signature terminator")
+        return value
+
+    def value(self, signature: str) -> object:
+        self._align(_dbus_alignment(signature))
+        code = signature[0]
+        if code == "a":
+            length = struct.unpack("<I", self._read(4))[0]
+            element = signature[1:]
+            self._align(_dbus_alignment(element))
+            end = self.offset + length
+            if end > len(self.data):
+                raise ValueError("Truncated D-Bus array")
+            if element.startswith("{"):
+                result: dict[object, object] = {}
+                while self.offset < end:
+                    key, item = self.value(element)
+                    result[key] = item
+                if self.offset != end:
+                    raise ValueError("Invalid D-Bus array length")
+                return result
+            result = []
+            while self.offset < end:
+                result.append(self.value(element))
+            if self.offset != end:
+                raise ValueError("Invalid D-Bus array length")
+            return result
+        if code == "{":
+            self._align(8)
+            key_type, value_type = _split_signature(signature[1:-1])
+            return [self.value(key_type), self.value(value_type)]
+        if code == "(":
+            return [self.value(kind) for kind in _split_signature(signature[1:-1])]
+        if code == "v":
+            kind = self._signature()
+            if len(_split_signature(kind)) != 1:
+                raise ValueError("Invalid D-Bus variant signature")
+            return {"type": kind, "data": self.value(kind)}
+        if code in "so":
+            length = struct.unpack("<I", self._read(4))[0]
+            try:
+                value = self._read(length).decode("utf-8")
+            except UnicodeError as error:
+                raise ValueError("Invalid D-Bus string") from error
+            if self._read(1) != b"\0":
+                raise ValueError("Invalid D-Bus string terminator")
+            return value
+        if code == "g":
+            return self._signature()
+        if code == "b":
+            value = struct.unpack("<I", self._read(4))[0]
+            if value not in (0, 1):
+                raise ValueError("Invalid D-Bus boolean")
+            return bool(value)
+        if code == "d":
+            return struct.unpack("<d", self._read(8))[0]
+        if code in "ynqiuxt":
+            format_code = {"y": "B", "n": "h", "q": "H", "u": "I", "x": "q", "t": "Q"}.get(
+                code, code,
+            )
+            return struct.unpack(
+                "<" + format_code, self._read(struct.calcsize("<" + format_code)),
+            )[0]
+        raise ValueError(f"Unsupported D-Bus type {code!r}")
+
+
+def _dbus_message(
+    message_type: int, serial: int, path: str | None = None,
+    interface: str | None = None, member: str | None = None,
+    destination: str | None = None, signature: str = "",
+    values: list[object] | None = None, reply_serial: int | None = None,
+    error_name: str | None = None,
+) -> bytes:
+    fields: list[object] = []
+    for field, kind, value in (
+        (1, "o", path), (2, "s", interface), (3, "s", member),
+        (4, "s", error_name),
+        (5, "u", reply_serial), (6, "s", destination), (8, "g", signature),
+    ):
+        if value is not None and (field != 8 or value):
+            fields.append([field, {"type": kind, "data": value}])
+    header = bytearray()
+    for field in fields:
+        _dbus_encode_value(header, "(yv)", field)
+    body = _dbus_encode(signature, values or [])
+    padding = b"\0" * (-((16 + len(header)) % 8) % 8)
+    fixed = struct.pack(
+        "<cBBBIII", b"l", message_type, 0, 1, len(body), serial, len(header),
     )
-    if not output.strip():
-        return []
+    return fixed + header + padding + body
+
+
+async def _dbus_read_message(reader: asyncio.StreamReader) -> tuple[int, int, dict[int, object], bytes]:
+    fixed = await reader.readexactly(16)
+    if fixed[0:1] != b"l" or fixed[3] != 1:
+        raise ValueError("Unsupported D-Bus message encoding")
+    message_type = fixed[1]
+    body_length, serial, fields_length = struct.unpack_from("<III", fixed, 4)
+    if fields_length > 1024 * 1024 or body_length > 16 * 1024 * 1024:
+        raise ValueError("D-Bus message is too large")
+    fields_data = await reader.readexactly(fields_length)
+    fields_reader = _DBusReader(fields_data)
+    fields: dict[int, object] = {}
+    while fields_reader.offset < fields_length:
+        field, value = fields_reader.value("(yv)")
+        if not isinstance(field, int) or not isinstance(value, dict):
+            raise ValueError("Invalid D-Bus header field")
+        fields[field] = value["data"]
+    await reader.readexactly(-((16 + fields_length) % 8) % 8)
+    body = await reader.readexactly(body_length)
+    return message_type, serial, fields, body
+
+
+def _dbus_secrets(values: object) -> set[str]:
+    secrets: set[str] = set()
+    if isinstance(values, dict):
+        for key, value in values.items():
+            if key in {"private-key", "preshared-key"} and isinstance(value, dict):
+                secret = value.get("data")
+                if isinstance(secret, str) and secret:
+                    secrets.add(secret)
+            secrets.update(_dbus_secrets(value))
+    elif isinstance(values, (list, tuple)):
+        for value in values:
+            secrets.update(_dbus_secrets(value))
+    return secrets
+
+
+def _system_bus_address() -> tuple[bytes, str | None]:
+    address = os.environ.get("DBUS_SYSTEM_BUS_ADDRESS")
+    if address is None:
+        return os.fsencode(DBUS_SYSTEM_SOCKET), None
+    # Never fall back to another bus when a configured address isn't supported.
+    if not address.startswith("unix:") or ";" in address:
+        raise NetworkManagerError("The configured system D-Bus must use a single Unix socket.")
+    options = {}
+    for part in address[5:].split(","):
+        key, sep, value = part.partition("=")
+        if not sep or key in options or re.search(r"%(?![a-fA-F0-9]{2})", value):
+            raise NetworkManagerError("Invalid system D-Bus socket address.")
+        options[key] = value
+    guid = options.get("guid")
+    if guid is not None and not re.fullmatch("[0-9a-fA-F]{32}", guid):
+        raise NetworkManagerError("Invalid system D-Bus server GUID.")
+    names = options.keys() - {"guid"}
+    if names not in ({"path"}, {"abstract"}):
+        raise NetworkManagerError("Unsupported system D-Bus socket address.")
+    name = names.pop()
+    value = unquote_to_bytes(options[name])
+    if not value or b"\0" in value or (name == "path" and not value.startswith(b"/")):
+        raise NetworkManagerError("Invalid system D-Bus socket address.")
+    return (b"\0" if name == "abstract" else b"") + value, guid
+
+
+def _verify_bus_peer(writer: asyncio.StreamWriter) -> None:
+    peer = writer.get_extra_info("socket")
+    if peer is None:
+        raise NetworkManagerError("Cannot verify the system D-Bus server.")
+    credentials = struct.Struct("iII")  # Linux struct ucred
+    _, uid, _ = credentials.unpack(peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, credentials.size))
+    if uid == 0:
+        return
+    for account in ("messagebus", "dbus"):
+        try:
+            if uid == pwd.getpwnam(account).pw_uid:
+                return
+        except KeyError:
+            continue
+    raise NetworkManagerError("The system D-Bus socket is not owned by a trusted bus service.")
+
+
+class _Bus:
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader, self.writer = reader, writer
+        self.serial = 0
+
+    async def call(self, path: str, interface: str, method: str, signature: str = "",
+                   *values: object, destination: str = NM_SERVICE) -> list[object]:
+        self.serial += 1
+        sent = False
+        try:
+            async with asyncio.timeout(DBUS_TIMEOUT):
+                self.writer.write(_dbus_message(
+                    1, self.serial, path, interface, method, destination, signature, list(values),
+                ))
+                sent = True
+                return await self._reply(values)
+        except (OSError, asyncio.IncompleteReadError, ValueError, TypeError, struct.error) as error:
+            if sent:
+                raise UnconfirmedWrite("No confirmation from NetworkManager. Reload before retrying.") from error
+            raise NetworkManagerError("Unable to communicate with NetworkManager over D-Bus.") from error
+
+    async def _reply(self, values: tuple) -> list[object]:
+        await self.writer.drain()
+        while True:
+            message_type, _, fields, body = await _dbus_read_message(self.reader)
+            if fields.get(5) != self.serial or message_type not in (2, 3):
+                continue
+            if message_type == 3:
+                error_name = fields.get(4)
+                if error_name == NM_SERVICE + ".Settings.VersionIdMismatch":
+                    raise ProfileConflict("The profile changed outside this editor. Reload before saving.")
+                if error_name == NM_SERVICE + ".Settings.UuidExists":
+                    raise DuplicateUuid("A profile with this UUID already exists.")
+                if error_name in ("org.freedesktop.DBus.Error.NoReply", "org.freedesktop.DBus.Error.Disconnected"):
+                    raise UnconfirmedWrite("No confirmation from NetworkManager. Reload the profile before retrying.")
+                detail = ""
+                if fields.get(8) == "s":
+                    try:
+                        detail = _DBusReader(body).value("s")
+                    except (UnicodeError, ValueError, struct.error):
+                        pass
+                if isinstance(detail, str):
+                    for secret in _dbus_secrets(values):
+                        detail = detail.replace(secret, "[redacted]")
+                    detail = detail.strip()[:600]
+                error = f" ({error_name})" if isinstance(error_name, str) else ""
+                reason = f": {detail}" if detail else ""
+                raise NetworkManagerError(
+                    f"NetworkManager rejected the connection settings{error}{reason}"
+                )
+            result_signature = fields.get(8, "")
+            if not result_signature:
+                return []
+            body_reader = _DBusReader(body)
+            return [body_reader.value(kind) for kind in _split_signature(result_signature)]
+
+
+@asynccontextmanager
+async def _system_bus():
+    writer = None
     try:
-        reply = json.loads(output)
-    except ValueError as error:
-        raise NetworkManagerError("NetworkManager returned an unreadable D-Bus reply.") from error
-    if not isinstance(reply, dict) or not isinstance(reply.get("data"), list):
-        raise NetworkManagerError("NetworkManager returned an unexpected D-Bus reply.")
-    return reply["data"]
+        try:
+            async with asyncio.timeout(DBUS_TIMEOUT):
+                address, guid = _system_bus_address()
+                reader, writer = await asyncio.open_unix_connection(address)
+                _verify_bus_peer(writer)
+                identity = str(os.getuid()).encode("ascii").hex()
+                writer.write(b"\0AUTH EXTERNAL " + identity.encode("ascii") + b"\r\n")
+                await writer.drain()
+                auth = (await reader.readline()).split()
+                if len(auth) != 2 or auth[0] != b"OK" or (guid and auth[1].lower() != guid.lower().encode()):
+                    raise NetworkManagerError("Unable to authenticate to the system D-Bus.")
+                writer.write(b"BEGIN\r\n")
+                bus = _Bus(reader, writer)
+                hello = await bus.call("/org/freedesktop/DBus", DBUS_SERVICE, "Hello", destination=DBUS_SERVICE)
+                if len(hello) != 1 or not isinstance(hello[0], str) or not hello[0].startswith(":"):
+                    raise NetworkManagerError("Unable to initialize the system D-Bus connection.")
+        except (OSError, ValueError, UnconfirmedWrite) as error:
+            raise NetworkManagerError("Unable to initialize the system D-Bus connection.") from error
+        yield bus
+    finally:
+        if writer is not None:
+            writer.transport.abort()  # never wait indefinitely for buffered writes on cancellation
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+
+async def _dbus_call(
+    path: str, interface: str, method: str, signature: str = "",
+    *values: object, destination: str = NM_SERVICE,
+) -> list[object]:
+    async with _system_bus() as bus:
+        return await bus.call(path, interface, method, signature, *values, destination=destination)
 
 
 def _settings_reply(data: list[object]) -> Settings:
@@ -296,19 +695,36 @@ def _settings_reply(data: list[object]) -> Settings:
     return settings
 
 
-async def _nm_connection(uuid: str) -> tuple[str, Settings]:
-    """Return a profile's D-Bus path and its settings, including WireGuard secrets."""
-    reply = await _busctl(
+async def _nm_profile_ref(bus: _Bus, uuid: str) -> ProfileRef:
+    ids = await bus.call("/org/freedesktop/DBus", DBUS_SERVICE, "GetId", destination=DBUS_SERVICE)
+    if len(ids) != 1 or not isinstance(ids[0], str) or not re.fullmatch(r"[0-9a-fA-F]{32}", ids[0]):
+        raise NetworkManagerError("Cannot identify the system D-Bus instance.")
+    owners = await bus.call("/org/freedesktop/DBus", DBUS_SERVICE, "GetNameOwner", "s",
+                            NM_SERVICE, destination=DBUS_SERVICE)
+    if (len(owners) != 1 or not isinstance(owners[0], str)
+            or not re.fullmatch(r":[\w-]+(?:\.[\w-]+)+", owners[0], re.ASCII)):
+        raise NetworkManagerError("Cannot identify the NetworkManager service.")
+    owner = owners[0]
+    reply = await bus.call(
         NM_SETTINGS_PATH, "org.freedesktop.NetworkManager.Settings",
-        "GetConnectionByUuid", "s", uuid,
+        "GetConnectionByUuid", "s", uuid, destination=owner,
     )
     path = reply[0] if len(reply) == 1 else None
     if not isinstance(path, str) or not path.startswith("/"):
         raise NetworkManagerError("NetworkManager returned an unexpected connection path.")
-    settings = _settings_reply(await _busctl(path, NM_CONNECTION_INTERFACE, "GetSettings"))
-    secrets = _settings_reply(await _busctl(
-        path, NM_CONNECTION_INTERFACE, "GetSecrets", "s", "wireguard",
+    return ProfileRef(owner, path, ids[0])
+
+
+async def _nm_snapshot(bus: _Bus, ref: ProfileRef) -> tuple[int, Settings]:
+    before = await _nm_revision(bus, ref)
+    secrets = _settings_reply(await bus.call(
+        ref.path, NM_CONNECTION_INTERFACE, "GetSecrets", "s", "wireguard", destination=ref.owner,
     ))
+    revision = await _nm_revision(bus, ref)
+    # NetworkManager updates its secret cache once even for already-saved keys.
+    if revision not in (before, before + 1):
+        raise ProfileConflict("The profile changed while reading its keys. Reload before editing.")
+    settings = _settings_reply(await bus.call(ref.path, NM_CONNECTION_INTERFACE, "GetSettings", destination=ref.owner))
     try:
         for name, values in secrets.items():
             target = settings.setdefault(name, {})
@@ -329,24 +745,126 @@ async def _nm_connection(uuid: str) -> tuple[str, Settings]:
                         })
     except (KeyError, TypeError) as error:
         raise NetworkManagerError("NetworkManager returned unexpected WireGuard secrets.") from error
-    return path, settings
+    return revision, settings
 
 
-async def _nm_update(path: str, settings: Settings) -> None:
-    payload = copy.deepcopy(settings)
+async def _nm_revision(bus: _Bus, ref: ProfileRef) -> int:
+    reply = await bus.call(
+        ref.path, "org.freedesktop.DBus.Properties", "Get", "ss",
+        NM_CONNECTION_INTERFACE, "VersionId", destination=ref.owner,
+    )
+    value = reply[0] if len(reply) == 1 else None
+    if (not isinstance(value, dict) or value.get("type") != "t"
+            or type(value.get("data")) is not int or value["data"] <= 0):
+        raise NetworkManagerError("Cannot safely edit without a NetworkManager profile revision.")
+    return value["data"]
+
+
+def _normalize_ip_settings(settings: Settings) -> None:
     for family in ("ipv4", "ipv6"):
-        values = payload.get(family, {})
-        # NetworkManager prefers deprecated properties when sent, ignoring their replacements.
+        values = settings.get(family, {})
         for legacy, replacement in (
             ("addresses", "address-data"), ("routes", "route-data"), ("dns", "dns-data"),
         ):
             if replacement in values:
                 values.pop(legacy, None)
+
+
+async def _prepare_settings(settings: Settings, config: dict[str, object], advanced: list[dict[str, str]]) -> bool:
+    changed = _apply_wireguard_config(settings, config, advanced)
+    _normalize_ip_settings(settings)
+    remaining = []
+    # These fields already have validated, unambiguous D-Bus representations.
+    # In particular nmcli interprets even unprefixed firewall marks as hexadecimal.
+    for update in advanced:
+        key, value = update["key"], update["value"]
+        if key in DIRECT_PROPERTIES:
+            group, field = key.split(".")
+            settings[group][field] = _variant("u", int(value)) if key == "wireguard.fwmark" else _variant("s", value)
+            changed = True
+        elif key in OFFLINE_PROPERTIES:
+            remaining.append(update)
+        else:
+            raise NetworkManagerError("Unsupported advanced property. Use a listed non-secret NetworkManager property.")
+    if not remaining:
+        return changed
+    requested = {item["key"]: item["value"].strip() for item in remaining}
+    for family in ("ipv4", "ipv6"):
+        never = requested.get(f"{family}.never-default")
+        if requested.get(f"{family}.gateway") and never is not None and never.lower() not in (
+            "", "0", "no", "n", "false", "f", "off",
+        ):
+            raise NetworkManagerError(f"Cannot set {family}.gateway together with {family}.never-default enabled.")
     try:
-        arguments = _encode_bus_value("a{sa{sv}}", payload)
-    except (TypeError, ValueError) as error:
-        raise NetworkManagerError(f"Unable to encode connection settings: {error}") from error
-    await _busctl(path, NM_CONNECTION_INTERFACE, "Update", "a{sa{sv}}", *arguments)
+        # Decky adds py_modules to sys.path; a source checkout uses the namespace package.
+        try:
+            from nm_keyfile import KeyfileCodec
+        except ModuleNotFoundError:
+            from py_modules.nm_keyfile import KeyfileCodec
+        codec = KeyfileCodec()
+        blob = _dbus_message(1, 1, "/", NM_CONNECTION_INTERFACE, "Update", NM_SERVICE,
+                             "a{sa{sv}}", [settings])
+        keyfile = codec.to_keyfile(blob)
+        arguments = [arg for update in remaining for arg in (update["key"], update["value"])]
+        edited = await _command("nmcli", "--offline", "connection", "modify", *arguments,
+                                input_data=keyfile)
+
+        def decode(text: bytes) -> Settings:
+            message = codec.from_keyfile(blob, text)
+            header_size = struct.unpack_from("<I", message, 12)[0]
+            result = _DBusReader(message[(16 + header_size + 7) & ~7:]).value("a{sa{sv}}")
+            _normalize_ip_settings(result)
+            return result
+
+        before, after = decode(keyfile), decode(edited.encode("utf-8"))
+    except (AttributeError, OSError, TypeError, ValueError, struct.error) as error:
+        raise NetworkManagerError("Cannot convert advanced settings using the system libnm.") from error
+    # Apply only what nmcli changed. A keyfile round trip alone can discard
+    # unknown peer options, address attributes or settings from newer daemons.
+    allowed = {key.removesuffix(".routes") + ".route-data" if key.endswith(".routes") else key for key in requested}
+    for group in before.keys() | after.keys():
+        old, new = before.get(group, {}), after.get(group, {})
+        for field in old.keys() | new.keys():
+            if old.get(field) != new.get(field):
+                if f"{group}.{field}" not in allowed:
+                    raise NetworkManagerError(
+                        f"This edit would also change {group}.{field}. Change that property explicitly."
+                    )
+                if field in new:
+                    settings.setdefault(group, {})[field] = new[field]
+                else:
+                    settings.get(group, {}).pop(field, None)
+    _normalize_ip_settings(settings)
+    _validate_wireguard_settings(settings, [])
+    return True
+
+
+async def _nm_update(bus: _Bus, ref: ProfileRef, settings: Settings, revision: int) -> None:
+    try:
+        await bus.call(ref.path, NM_CONNECTION_INTERFACE, "Update2", "a{sa{sv}}ua{sv}",
+                       settings, NM_UPDATE_TO_DISK | NM_UPDATE_NO_REAPPLY,
+                       {"version-id": _variant("t", revision)}, destination=ref.owner)
+    except UnconfirmedWrite:
+        if not await _matches_persisted_profile(settings, expected=ref):
+            raise
+
+
+async def _matches_persisted_profile(intended: Settings, expected: ProfileRef | None = None) -> bool:
+    # Only turn a lost acknowledgement into success with positive evidence.
+    # NetworkManager may normalize defaults; uncertain is safer than a false match.
+    try:
+        async with _system_bus() as bus:
+            ref = await _nm_profile_ref(bus, intended["connection"]["uuid"]["data"])
+            if expected is not None and ref != expected:
+                return False
+            revision, actual = await _nm_snapshot(bus, ref)
+            _normalize_ip_settings(actual)
+            dirty = await bus.call(ref.path, "org.freedesktop.DBus.Properties", "Get", "ss",
+                                   NM_CONNECTION_INTERFACE, "Unsaved", destination=ref.owner)
+            return (actual == intended and dirty == [_variant("b", False)]
+                    and await _nm_revision(bus, ref) == revision)
+    except NetworkManagerError:
+        return False
 
 
 def _variant(kind: str, data: object) -> dict[str, object]:
@@ -638,9 +1156,7 @@ def _validate_wireguard_settings(
 
 
 def _validate_advanced_names(keys: list[str]) -> None:
-    guarded = STRUCTURED_PROPERTIES | IDENTITY_PROPERTIES | {
-        "connection.interface-name", "ipv4.method", "ipv6.method", "wireguard.fwmark",
-    }
+    guarded = STRUCTURED_PROPERTIES | IDENTITY_PROPERTIES | DIRECT_PROPERTIES
     for key in keys:
         if key in guarded:
             continue
@@ -652,6 +1168,8 @@ def _validate_advanced_names(keys: list[str]) -> None:
                 raise NetworkManagerError(
                     f"Use the full property name {full!r} instead of the abbreviation {key!r}."
                 )
+        if key not in OFFLINE_PROPERTIES:
+            raise NetworkManagerError("Unsupported advanced property. Use a listed non-secret NetworkManager property.")
 
 
 def _apply_wireguard_config(
@@ -921,6 +1439,8 @@ async def _send_probe(device: str, targets: list[ProbeTarget]) -> int:
 class Plugin:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
+        self._editor_snapshot: tuple[str, Settings] | None = None
+        self._editor_expiry: asyncio.TimerHandle | None = None
         self._active_paths: dict[str, str] = {}
         self._activations: dict[str, Activation] = {}
         self._pending_activations: dict[str, tuple[float, int]] = {}
@@ -1214,22 +1734,41 @@ class Plugin:
             if len(fields) != 2 or not fields[0].islower():
                 continue
             key, value = fields
-            if "." in key and key not in STRUCTURED_PROPERTIES | IDENTITY_PROPERTIES:
+            if key in DIRECT_PROPERTIES or key in OFFLINE_PROPERTIES:
                 properties.append({"key": key, "value": value})
         return properties
 
     async def get_connection_config(self, uuid: str) -> dict[str, object]:
         try:
-            async with self._lock:
+            async with self._lock, _system_bus() as bus:
                 profile = await self._profile(uuid)
-                _, settings = await _nm_connection(profile["uuid"])
+                ref = await _nm_profile_ref(bus, profile["uuid"])
+                revision, settings = await _nm_snapshot(bus, ref)
+                if (_data(settings.get("connection", {}), "uuid", None) != profile["uuid"]
+                        or _data(settings["connection"], "type", None) != "wireguard"):
+                    raise ProfileConflict("The WireGuard profile was replaced. Reload before editing.")
+                advanced = await self._advanced_properties(profile["uuid"])
+                if await _nm_revision(bus, ref) != revision:
+                    raise ProfileConflict("The profile changed while loading. Reload before editing.")
+                config = _wireguard_config(settings)
+                token = ref.revision_token(revision)
+                self._clear_editor_snapshot()
+                self._editor_snapshot = token, settings
+                self._editor_expiry = asyncio.get_running_loop().call_later(EDITOR_SNAPSHOT_TTL, self._clear_editor_snapshot)
                 return {
                     "success": True,
-                    "config": _wireguard_config(settings),
-                    "advanced": await self._advanced_properties(profile["uuid"]),
+                    "revision": token,
+                    "config": config,
+                    "advanced": advanced,
                 }
         except NetworkManagerError as error:
             return self._failure(error)
+
+    def _clear_editor_snapshot(self) -> None:
+        self._editor_snapshot = None
+        if self._editor_expiry is not None:
+            self._editor_expiry.cancel()
+            self._editor_expiry = None
 
     async def read_conf_file(self, path: str) -> dict[str, object]:
         try:
@@ -1238,18 +1777,19 @@ class Plugin:
                 or Path(path).suffix.lower() != ".conf"
             ):
                 raise NetworkManagerError("Select a WireGuard .conf file.")
-            # Nonblocking open also lets us reject pipes/devices without waiting on them.
-            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            with os.fdopen(descriptor, "rb") as source:
-                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                    raise NetworkManagerError("Select a regular .conf file.")
-                content = source.read(1024 * 1024 + 1)
-            if len(content) > 1024 * 1024:
-                raise NetworkManagerError("Configuration files must be at most 1 MiB.")
-            return {"success": True, "text": content.decode("utf-8-sig")}
+            uid = os.geteuid()
+            name = os.environ.get("DECKY_USER")
+            if not name and uid == 0:
+                raise NetworkManagerError("Cannot identify Decky's desktop user for this import.")
+            account = pwd.getpwnam(name) if name else pwd.getpwuid(uid)
+            if account.pw_uid == 0 or uid not in (0, account.pw_uid):
+                raise NetworkManagerError("Cannot import using the desktop user's privileges.")
+            helper = Path(__file__).resolve().parent / "py_modules" / "read_conf.py"
+            text = await _command("/usr/bin/python3", "-I", "-S", str(helper), path, desktop_user=account)
+            return {"success": True, "text": text}
         except NetworkManagerError as error:
             return self._failure(error)
-        except (OSError, UnicodeError, ValueError):
+        except (KeyError, OSError, UnicodeError, ValueError):
             # File contents, names and decoding errors can contain private keys.
             return self._failure(NetworkManagerError(
                 "Unable to import configuration. Select a readable UTF-8 .conf file "
@@ -1257,14 +1797,19 @@ class Plugin:
             ))
 
     async def create_connection_config(
-        self, config: dict[str, object], advanced: list[dict[str, str]],
+        self, config: dict[str, object], advanced: list[dict[str, str]], request_uuid: str | None = None,
     ) -> dict[str, object]:
-        return await self.set_connection_config(None, config, advanced)
+        return await self.set_connection_config(None, config, advanced, request_uuid=request_uuid)
 
     async def _create_connection_config(
-        self, config: dict[str, object], advanced: list[dict[str, str]],
+        self, config: dict[str, object], advanced: list[dict[str, str]], request_uuid: str | None,
     ) -> dict[str, object]:
-        uuid = str(uuid4())
+        uuid = str(uuid4()) if request_uuid is None else request_uuid
+        try:
+            if not isinstance(uuid, str) or str(UUID(uuid)) != uuid or UUID(uuid).version != 4:
+                raise ValueError
+        except ValueError:
+            raise NetworkManagerError("Invalid UUID for the new profile.") from None
         settings = {
             "connection": {
                 "id": _variant("s", ""), "uuid": _variant("s", uuid),
@@ -1274,35 +1819,24 @@ class Plugin:
             "ipv4": {"method": _variant("s", "disabled")},
             "ipv6": {"method": _variant("s", "disabled")},
         }
-        _apply_wireguard_config(settings, config, advanced)
-        reply = await _busctl(
-            NM_SETTINGS_PATH, "org.freedesktop.NetworkManager.Settings", "AddConnectionUnsaved",
-            "a{sa{sv}}", *_encode_bus_value("a{sa{sv}}", settings),
-        )
-        path = reply[0] if len(reply) == 1 else None
-        if not isinstance(path, str) or not path.startswith("/"):
-            raise NetworkManagerError("NetworkManager returned an unexpected connection path.")
+        await _prepare_settings(settings, config, advanced)
         try:
-            if advanced:
-                arguments = ["connection", "modify", "--temporary", "uuid", uuid]
-                for update in advanced:
-                    arguments.extend((update["key"], update["value"]))
-                await _nmcli(*arguments)
-                _, settings = await _nm_connection(uuid)
-            await _nm_update(path, settings)
-        except (NetworkManagerError, asyncio.CancelledError):
-            try:
-                await _busctl(path, NM_CONNECTION_INTERFACE, "Delete")
-            except NetworkManagerError as cleanup:
-                raise NetworkManagerError(
-                    "Saving failed and the new profile could not be removed. "
-                    "Refresh the connection list before retrying."
-                ) from cleanup
-            raise
+            reply = await _dbus_call(
+                NM_SETTINGS_PATH, "org.freedesktop.NetworkManager.Settings", "AddConnection",
+                "a{sa{sv}}", settings,
+            )
+            if len(reply) != 1 or not isinstance(reply[0], str) or not reply[0].startswith("/"):
+                raise UnconfirmedWrite("Unexpected reply to profile creation.")
+        except (DuplicateUuid, UnconfirmedWrite) as failure:
+            if not await _matches_persisted_profile(settings):
+                if isinstance(failure, DuplicateUuid):
+                    return {**self._failure(failure), "code": "uuid_exists", "uuid": uuid}
+                raise NetworkManagerError("Creation was not confirmed. Retry this draft or check the connection list.") from failure
         return {"success": True, "uuid": uuid}
 
     async def set_connection_config(
         self, uuid: str | None, config: dict[str, object], advanced: list[dict[str, str]],
+        revision: str | None = None, request_uuid: str | None = None,
     ) -> dict[str, object]:
         if not _config_input(config):
             return self._failure(NetworkManagerError("Invalid WireGuard configuration."))
@@ -1355,22 +1889,24 @@ class Plugin:
             ]
             async with self._lock:
                 if uuid is None:
-                    return await self._create_connection_config(config, advanced)
-                profile = await self._profile(uuid)
-                path, settings = await _nm_connection(profile["uuid"])
-                # Validate before nmcli so invalid fields cannot leave a partial save.
-                changed = _apply_wireguard_config(settings, config, advanced)
-                if advanced:
-                    arguments = ["connection", "modify", "uuid", profile["uuid"]]
-                    for update in advanced:
-                        arguments.extend((update["key"], update["value"]))
-                    await _nmcli(*arguments)
-                    if changed:
-                        path, settings = await _nm_connection(profile["uuid"])
-                        changed = _apply_wireguard_config(settings, config)
-                if changed:
-                    await _nm_update(path, settings)
+                    return await self._create_connection_config(config, advanced, request_uuid)
+                if not isinstance(revision, str) or not revision:
+                    raise NetworkManagerError("A loaded profile revision is required. Reload before saving.")
+                snapshot = self._editor_snapshot
+                if snapshot is None or snapshot[0] != revision:
+                    raise ProfileConflict("The edit snapshot is no longer current. Reload before saving.")
+                async with _system_bus() as bus:
+                    profile = await self._profile(uuid)
+                    ref = await _nm_profile_ref(bus, profile["uuid"])
+                    current = await _nm_revision(bus, ref)
+                    if revision != ref.revision_token(current):
+                        raise ProfileConflict("The profile changed outside this editor. Reload before saving.")
+                    settings = copy.deepcopy(snapshot[1])
+                    if await _prepare_settings(settings, config, advanced):
+                        await _nm_update(bus, ref, settings, current)
                 return {"success": True}
+        except (ProfileConflict, UnconfirmedWrite) as error:
+            return {**self._failure(error), "code": "reload_required"}
         except NetworkManagerError as error:
             return self._failure(error)
 
@@ -1821,6 +2357,7 @@ class Plugin:
             self._startup_waiting.clear()
 
     async def _unload(self) -> None:
+        self._clear_editor_snapshot()
         if self._startup_task is not None:
             self._startup_task.cancel()
             try:

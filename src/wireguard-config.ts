@@ -153,6 +153,30 @@ export function draftChanged(draft: EditorDraft, saved: EditorDraft): boolean {
       (property.isNew && property.key.trim() !== "") || property.value !== property.originalValue);
 }
 
+/** Replay only local edits onto a fresh snapshot; never overwrite an overlapping external edit. */
+export function rebaseDraft(base: EditorDraft, local: EditorDraft, fresh: EditorDraft): EditorDraft {
+  const config = { ...fresh.config };
+  const copy = <K extends keyof EditorDraft["config"]>(key: K) => {
+    const previous = JSON.stringify(base.config[key]);
+    const edited = JSON.stringify(local.config[key]);
+    const latest = JSON.stringify(fresh.config[key]);
+    if (edited === previous || latest === edited) return;
+    if (latest !== previous) throw new Error(`Both copies changed ${key}. Your draft was kept.`);
+    config[key] = local.config[key];
+  };
+  for (const key of ["name", "private_key", "addresses", "dns", "mtu", "listen_port", "peers"] as const) copy(key);
+  const advanced = fresh.advanced.map((p) => ({ ...p }));
+  for (const { key, value } of fromDraft(local).advanced) {
+    const previous = base.advanced.find((p) => p.key === key);
+    const latest = advanced.find((p) => p.key === key);
+    if (latest?.value === value) continue;
+    if (latest?.value !== previous?.value) throw new Error(`Both copies changed ${key}. Your draft was kept.`);
+    if (latest) latest.value = value;
+    else advanced.push({ key, value, originalValue: "", isNew: true, id: key });
+  }
+  return { config, advanced };
+}
+
 export function advancedSettingLabel(key: string): string {
   const acronyms: Record<string, string> = {
     ipv4: "IPv4", ipv6: "IPv6", dns: "DNS", mtu: "MTU", uuid: "UUID", id: "ID",

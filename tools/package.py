@@ -3,20 +3,29 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
-root = Path(__file__).resolve().parents[1]
-version = json.loads((root / "package.json").read_text())["version"]
-files = ["plugin.json", "package.json", "main.py", "dist/index.js", "README.md"]
-files.extend(
-    path.relative_to(root).as_posix()
-    for path in sorted((root / "docs").rglob("*.md"))
+FILES = (
+    "plugin.json", "package.json", "main.py", "py_modules/nm_keyfile.py", "py_modules/read_conf.py", "dist/index.js",
+    "README.md", "docs/configuration.md", "docs/development.md", "docs/how-it-works.md",
+    "docs/troubleshooting.md",
 )
-for name in files:
-    if not (root / name).is_file():
-        raise SystemExit(f"Missing package file: {name}. Run npm run build first.")
 
-output = root / "out" / f"decky-wireguard-{version}.zip"
-output.parent.mkdir(exist_ok=True)
-with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
-    for name in files:
-        archive.write(root / name, f"decky-wireguard/{name}")
-print(output)
+
+def build(root: Path) -> Path:
+    for name in FILES:
+        path = root / name
+        if path.resolve() != path:
+            raise SystemExit(f"Refusing to package a symlink: {name}")
+        if not path.is_file():
+            raise SystemExit(f"Missing package file: {name}. Run npm run build first.")
+
+    version = json.loads((root / "package.json").read_text())["version"]
+    output = root / "out" / f"decky-wireguard-{version}.zip"
+    output.parent.mkdir(exist_ok=True)
+    with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
+        for name in FILES:
+            archive.write(root / name, f"decky-wireguard/{name}")
+    return output
+
+
+if __name__ == "__main__":
+    print(build(Path(__file__).resolve().parents[1]))

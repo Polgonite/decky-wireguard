@@ -29,7 +29,8 @@ function deferred() {
 }
 
 function page(draft = saved, backend = () => assert.fail("Unexpected backend call"), options = {}) {
-  const hooks = [draft, options.saved === undefined ? saved : options.saved];
+  const baseline = options.saved === undefined ? saved : options.saved;
+  const hooks = [draft, baseline && { draft: baseline, revision: "existing-snapshot" }];
   const effects = [];
   const modals = [];
   const openedPanels = [];
@@ -37,6 +38,7 @@ function page(draft = saved, backend = () => assert.fail("Unexpected backend cal
   let navigations = 0;
   const element = (type, props) => ({ type, props });
   const context = {
+    crypto: require("node:crypto").webcrypto,
     exports: {},
     require: (name) => {
       if (name === "@decky/api") return {
@@ -104,6 +106,9 @@ function page(draft = saved, backend = () => assert.fail("Unexpected backend cal
       back: () => find(tree, "ButtonItem").props.onClick(),
       backDisabled: find(tree, "ButtonItem").props.disabled,
       save: () => find(tree, "ButtonItem", (node) => node.props.children === "Save").props.onClick(),
+      saveDisabled: find(tree, "ButtonItem", (node) => node.props.children === "Save")?.props.disabled,
+      retryReload: () => find(tree, "ButtonItem", (node) => node.props.children === "Retry reload").props.onClick(),
+      click: (label) => find(tree, "ButtonItem", (node) => node.props.children === label).props.onClick(),
       importFile: () => find(tree, "ButtonItem", (node) => node.props.children === "Import .conf file").props.onClick(),
       draft: find(tree, "ConnectionEditor")?.props.draft,
       allowAdvanced: find(tree, "ConnectionEditor")?.props.allowAdvanced,
@@ -191,7 +196,7 @@ for (const input of ["back", "cancel"]) {
     assert.equal(editor.modals.length, 0);
     assert.equal(editor.render().backDisabled, true);
 
-    reload.resolve({ success: true, config: draft.config, advanced: [] });
+    reload.resolve({ success: true, config: draft.config, advanced: [], revision: "saved-snapshot" });
     await flush();
     assert.equal(editor.render().backDisabled, false);
     editor.render()[input]();
@@ -237,7 +242,7 @@ test("import browses folders and only updates the draft until Save is pressed", 
     if (route === "read_conf_file") return { success: true, text: "[Interface]\nPrivateKey = imported\n" };
     if (route === "set_connection_config") return { success: true };
     if (route === "get_profiles") return { success: true, profiles: [{ uuid: "test", state: "disconnected" }] };
-    if (route === "get_connection_config") return { success: true, config: saved.config, advanced: [] };
+    if (route === "get_connection_config") return { success: true, config: saved.config, advanced: [], revision: "import-snapshot" };
     assert.fail(`Unexpected call: ${route}`);
   }, {
     pick: async (type, _start, files, folders, _filter, extensions) => {
@@ -285,7 +290,7 @@ test("new connections start locally, create only on Save, and use the created UU
     if (route === "create_connection_config") return { success: true, uuid: "created" };
     if (route === "set_connection_config") return { success: true };
     if (route === "get_profiles") return { success: true, profiles: [{ uuid: "created", state: "disconnected" }] };
-    if (route === "get_connection_config") return { success: true, config: draft.config, advanced: [] };
+    if (route === "get_connection_config") return { success: true, config: draft.config, advanced: [], revision: "new-snapshot" };
     assert.fail(`Unexpected call: ${route}`);
   }, { uuid: "new", saved: null });
   await editor.mount();
@@ -300,7 +305,9 @@ test("new connections start locally, create only on Save, and use the created UU
   editor.render().save();
   await flush();
   assert.equal(calls.filter(([route]) => route === "create_connection_config").length, 1);
-  assert.equal(calls.find(([route]) => route === "set_connection_config")[1], "created");
+  const update = calls.find(([route]) => route === "set_connection_config");
+  assert.equal(update[1], "created");
+  assert.equal(update[4], "new-snapshot");
   editor.render().back();
   assert.deepEqual(editor.openedPanels, [{ tab: 999, uuid: "created" }]);
 });
@@ -311,6 +318,124 @@ test("an untouched new connection can be closed without creating a profile", asy
   editor.render().back();
   assert.equal(editor.modals.length, 0);
   assert.deepEqual(editor.openedPanels, [{ tab: 999, uuid: null }]);
+});
+
+test("after creation a failed reload keeps the draft and only retries the read", async () => {
+  const calls = [];
+  const draft = { ...saved, config: { ...saved.config, name: "Created" } };
+  let available = false;
+  const editor = page(null, (route, ...args) => {
+    calls.push([route, ...args]);
+    if (route === "create_connection_config") return { success: true, uuid: "created" };
+    if (route === "get_profiles") return { success: true, profiles: [] };
+    if (route === "get_connection_config") return available
+      ? { success: true, config: draft.config, advanced: [], revision: "fresh-snapshot" }
+      : { success: false, error: "temporarily unavailable" };
+    if (route === "set_connection_config") return { success: true };
+    assert.fail(`Unexpected call: ${route}`);
+  }, { uuid: "new", saved: null });
+  await editor.mount();
+  editor.render().change(draft);
+  editor.render().save();
+  await flush();
+  const locked = editor.render();
+  assert.equal(locked.draft, draft);
+  assert.ok(locked.saveDisabled);
+  assert.ok(locked.messages.some((text) => text.includes("Saved, but")));
+  locked.save();
+  assert.ok(!calls.some(([route]) => route === "set_connection_config"));
+  available = true;
+  locked.retryReload();
+  await flush();
+  assert.deepEqual(calls.map(([route]) => route),
+    ["create_connection_config", "get_profiles", "get_connection_config", "get_connection_config"]);
+  editor.render().change({ ...draft, config: { ...draft.config, name: "Changed" } });
+  editor.render().save();
+  await flush();
+  assert.equal(calls.find(([route]) => route === "set_connection_config")[4], "fresh-snapshot");
+});
+
+test("retrying a new draft after a lost reply uses the same creation UUID", async () => {
+  const ids = [];
+  const editor = page(null, (route, _config, _advanced, id) => {
+    assert.equal(route, "create_connection_config");
+    ids.push(id);
+    throw new Error("Lost reply");
+  }, { uuid: "new", saved: null });
+  await editor.mount();
+  editor.render().change({ ...saved, config: { ...saved.config, name: "New" } });
+  editor.render().save();
+  await flush();
+  editor.render().save();
+  await flush();
+  assert.match(ids[0], /^[a-f0-9-]{36}$/);
+  assert.deepEqual(ids, [ids[0], ids[0]]);
+});
+
+test("a stale save reloads non-overlapping edits without writing until Save is pressed", async () => {
+  const writes = [];
+  const local = { ...saved, config: { ...saved.config, name: "My edit" } };
+  const fresh = { ...saved.config, mtu: "1400" };
+  const editor = page(local, (route, uuid, ...args) => {
+    if (route === "get_connection_config") return { success: true, config: fresh, advanced: [], revision: "fresh" };
+    if (route === "set_connection_config") {
+      writes.push(args);
+      return { success: false, code: "reload_required", error: "Profile changed" };
+    }
+    assert.fail(`Unexpected backend call: ${route}`);
+  });
+  editor.render().save();
+  await flush();
+  assert.equal(editor.render().saveDisabled, true);
+  editor.render().click("Reload and keep my edits");
+  await flush();
+  assert.equal(writes.length, 1);
+  assert.equal(editor.render().draft.config.mtu, fresh.mtu);
+  assert.equal(editor.render().draft.config.name, "My edit");
+  editor.render().save();
+  await flush();
+  assert.equal(writes[1][2], "fresh");
+});
+
+test("an overlapping external change keeps the draft until discard is confirmed", async () => {
+  const local = { ...saved, config: { ...saved.config, name: "My edit" } };
+  const editor = page(local, (route) => {
+    if (route === "set_connection_config") return { success: false, code: "reload_required", error: "Profile changed" };
+    return { success: true, config: { ...saved.config, name: "External edit" }, advanced: [], revision: "fresh" };
+  });
+  editor.render().save();
+  await flush();
+  editor.render().click("Reload and keep my edits");
+  await flush();
+  assert.equal(editor.render().draft.config.name, "My edit");
+  assert.ok(editor.render().messages.some((text) => text.includes("Both copies changed name")));
+  editor.render().click("Discard edits and reload");
+  assert.equal(editor.render().draft.config.name, "My edit");
+  editor.modals.at(-1).props.onOK();
+  await flush();
+  assert.equal(editor.render().draft.config.name, "External edit");
+  assert.equal(editor.render().saveDisabled, true);
+});
+
+test("an unverified UUID collision only opens the saved profile after confirmation", async () => {
+  const calls = [];
+  const editor = page(null, (route, ...args) => {
+    calls.push(route);
+    if (route === "create_connection_config") return { success: false, code: "uuid_exists", error: "Already exists", uuid: args[2] };
+    if (route === "get_connection_config") return { success: true, config: saved.config, advanced: [], revision: "existing" };
+    assert.fail(`Unexpected backend call: ${route}`);
+  }, { uuid: "new", saved: null });
+  await editor.mount();
+  editor.render().change({ ...saved, config: { ...saved.config, name: "Unsaved" } });
+  editor.render().save();
+  await flush();
+  editor.render().click("Open existing profile");
+  assert.deepEqual(calls, ["create_connection_config"]);
+  editor.modals.at(-1).props.onOK();
+  await flush();
+  assert.deepEqual(calls, ["create_connection_config", "get_connection_config"]);
+  assert.equal(editor.render().draft.config.name, saved.config.name);
+  assert.equal(editor.render().saveDisabled, true);
 });
 
 test("the editor receives the current advanced settings preference", () => {

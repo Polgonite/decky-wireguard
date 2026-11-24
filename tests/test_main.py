@@ -3,27 +3,43 @@ import base64
 import copy
 import json
 import os
+import shutil
 import socket
 import struct
 import tempfile
 import unittest
+from contextlib import asynccontextmanager
 from ipaddress import ip_address
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from main import (
     DIAGNOSTIC_LOG,
+    DuplicateUuid,
     NetworkManagerError,
+    UnconfirmedWrite,
+    NM_SETTINGS_PATH,
     Plugin,
+    ProfileRef,
     ProbeTarget,
-    _encode_bus_value,
+    _Bus,
+    _DBusReader,
+    _command,
+    _dbus_call,
+    _dbus_message,
+    _dbus_read_message,
     _handshakes,
     _nmcli,
+    _nm_profile_ref,
+    _nm_update,
     _probe_targets,
     _received_bytes,
     _send_probe,
     _split_signature,
+    _system_bus_address,
+    _system_bus,
     _transfer_counters,
+    _verify_bus_peer,
 )
 
 HOME = "11111111-1111-4111-8111-111111111111"
@@ -1163,9 +1179,16 @@ PEER = wg_key(1)
 PRIVATE = wg_key(2)
 PSK = wg_key(3)
 CONNECTION_PATH = "/org/freedesktop/NetworkManager/Settings/7"
-BUS_PREFIX = (
-    "--system", "--json=short", "--timeout=10", "--", "call", "org.freedesktop.NetworkManager",
-)
+REF = ProfileRef(":1.77", CONNECTION_PATH, "a" * 32)
+REVISION = REF.revision_token(42)
+
+
+def bus_writer(uid=0):
+    writer = Mock()
+    writer.get_extra_info.return_value.getsockopt.return_value = struct.pack("iII", 123, uid, 42)
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+    return writer
 
 
 class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
@@ -1191,6 +1214,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                 "addresses": v("aau", [[ipv4_dns("10.0.0.2"), 32, 0]]),
                 "address-data": v("aa{sv}", [{"address": v("s", "10.0.0.2"), "prefix": v("u", 32)}]),
                 "dns": v("au", [ipv4_dns("10.0.0.1")]), "dns-search": v("as", []),
+                "dns-priority": v("i", 0),
                 "routes": v("aau", []), "route-data": v("aa{sv}", [{
                     "dest": v("s", "192.168.50.0"), "prefix": v("u", 24), "table": v("u", 51820),
                 }]),
@@ -1207,33 +1231,60 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         }}
         self.updates = []
         self.calls = []
+        self.nmcli_calls = []
+        self.revision = 42
+        self.secret_bump = 0
+        self.bus_id = REF.bus_id
 
         async def command(executable, *arguments, **kwargs):
-            self.assertEqual(executable, "busctl")
-            self.assertEqual(arguments[:6], BUS_PREFIX)
-            path, interface, method, *rest = arguments[6:]
-            self.calls.append(method)
+            if executable == "nmcli":
+                self.assertEqual(arguments[:3], ("--offline", "connection", "modify"))
+                self.assertNotIn(PRIVATE, arguments)
+                self.assertNotIn(PSK, arguments)
+                self.calls.append("offline modify")
+                return await _command(executable, *arguments, **kwargs)
+            self.fail(f"Unexpected process: {executable}")
+
+        async def dbus_call(path, interface, method, signature="", *values, destination):
+            if method == "GetId":
+                self.assertEqual(destination, "org.freedesktop.DBus")
+                return [self.bus_id]
+            if method == "GetNameOwner":
+                self.assertEqual((destination, values), ("org.freedesktop.DBus", ("org.freedesktop.NetworkManager",)))
+                return [REF.owner]
+            self.assertEqual(destination, REF.owner)
             if method == "GetConnectionByUuid":
-                self.assertEqual((path, rest), ("/org/freedesktop/NetworkManager/Settings", ["s", HOME]))
-                return json.dumps({"type": "o", "data": [CONNECTION_PATH]})
-            self.assertEqual(
-                (path, interface), (CONNECTION_PATH, "org.freedesktop.NetworkManager.Settings.Connection"),
-            )
-            if method == "GetSettings":
-                self.assertEqual(rest, [""])
-                return json.dumps({"type": "a{sa{sv}}", "data": [self.settings]})
-            if method == "GetSecrets":
-                self.assertEqual(rest, ["s", "wireguard"])
-                return json.dumps({"type": "a{sa{sv}}", "data": [self.secrets]})
-            if method == "Update":
-                self.assertEqual(rest[0], "a{sa{sv}}")
-                tokens = rest[1:]
-                self.updates.append(decode_bus("a{sa{sv}}", tokens))
-                self.assertEqual(tokens, [])
-                return ""
-            self.fail(f"Unexpected D-Bus call: {method}")
+                self.calls.append(method)
+                self.assertEqual((path, signature, values), (NM_SETTINGS_PATH, "s", (HOME,)))
+                return [CONNECTION_PATH]
+            if method in ("GetSettings", "GetSecrets"):
+                self.calls.append(method)
+                self.assertEqual(path, REF.path)
+                if method == "GetSecrets":
+                    self.assertEqual((signature, values), ("s", ("wireguard",)))
+                    self.revision += self.secret_bump
+                    return [copy.deepcopy(self.secrets)]
+                return [copy.deepcopy(self.settings)]
+            if method == "Get":
+                self.assertEqual((path, interface, signature, values), (
+                    CONNECTION_PATH, "org.freedesktop.DBus.Properties", "ss",
+                    ("org.freedesktop.NetworkManager.Settings.Connection", "VersionId"),
+                ))
+                self.calls.append("Get VersionId")
+                return [v("t", self.revision)]
+            self.assertEqual((path, interface), (
+                CONNECTION_PATH, "org.freedesktop.NetworkManager.Settings.Connection",
+            ))
+            self.assertEqual(signature, "a{sa{sv}}ua{sv}")
+            self.calls.append(method)
+            self.assertEqual(values[1:], (0x41, {"version-id": v("t", self.revision)}))
+            if method == "Update2":
+                self.updates.append(copy.deepcopy(values[0]))
+                return [{}]
+            self.fail(f"Unexpected direct D-Bus call: {method}")
 
         async def nmcli(*arguments, **kwargs):
+            self.nmcli_calls.append(arguments)
             if arguments == FIELDS:
                 return f"{HOME}:wireguard:Home:::\n"
             if arguments == ("--fields", "all", "connection", "show", "uuid", HOME):
@@ -1246,11 +1297,15 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                     "wireguard.fwmark:0x0\n"
                     "ipv4.dns-priority:0\n"
                 )
-            if arguments[:2] == ("connection", "modify"):
-                self.calls.append("nmcli modify")
-                return ""
             self.fail(f"Unexpected nmcli call: {arguments}")
 
+        self.bus = Mock(call=AsyncMock(side_effect=dbus_call))
+
+        @asynccontextmanager
+        async def system_bus():
+            yield self.bus
+
+        self.enterContext(patch("main._system_bus", system_bus))
         for target, side_effect in (("main._command", command), ("main._nmcli", nmcli)):
             patcher = patch(target, new_callable=AsyncMock, side_effect=side_effect)
             patcher.start()
@@ -1265,6 +1320,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         result = await self.plugin.get_connection_config(HOME)
         self.assertEqual(result, {
             "success": True,
+            "revision": REVISION,
             "config": {
                 "name": "Home", "private_key": PRIVATE, "addresses": "10.0.0.2/32",
                 "dns": "10.0.0.1", "mtu": "1420", "listen_port": "",
@@ -1281,11 +1337,75 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
             ],
         })
 
+    async def test_creation_and_update_transmit_keys_only_in_dbus_payload(self):
+        settings = copy.deepcopy(self.settings)
+        settings["wireguard"]["private-key"] = v("s", PRIVATE)
+        settings["wireguard"]["peers"]["data"][0]["preshared-key"] = v("s", PSK)
+        streams = []
+        for index in range(2):
+            reader = asyncio.StreamReader()
+            reader.feed_data(
+                b"OK test-guid\r\n"
+                + _dbus_message(2, 42, signature="s", values=[":1.1"], reply_serial=1)
+                + (
+                    _dbus_message(2, 43, signature="s", values=[REF.bus_id], reply_serial=2)
+                    + _dbus_message(2, 44, signature="s", values=[REF.owner], reply_serial=3)
+                    + _dbus_message(2, 45, signature="o", values=[REF.path], reply_serial=4)
+                    + _dbus_message(2, 46, signature="a{sv}", values=[{}], reply_serial=5)
+                    if index == 0 else
+                    _dbus_message(2, 43, signature="o", values=[CONNECTION_PATH], reply_serial=2)
+                )
+            )
+            reader.feed_eof()
+            writer = bus_writer()
+            streams.append((reader, writer))
+        with (
+            patch("main._system_bus", new=_system_bus),
+            patch("main.asyncio.open_unix_connection", new_callable=AsyncMock,
+                  side_effect=streams),
+            patch("main.asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
+        ):
+            async with _system_bus() as bus:
+                ref = await _nm_profile_ref(bus, HOME)
+                self.assertEqual(ref, REF)
+                await _nm_update(bus, ref, settings, 42)
+            self.assertEqual(await _dbus_call(
+                NM_SETTINGS_PATH, "org.freedesktop.NetworkManager.Settings",
+                "AddConnection", "a{sa{sv}}", settings,
+            ), [CONNECTION_PATH])
+
+        for expected_method, (_, writer) in zip(("Update2", "AddConnection"), streams):
+            request = writer.write.call_args_list[-1].args[0]
+            incoming = asyncio.StreamReader()
+            incoming.feed_data(request)
+            incoming.feed_eof()
+            message_type, _, fields, body = await _dbus_read_message(incoming)
+            self.assertEqual(message_type, 1)
+            self.assertEqual(fields[3], expected_method)
+            self.assertEqual(fields[6], REF.owner if expected_method == "Update2" else "org.freedesktop.NetworkManager")
+            self.assertEqual(fields[8], "a{sa{sv}}ua{sv}" if expected_method == "Update2" else "a{sa{sv}}")
+            decoded = _DBusReader(body).value("a{sa{sv}}")
+            self.assertEqual(decoded["wireguard"]["private-key"], v("s", PRIVATE))
+            self.assertEqual(
+                decoded["wireguard"]["peers"]["data"][0]["preshared-key"], v("s", PSK),
+            )
+        spawn.assert_not_awaited()
+
     async def test_unchanged_config_does_not_update_networkmanager(self):
         self.assertEqual(
-            await self.plugin.set_connection_config(HOME, await self.config(), []), {"success": True},
+            await self.plugin.set_connection_config(HOME, await self.config(), [], REVISION), {"success": True},
         )
-        self.assertNotIn("Update", self.calls)
+        self.assertNotIn("Update2", self.calls)
+
+    async def test_structured_update_preserves_unchanged_private_and_preshared_keys(self):
+        config = await self.config()
+        config["name"] = "Home VPN"
+        result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
+        self.assertEqual(result, {"success": True})
+        self.assertEqual(self.updates[0]["wireguard"]["private-key"], v("s", PRIVATE))
+        self.assertEqual(
+            self.updates[0]["wireguard"]["peers"]["data"][0]["preshared-key"], v("s", PSK),
+        )
 
     async def test_update_rewrites_changed_fields_and_preserves_everything_else(self):
         original = copy.deepcopy(self.settings)
@@ -1299,7 +1419,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
             "original_public_key": None, "public_key": wg_key(5), "preshared_key": "",
             "allowed_ips": "10.1.0.5/16", "endpoint": "", "persistent_keepalive": "off",
         })
-        self.assertEqual(await self.plugin.set_connection_config(HOME, config, []), {"success": True})
+        self.assertEqual(await self.plugin.set_connection_config(HOME, config, [], REVISION), {"success": True})
         [update] = self.updates
         self.assertEqual(update["connection"], {
             **original["connection"], "id": v("s", "Home VPN"),
@@ -1323,6 +1443,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
             "method": v("s", "manual"),
             "address-data": v("aa{sv}", [{"address": v("s", "10.0.0.3"), "prefix": v("u", 24)}]),
             "dns": v("au", [ipv4_dns("10.0.0.1")]), "dns-search": v("as", ["home.lan"]),
+            "dns-priority": original["ipv4"]["dns-priority"],
             "route-data": original["ipv4"]["route-data"],
         })
         self.assertEqual(update["ipv6"], {
@@ -1336,7 +1457,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         config = await self.config()
         self.assertEqual(config["dns"], "10.0.0.1#dns.example")
         config["dns"] = "10.0.0.53"
-        await self.plugin.set_connection_config(HOME, config, [])
+        await self.plugin.set_connection_config(HOME, config, [], REVISION)
         self.assertEqual(self.updates[0]["ipv4"]["dns-data"], v("as", ["10.0.0.53"]))
         self.assertNotIn("dns", self.updates[0]["ipv4"])
 
@@ -1344,7 +1465,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         config = await self.config()
         config.update({"addresses": "", "dns": ""})
         config["peers"][0]["preshared_key"] = ""
-        await self.plugin.set_connection_config(HOME, config, [])
+        await self.plugin.set_connection_config(HOME, config, [], REVISION)
         update = self.updates[0]
         self.assertEqual(update["ipv4"]["method"], v("s", "disabled"))
         self.assertNotIn("preshared-key", update["wireguard"]["peers"]["data"][0])
@@ -1362,25 +1483,136 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         config = await self.config()
         self.assertEqual(config["dns"], "10.0.0.1, corp.example")
         config["addresses"] = "10.0.0.2/32"
-        self.assertEqual(await self.plugin.set_connection_config(HOME, config, []), {"success": True})
+        self.assertEqual(await self.plugin.set_connection_config(HOME, config, [], REVISION), {"success": True})
         update = self.updates[0]
         self.assertEqual(update["ipv6"]["method"], v("s", "disabled"))
         self.assertEqual(update["ipv6"]["dns-search"], v("as", []))
         self.assertEqual(update["ipv4"]["dns-search"], v("as", ["corp.example"]))
         self.assertEqual(update["ipv4"]["dns"], v("au", [ipv4_dns("10.0.0.1")]))
 
-    async def test_advanced_properties_apply_before_rereading_for_the_structured_update(self):
+    @unittest.skipUnless(shutil.which("nmcli"), "Offline conversion requires NetworkManager")
+    async def test_advanced_and_structured_changes_are_persisted_in_one_update(self):
         config = await self.config()
         config["mtu"] = ""
         self.calls.clear()
         self.assertEqual(await self.plugin.set_connection_config(
-            HOME, config, [{"key": "ipv4.dns-priority", "value": "-50"}],
+            HOME, config, [{"key": "ipv4.dns-priority", "value": "-50"}], REVISION,
         ), {"success": True})
         self.assertEqual(self.calls, [
-            "GetConnectionByUuid", "GetSettings", "GetSecrets", "nmcli modify",
-            "GetConnectionByUuid", "GetSettings", "GetSecrets", "Update",
+            "GetConnectionByUuid", "Get VersionId", "offline modify", "Update2",
         ])
+        self.assertEqual(len(self.updates), 1)
+        self.assertEqual(self.updates[0]["ipv4"]["dns-priority"], v("i", -50))
         self.assertEqual(self.updates[0]["wireguard"]["mtu"], v("u", 0))
+        self.assertEqual(self.updates[0]["ipv4"]["route-data"], self.settings["ipv4"]["route-data"])
+        self.assertNotIn("routes", self.updates[0]["ipv4"])
+        self.assertIn("future-option", self.updates[0]["wireguard"]["peers"]["data"][0])
+
+    async def test_setting_manual_method_and_first_address_is_one_valid_edit(self):
+        self.settings["ipv6"]["method"] = v("s", "disabled")
+        config = await self.config()
+        config["addresses"] += ", fd00::1/64"
+        result = await self.plugin.set_connection_config(
+            HOME, config, [{"key": "ipv6.method", "value": "manual"}], REVISION,
+        )
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self.updates[0]["ipv6"]["method"], v("s", "manual"))
+        self.assertEqual(self.updates[0]["ipv6"]["address-data"]["data"][0]["prefix"], v("u", 64))
+
+    @unittest.skipUnless(shutil.which("nmcli"), "Offline conversion requires NetworkManager")
+    async def test_last_address_gateway_and_routes_can_be_removed_together(self):
+        self.settings["ipv4"]["gateway"] = v("s", "10.0.0.1")
+        config = {**await self.config(), "addresses": "", "dns": ""}
+        result = await self.plugin.set_connection_config(HOME, config, [
+            {"key": "ipv4.gateway", "value": ""}, {"key": "ipv4.routes", "value": ""},
+        ], REVISION)
+        self.assertTrue(result["success"], result)
+        [updated] = self.updates
+        self.assertEqual(updated["ipv4"]["method"], v("s", "disabled"))
+        self.assertNotIn("gateway", updated["ipv4"])
+        self.assertFalse(updated["ipv4"].get("route-data", v("aa{sv}", []))["data"])
+
+    async def test_uncertain_rejected_or_cancelled_update_never_writes_rollback(self):
+        config = {**await self.config(), "name": "Changed"}
+        for error in (UnconfirmedWrite("Reload before retrying"), NetworkManagerError("Rejected"),
+                      asyncio.CancelledError()):
+            with self.subTest(error=error), patch("main._nm_update", side_effect=error) as update:
+                if isinstance(error, asyncio.CancelledError):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await self.plugin.set_connection_config(HOME, config, [], REVISION)
+                else:
+                    with self.assertLogs("decky-wireguard"):
+                        result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
+                    self.assertFalse(result["success"])
+                update.assert_awaited_once()
+                self.assertEqual(update.await_args.args[3], self.revision)
+                self.assertFalse(self.updates)
+
+    async def test_stale_editor_revision_is_rejected_before_writing(self):
+        config = {**await self.config(), "name": "Changed"}
+        for token in (None, REF.revision_token(41), ProfileRef(":1.66", REF.path, REF.bus_id).revision_token(42),
+                      ProfileRef(REF.owner, REF.path + "1", REF.bus_id).revision_token(42)):
+            with self.subTest(token=token), self.assertLogs("decky-wireguard"):
+                result = await self.plugin.set_connection_config(HOME, config, [], token)
+                self.assertIn("Reload before saving", result["error"])
+                self.assertFalse(self.updates)
+
+    async def test_secret_refresh_version_is_the_save_baseline_and_secrets_are_not_reread(self):
+        self.secret_bump = 1
+        loaded = await self.plugin.get_connection_config(HOME)
+        self.assertEqual(loaded["revision"], REF.revision_token(43))
+        config = {**loaded["config"], "name": "New name"}
+        self.assertEqual(await self.plugin.set_connection_config(HOME, config, [], loaded["revision"]), {"success": True})
+        self.assertEqual(self.calls.count("GetSecrets"), 1)
+        self.assertEqual(self.updates[0]["wireguard"]["private-key"], v("s", PRIVATE))
+        self.revision += 1
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.set_connection_config(HOME, config, [], loaded["revision"])
+        self.assertEqual(result["code"], "reload_required")
+        self.assertEqual(len(self.updates), 1)
+
+    async def test_extra_version_change_during_secret_read_prevents_opening_editor(self):
+        self.secret_bump = 2
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.get_connection_config(HOME)
+        self.assertFalse(result["success"])
+        self.assertIsNone(self.plugin._editor_snapshot)
+
+    async def test_restarted_bus_reusing_owner_path_and_version_cannot_receive_update(self):
+        config = {**await self.config(), "name": "New name"}
+        self.bus_id = "b" * 32
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
+        self.assertEqual(result["code"], "reload_required")
+        self.assertNotIn("Update2", self.calls)
+
+    @unittest.skipUnless(shutil.which("nmcli"), "Offline conversion requires NetworkManager")
+    async def test_gateway_edits_cannot_silently_change_default_route_policy(self):
+        self.settings["ipv4"]["never-default"] = v("b", True)
+        config = await self.config()
+        gateway = {"key": "ipv4.gateway", "value": "10.0.0.1"}
+        never = {"key": "ipv4.never-default", "value": "yes"}
+        for edits in ([gateway], [never, gateway], [gateway, never]):
+            with self.subTest(edits=edits), self.assertLogs("decky-wireguard"):
+                result = await self.plugin.set_connection_config(HOME, config, edits, REVISION)
+            self.assertFalse(result["success"])
+            self.assertIn("never-default", result["error"])
+        self.assertFalse(self.updates)
+        result = await self.plugin.set_connection_config(
+            HOME, config, [gateway, {**never, "value": "no"}], REVISION,
+        )
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self.updates[0]["ipv4"]["gateway"], v("s", "10.0.0.1"))
+
+    @unittest.skipUnless(shutil.which("nmcli"), "Offline conversion requires NetworkManager")
+    async def test_invalid_offline_property_never_mutates_the_profile(self):
+        config = await self.config()
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.set_connection_config(
+                HOME, config, [{"key": "ipv4.dns-priority", "value": "invalid"}], REVISION,
+            )
+        self.assertFalse(result["success"])
+        self.assertFalse(self.updates)
 
     async def test_invalid_changes_are_rejected_before_anything_is_saved(self):
         cases = [
@@ -1407,27 +1639,29 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                 self.calls.clear()
                 with self.assertLogs("decky-wireguard"):
                     result = await self.plugin.set_connection_config(
-                        HOME, config, [{"key": "ipv4.dns-priority", "value": "1"}],
+                        HOME, config, [{"key": "ipv4.dns-priority", "value": "1"}], REVISION,
                     )
                 self.assertFalse(result["success"])
                 self.assertIn(message, result["error"])
                 self.assertNotIn("nmcli modify", self.calls)
-                self.assertNotIn("Update", self.calls)
+                self.assertNotIn("Update2", self.calls)
 
     async def test_advanced_properties_cannot_bypass_structured_or_startup_fields(self):
         config = await self.config()
         for key, message in [
             ("connection.autoconnect", "managed by the startup controls"),
             ("wireguard.peers", "edited in the WireGuard fields"),
+            ("vpn.secrets", "Unsupported advanced property"),
             ("--help", "Invalid or duplicate"),
         ]:
             with self.subTest(key=key), self.assertLogs("decky-wireguard"):
                 result = await self.plugin.set_connection_config(
-                    HOME, config, [{"key": key, "value": "x"}],
+                    HOME, config, [{"key": key, "value": "x"}], REVISION,
                 )
                 self.assertFalse(result["success"])
                 self.assertIn(message, result["error"])
         self.assertNotIn("nmcli modify", self.calls)
+        self.assertNotIn("offline modify", self.calls)
 
     async def test_create_saves_keys_and_peers_without_autoconnect_or_activation(self):
         config = await self.config()
@@ -1436,20 +1670,17 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         created = {}
         methods = []
 
-        async def bus(path, interface, method, signature="", *arguments):
+        async def bus(path, interface, method, signature="", *values):
             methods.append(method)
-            if method == "AddConnectionUnsaved":
-                created.update(decode_bus(signature, list(arguments)))
+            if method == "AddConnection":
+                created.update(values[0])
                 return [CONNECTION_PATH]
-            if method == "Update":
-                self.assertEqual(decode_bus(signature, list(arguments)), created)
-                return []
             self.fail(f"Unexpected method: {method}")
 
-        with patch("main._busctl", side_effect=bus), patch("main._nmcli") as nmcli:
+        with patch("main._dbus_call", side_effect=bus), patch("main._nmcli") as nmcli:
             result = await self.plugin.create_connection_config(config, [])
         self.assertTrue(result["success"], result)
-        self.assertEqual(methods, ["AddConnectionUnsaved", "Update"])
+        self.assertEqual(methods, ["AddConnection"])
         self.assertEqual(created["connection"]["uuid"], v("s", result["uuid"]))
         self.assertEqual(created["connection"]["id"], v("s", "Home"))
         self.assertEqual(created["connection"]["type"], v("s", "wireguard"))
@@ -1463,72 +1694,53 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("preshared-key", peer)
         nmcli.assert_not_called()
 
-    async def test_new_profile_advanced_properties_are_temporary_until_saved(self):
-        config = await self.config()
-        config["peers"] = []
-        created = {}
-        methods = []
+    async def test_timed_out_dbus_request_is_an_unconfirmed_write(self):
+        reader = asyncio.StreamReader()
+        writer = Mock(write=Mock(), drain=AsyncMock())
+        with patch("main.DBUS_TIMEOUT", 0.01), self.assertRaises(UnconfirmedWrite):
+            await _Bus(reader, writer).call("/", "org.example", "Update2")
 
-        async def bus(path, interface, method, signature="", *arguments):
-            methods.append(method)
-            if method == "AddConnectionUnsaved":
-                created.update(decode_bus(signature, list(arguments)))
-                return [CONNECTION_PATH]
-            if method == "Update":
-                stored = decode_bus(signature, list(arguments))
-                self.assertEqual(stored["ipv4"]["dns-priority"], v("i", -50))
-                self.assertEqual(stored["wireguard"]["private-key"], v("s", PRIVATE))
-                return []
-            self.fail(f"Unexpected method: {method}")
+    async def test_lost_create_reply_reconciles_the_draft_uuid_without_deleting(self):
+        config = {**await self.config(), "peers": []}
+        with (patch("main._dbus_call", side_effect=UnconfirmedWrite("No reply")) as add,
+              patch("main._matches_persisted_profile", return_value=False) as verify,
+              self.assertLogs("decky-wireguard")):
+            result = await self.plugin.create_connection_config(config, [], WORK)
+        self.assertIn("not confirmed", result["error"])
+        self.assertEqual(verify.await_args.args[0]["connection"]["uuid"], v("s", WORK))
+        add.assert_awaited_once()
+        self.assertEqual(add.await_args.args[4]["connection"]["uuid"], v("s", WORK))
 
-        async def modify(*arguments):
-            self.assertEqual(arguments, (
-                "connection", "modify", "--temporary", "uuid",
-                created["connection"]["uuid"]["data"], "ipv4.dns-priority", "-50",
-            ))
-            created["ipv4"]["dns-priority"] = v("i", -50)
-
-        with (
-            patch("main._busctl", side_effect=bus),
-            patch("main._nmcli", side_effect=modify),
-            patch("main._nm_connection", return_value=(CONNECTION_PATH, created)) as reload,
+    async def test_lost_update_reply_confirms_only_matching_persisted_settings(self):
+        intended = {"connection": {"id": v("s", "Changed"), "uuid": v("s", HOME)}}
+        for actual, dirty, version, confirmed in (
+            (intended, False, 43, True), (intended, True, 43, False),
+            ({}, False, 43, False), (intended, False, 44, False),
         ):
-            result = await self.plugin.create_connection_config(
-                config, [{"key": "ipv4.dns-priority", "value": "-50"}],
-            )
-        self.assertTrue(result["success"], result)
-        reload.assert_awaited_once_with(result["uuid"])
-        self.assertEqual(methods, ["AddConnectionUnsaved", "Update"])
+            with (self.subTest(dirty=dirty, version=version, actual=actual),
+                  patch("main._nm_snapshot", return_value=(43, actual)),
+                  patch("main._nm_profile_ref", return_value=REF),
+                  patch("main._nm_revision", return_value=version),
+                  patch.object(self.bus, "call", side_effect=[UnconfirmedWrite("No reply"),
+                                                             [v("b", dirty)]]) as bus):
+                if confirmed:
+                    await _nm_update(self.bus, REF, intended, 42)
+                else:
+                    with self.assertRaises(UnconfirmedWrite):
+                        await _nm_update(self.bus, REF, intended, 42)
+                self.assertEqual([call.args[2] for call in bus.await_args_list], ["Update2", "Get"])
 
-    async def test_failed_creation_removes_the_unsaved_profile(self):
-        config = await self.config()
-        config["peers"] = []
-        for failure in ("advanced", "save"):
-            methods = []
-
-            async def bus(path, interface, method, *arguments, methods=methods):
-                methods.append(method)
-                if method == "AddConnectionUnsaved":
-                    return [CONNECTION_PATH]
-                if method == "Update":
-                    raise NetworkManagerError("Could not save")
-                if method == "Delete":
-                    return []
-                self.fail(f"Unexpected method: {method}")
-
-            with (
-                self.subTest(failure=failure),
-                patch("main._busctl", side_effect=bus),
-                patch("main._nmcli", side_effect=NetworkManagerError("Invalid advanced value")),
-                self.assertLogs("decky-wireguard"),
-            ):
-                result = await self.plugin.create_connection_config(
-                    config, [{"key": "ipv4.dns-priority", "value": "invalid"}]
-                    if failure == "advanced" else [],
-                )
-            self.assertFalse(result["success"])
-            self.assertEqual(methods[0], "AddConnectionUnsaved")
-            self.assertEqual(methods[-1], "Delete")
+    async def test_duplicate_create_only_succeeds_on_a_verified_match(self):
+        config = {**await self.config(), "peers": []}
+        with (patch("main._dbus_call", side_effect=DuplicateUuid("Already exists")) as add,
+              patch("main._matches_persisted_profile", side_effect=[True, False])):
+            first = await self.plugin.create_connection_config(config, [], WORK)
+            with self.assertLogs("decky-wireguard"):
+                second = await self.plugin.create_connection_config(config, [], WORK)
+        self.assertEqual(first, {"success": True, "uuid": WORK})
+        self.assertEqual((second["success"], second["code"], second["uuid"]), (False, "uuid_exists", WORK))
+        self.assertEqual([call.args[2] for call in add.await_args_list], ["AddConnection", "AddConnection"])
+        self.assertFalse(self.updates)
 
     async def test_invalid_new_profiles_are_rejected_before_creation(self):
         config = await self.config()
@@ -1542,7 +1754,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         ]:
             with (
                 self.subTest(changes=changes, advanced=advanced),
-                patch("main._busctl") as bus,
+                patch("main._dbus_call") as bus,
                 self.assertLogs("decky-wireguard"),
             ):
                 result = await self.plugin.create_connection_config({**config, **changes}, advanced)
@@ -1575,13 +1787,13 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                 self.calls.clear()
                 with self.assertLogs("decky-wireguard"):
                     result = await self.plugin.set_connection_config(
-                        HOME, config, [{"key": "ipv4.dns-priority", "value": "-50"}],
+                        HOME, config, [{"key": "ipv4.dns-priority", "value": "-50"}], REVISION,
                     )
                 self.assertFalse(result["success"])
                 self.assertIn(message, result["error"])
                 self.assertNotIn(noncanonical, result["error"])
                 self.assertNotIn("nmcli modify", self.calls)
-                self.assertNotIn("Update", self.calls)
+                self.assertNotIn("Update2", self.calls)
 
     async def test_incompatible_advanced_settings_are_rejected_before_any_write(self):
         config = await self.config()
@@ -1617,12 +1829,12 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                 self.calls.clear()
                 with self.assertLogs("decky-wireguard"):
                     result = await self.plugin.set_connection_config(
-                        HOME, config, [{"key": key, "value": value}],
+                        HOME, config, [{"key": key, "value": value}], REVISION,
                     )
                 self.assertFalse(result["success"])
                 self.assertIn(message, result["error"])
                 self.assertNotIn("nmcli modify", self.calls)
-                self.assertNotIn("Update", self.calls)
+                self.assertNotIn("Update2", self.calls)
 
     async def test_format_failures_block_both_creating_and_updating_profiles(self):
         valid = await self.config()
@@ -1655,13 +1867,13 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                     config = {**valid, **changes, "peers": [{**valid["peers"][0], **peer_changes}]}
                     self.calls.clear()
                     with self.assertLogs("decky-wireguard"):
-                        result = await self.plugin.set_connection_config(uuid, config, [])
+                        result = await self.plugin.set_connection_config(uuid, config, [], REVISION if uuid else None)
                     self.assertFalse(result["success"])
                     self.assertIn(message, result["error"])
                     self.assertNotIn("secret-but-not-a-key", result["error"])
-                    self.assertNotIn("AddConnectionUnsaved", self.calls)
+                    self.assertNotIn("AddConnection", self.calls)
                     self.assertNotIn("nmcli modify", self.calls)
-                    self.assertNotIn("Update", self.calls)
+                    self.assertNotIn("Update2", self.calls)
 
     async def test_valid_boundaries_and_server_style_optional_omissions_are_accepted(self):
         valid = await self.config()
@@ -1674,7 +1886,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                         "preshared_key": "", "persistent_keepalive": keepalive,
                     }],
                 }
-                result = await self.plugin.set_connection_config(HOME, config, [])
+                result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
                 self.assertTrue(result["success"], result)
                 update = self.updates[-1]
                 self.assertEqual(update["wireguard"]["listen-port"], v("u", int(port)))
@@ -1684,7 +1896,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(peer["allowed-ips"], v("as", []))
                 self.assertNotIn("endpoint", peer)
         result = await self.plugin.set_connection_config(
-            HOME, {**valid, "addresses": "", "dns": "", "peers": []}, [],
+            HOME, {**valid, "addresses": "", "dns": "", "peers": []}, [], REVISION,
         )
         self.assertTrue(result["success"], result)
 
@@ -1703,22 +1915,21 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         ]:
             with (
                 self.subTest(key=key, value=value),
-                patch("main._nmcli") as nmcli,
                 patch.object(self.plugin, "_profile", return_value={"uuid": HOME}),
             ):
                 result = await self.plugin.set_connection_config(
-                    HOME, config, [{"key": key, "value": value}],
+                    HOME, config, [{"key": key, "value": value}], REVISION,
                 )
                 self.assertTrue(result["success"], result)
-                nmcli.assert_awaited_once_with(
-                    "connection", "modify", "uuid", HOME, key, normalized,
-                )
+                group, field = key.split(".")
+                value = self.updates[-1][group].get(field, {"data": 0})["data"]
+                self.assertEqual(str(value), normalized)
 
     async def test_existing_dns_over_tls_settings_remain_editable(self):
         self.settings["ipv4"]["dns-data"] = v("as", ["10.0.0.1#dns.example"])
         config = await self.config()
         config["name"] = "Renamed"
-        result = await self.plugin.set_connection_config(HOME, config, [])
+        result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
         self.assertTrue(result["success"], result)
         self.assertEqual(self.updates[-1]["ipv4"]["dns-data"], v("as", ["10.0.0.1#dns.example"]))
         self.assertNotIn("dns", self.updates[-1]["ipv4"])
@@ -1729,7 +1940,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
             "addresses": "10.0.0.2/0, fd00::2/0, fd00::3/128",
             "dns": "10.0.0.1, ~., ~example.com, .",
         })
-        result = await self.plugin.set_connection_config(HOME, config, [])
+        result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
         self.assertTrue(result["success"], result)
         self.assertEqual(self.updates[-1]["ipv4"]["dns-search"], v("as", [
             "~.", "~example.com", ".",
@@ -1746,38 +1957,47 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
             "name": "Private VPN \u0394", "private_key": PRIVATE, "addresses": "",
             "dns": "", "listen_port": "", "mtu": "", "peers": [],
         }
-        with patch("main._busctl", side_effect=[[CONNECTION_PATH], []]) as bus:
+        with patch("main._dbus_call", side_effect=[[CONNECTION_PATH], []]) as bus:
             result = await self.plugin.create_connection_config(config, [])
         self.assertTrue(result["success"], result)
         added = bus.await_args_list[0].args
-        self.assertEqual(added[2], "AddConnectionUnsaved")
-        settings = decode_bus(added[3], list(added[4:]))
+        self.assertEqual(added[2], "AddConnection")
+        settings = added[4]
         self.assertEqual(settings["connection"]["id"], v("s", config["name"]))
         self.assertEqual(settings["wireguard"]["private-key"], v("s", PRIVATE))
         self.assertEqual(settings["ipv4"]["method"], v("s", "disabled"))
         self.assertEqual(settings["ipv6"]["method"], v("s", "disabled"))
-        self.assertEqual(bus.await_args_list[1].args[2], "Update")
-
-    def test_bus_encoding_uses_busctl_container_syntax(self):
-        self.assertEqual(
-            _encode_bus_value("a{sv}", {"on": v("b", True), "pair": v("(su)", ["-x", 7])}),
-            ["2", "on", "b", "true", "pair", "(su)", "-x", "7"],
-        )
-        for signature, value in [("as", "text"), ("v", {"type": "su", "data": 1}), ("u", True)]:
-            with self.subTest(signature=signature), self.assertRaises((TypeError, ValueError)):
-                _encode_bus_value(signature, value)
-
+        bus.assert_awaited_once()
 
 class ConfFileTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipIf(os.geteuid() == 0, "This fixture is owned by the user running the suite")
     async def test_read_only_import_returns_utf8_contents_without_networkmanager_calls(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "vpn.conf"
             path.write_text("\ufeff[Interface]\nPrivateKey = test\n", encoding="utf-8")
-            with patch("main._command") as command, patch("main._nmcli") as nmcli:
+            with patch("main._nmcli") as nmcli:
                 result = await Plugin().read_conf_file(str(path))
             self.assertEqual(result, {"success": True, "text": "[Interface]\nPrivateKey = test\n"})
-            command.assert_not_called()
             nmcli.assert_not_called()
+
+    async def test_root_import_requires_a_non_root_desktop_identity_and_drops_all_credentials(self):
+        account = Mock(pw_name="desktop", pw_uid=1001, pw_gid=1002)
+        proc = Mock(returncode=0, communicate=AsyncMock(return_value=(b"fixture", b"")))
+        with (patch("main.os.geteuid", return_value=0),
+              patch.dict(os.environ, {"DECKY_USER": ""}),
+              patch("main.pwd.getpwnam", return_value=account),
+              patch("main.os.getgrouplist", return_value=[1002, 1003]),
+              patch("main.asyncio.create_subprocess_exec", return_value=proc) as spawn):
+            with self.assertLogs("decky-wireguard"):
+                self.assertFalse((await Plugin().read_conf_file("/example.conf"))["success"])
+            with patch.dict(os.environ, {"DECKY_USER": "root"}), patch.object(account, "pw_uid", 0), self.assertLogs("decky-wireguard"):
+                self.assertFalse((await Plugin().read_conf_file("/example.conf"))["success"])
+            spawn.assert_not_awaited()
+            with patch.dict(os.environ, {"DECKY_USER": "desktop"}):
+                self.assertEqual(await Plugin().read_conf_file("/example.conf"), {"success": True, "text": "fixture"})
+            kwargs = spawn.await_args.kwargs
+            self.assertEqual((kwargs["user"], kwargs["group"], kwargs["extra_groups"]), (1001, 1002, [1002, 1003]))
+            self.assertEqual(spawn.await_args.args[:3], ("/usr/bin/python3", "-I", "-S"))
 
     async def test_import_rejects_missing_nonregular_oversized_and_non_utf8_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1939,6 +2159,94 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SubprocessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_untrusted_bus_peer_is_rejected_before_any_bytes_are_sent(self):
+        writer = bus_writer(2000)
+        with (patch("main.asyncio.open_unix_connection", return_value=(AsyncMock(), writer)),
+              patch("main.pwd.getpwnam", return_value=Mock(pw_uid=81)),
+              self.assertRaisesRegex(NetworkManagerError, "trusted bus service")):
+            await _dbus_call(NM_SETTINGS_PATH, "org.freedesktop.NetworkManager.Settings", "AddConnection")
+        writer.write.assert_not_called()
+        writer.transport.abort.assert_called_once()
+        with patch("main.pwd.getpwnam", return_value=Mock(pw_uid=81)):
+            _verify_bus_peer(bus_writer(81))
+
+    def test_system_bus_address_never_falls_back_to_another_socket(self):
+        for address, expected in [
+            ("unix:path=/tmp/test%20bus", (b"/tmp/test bus", None)),
+            ("unix:abstract=test,guid=" + "a" * 32, (b"\0test", "a" * 32)),
+        ]:
+            with self.subTest(address=address), patch.dict(os.environ, {"DBUS_SYSTEM_BUS_ADDRESS": address}):
+                self.assertEqual(_system_bus_address(), expected)
+        for address in ("tcp:host=test", "unix:path=/one;unix:path=/two", "unix:path=relative",
+                        "unix:path=/a,path=/b", "unix:path=/tmp/%00", "unix:path=/bad%zz"):
+            with (self.subTest(address=address), patch.dict(os.environ, {"DBUS_SYSTEM_BUS_ADDRESS": address}),
+                  self.assertRaises(NetworkManagerError)):
+                _system_bus_address()
+
+    async def test_dbus_error_reports_message_without_echoing_secrets(self):
+        secret = "sensitive-private-key-value"
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            b"OK test-guid\r\n"
+            + _dbus_message(2, 42, signature="s", values=[":1.1"], reply_serial=1)
+            + _dbus_message(
+                3, 43, signature="s",
+                values=[f"Invalid wireguard.private-key: {secret}"],
+                reply_serial=2, error_name="org.freedesktop.NetworkManager.Error.InvalidProperty",
+            )
+        )
+        reader.feed_eof()
+        writer = bus_writer()
+        with patch(
+            "main.asyncio.open_unix_connection", new_callable=AsyncMock,
+            return_value=(reader, writer),
+        ):
+            with self.assertRaises(NetworkManagerError) as caught:
+                await _dbus_call(
+                    CONNECTION_PATH, "org.freedesktop.NetworkManager.Settings.Connection",
+                    "Update", "a{sa{sv}}",
+                    {"wireguard": {"private-key": v("s", secret)}},
+                )
+        self.assertIn("Invalid wireguard.private-key", str(caught.exception))
+        self.assertIn("org.freedesktop.NetworkManager.Error.InvalidProperty", str(caught.exception))
+        self.assertNotIn(secret, str(caught.exception))
+
+    async def test_dbus_call_cancellation_closes_its_socket(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"OK test-guid\r\n")
+        hello_sent = asyncio.Event()
+        writer = bus_writer()
+        writes = []
+        drains = 0
+
+        def write(data):
+            writes.append(data)
+
+        async def drain():
+            nonlocal drains
+            drains += 1
+            if drains == 2:
+                hello_sent.set()
+
+        writer.write = write
+        writer.drain = drain
+        writer.wait_closed = AsyncMock()
+        with patch(
+            "main.asyncio.open_unix_connection", new_callable=AsyncMock,
+            return_value=(reader, writer),
+        ):
+            request = asyncio.create_task(_dbus_call(
+                CONNECTION_PATH, "org.freedesktop.NetworkManager.Settings.Connection",
+                "Update", "a{sa{sv}}", {},
+            ))
+            await hello_sent.wait()
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+        self.assertEqual(len(writes), 3)
+        writer.transport.abort.assert_called_once_with()
+        writer.wait_closed.assert_awaited_once()
+
     async def test_transfer_query_only_reads_counters_and_does_not_use_sent_bytes(self):
         with patch(
             "main._command", new_callable=AsyncMock, return_value="peer\t123\t999999\n",

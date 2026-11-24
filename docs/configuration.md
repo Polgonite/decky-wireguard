@@ -8,7 +8,8 @@ Decky. For status explanations and failure diagnosis, see
 
 The plugin lists native NetworkManager WireGuard profiles, including
 disconnected profiles. It does not show profiles managed only by `wg-quick`.
-NetworkManager, `nmcli`, and systemd's `busctl` must be available to the backend.
+Profile editing requires NetworkManager 1.44 or newer, its matching `nmcli` and
+`libnm`. Smart connect's internet check also uses systemd's `busctl`.
 Peer status and probing require `wg` from `wireguard-tools`.
 
 The plugin does not support connections that require interactive password
@@ -34,6 +35,18 @@ Peer options not shown by the editor are preserved when an existing peer is
 saved. Profile changes take effect the next time the tunnel connects; saving
 does not itself connect or disconnect it. Leaving with unsaved edits asks for
 confirmation. Back is unavailable while saving or reloading a saved profile.
+If a save succeeds but reloading fails, the editor keeps the draft visible.
+Select **Retry reload** to read the saved profile before editing again; this
+does not repeat the write. If another editor changes the profile, choose
+**Reload and keep my edits** to combine changes to different fields. If both
+copies changed the same field (including the peer list), the draft is kept
+and nothing is written. **Discard edits and reload** asks for confirmation.
+If a save
+times out, check the profile in the connection list before retrying: the
+complete change may already have reached disk. Retrying the same new draft
+reuses its UUID instead of creating a second profile. If the existing profile
+cannot be verified as an exact match, **Open existing profile** lets you
+inspect it after confirming that you want to discard the draft.
 
 ## Import a `.conf` file
 
@@ -52,7 +65,8 @@ The importer accepts `[Interface]` `PrivateKey`, `Address`, `DNS`, `MTU`,
 `PresharedKey`, `AllowedIPs`, `Endpoint`, and `PersistentKeepalive`. It rejects
 unsupported directives such as `Table` and `PostUp`, malformed input, and
 duplicate single-value fields without changing the draft. Files must be regular
-UTF-8 `.conf` files no larger than 1 MiB.
+UTF-8 `.conf` files no larger than 1 MiB and readable by the Decky desktop
+user. Import uses `/usr/bin/python3` as that user, not root.
 
 You can also import in NetworkManager's Desktop Mode editor or with:
 
@@ -93,9 +107,22 @@ of that family. Methods without static addressing cannot be combined with
 static addresses or DNS/search domains. DHCP/`auto` and `shared` are not
 supported. UUID, connection type, and `connection.autoconnect` are managed
 outside the raw advanced-property editor; use the startup controls for
-autoconnect. Use full property names for checked settings so abbreviations
-cannot bypass validation. NetworkManager validates other advanced property
-values itself.
+autoconnect. **Add property** accepts only the following full property names;
+other stored settings are left alone. Use NetworkManager's editor for unlisted
+properties. Do not enter credentials in these fields.
+
+| Setting | Editable properties |
+| --- | --- |
+| `connection` | `interface-name`, `zone`, `metered`, `autoconnect-priority` |
+| `wireguard` | `fwmark`, `peer-routes`, `ip4-auto-default-route`, `ip6-auto-default-route` |
+| `ipv4` and `ipv6` | `method`, `gateway`, `routes`, `routing-rules`, `route-table`, `route-metric`, `never-default`, `dns-priority`, `dns-options`, `ignore-auto-dns`, `ignore-auto-routes`, `may-fail` |
+| `ipv6` only | `addr-gen-mode`, `ip6-privacy` |
+
+For example, use `ipv4.dns-priority`. NetworkManager validates the completed
+profile, so related changes such as clearing the last address and its gateway
+can be saved together. A gateway cannot be combined with `never-default=yes`
+for the same IP family. If an edit would implicitly change another routing
+property, the editor rejects it; change both properties explicitly instead.
 
 These are local compatibility checks, not a connectivity test. They cannot
 verify that the remote peer has matching keys, accepts the chosen addresses, or

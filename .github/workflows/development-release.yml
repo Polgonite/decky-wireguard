@@ -32,7 +32,12 @@ jobs:
           uv run --locked npm ci
 
       - name: Run pre-commit checks
-        run: uv run --locked pre-commit run --all-files
+        run: |
+          if ! command -v nmcli >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends network-manager
+          fi
+          uv run --locked pre-commit run --all-files
 
   release:
     name: Build and publish development release
@@ -68,8 +73,13 @@ jobs:
           uv run --locked npm version "$version" --no-git-tag-version --ignore-scripts
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Run backend tests
-        run: uv run --locked npm test
+      - name: Run tests including offline NetworkManager conversion
+        run: |
+          if ! command -v nmcli >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends network-manager
+          fi
+          uv run --locked npm test
 
       - name: Build installable ZIP
         run: uv run --locked npm run package
@@ -81,19 +91,16 @@ jobs:
           uv run --locked python - <<'PY'
           import json
           import os
-          from pathlib import Path
           from zipfile import ZipFile
 
           version = os.environ["VERSION"]
           with ZipFile(f"out/decky-wireguard-{version}.zip") as archive:
               assert archive.testzip() is None, "Corrupt ZIP archive"
               expected = {
-                  "plugin.json", "package.json", "main.py", "dist/index.js", "README.md"
+                  "plugin.json", "package.json", "main.py", "dist/index.js", "README.md",
+                  "py_modules/nm_keyfile.py", "py_modules/read_conf.py", "docs/configuration.md", "docs/development.md",
+                  "docs/how-it-works.md", "docs/troubleshooting.md",
               }
-              expected.update(
-                  f"docs/{path.relative_to('docs').as_posix()}"
-                  for path in Path("docs").rglob("*.md")
-              )
               assert set(archive.namelist()) == {
                   f"decky-wireguard/{name}" for name in expected
               }, "Unexpected ZIP layout"

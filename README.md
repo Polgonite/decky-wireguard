@@ -40,12 +40,12 @@ directory without building it first.
 
 ## Get started
 
-Select an existing profile to connect it. To add one, select **Add connection**,
+Select an existing profile, then choose **Connect**. To add one, select **Add connection**,
 enter its settings or import a `.conf` file, then select **Save**. Importing
 fills the editor; it does not save or connect the profile automatically.
 
-Open **Edit configuration** to change a profile. **Settings** includes optional
-startup behavior and an updater for the latest installable release. See the
+Open **Edit configuration** to change a profile. On the same profile page,
+use **Connect during boot** or **Smart connect** to set its startup behavior. See the
 [configuration guide](docs/configuration.md) for detailed options and limits.
 
 Your NetworkManager profile controls routing and DNS. The plugin does not

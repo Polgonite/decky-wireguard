@@ -124,7 +124,7 @@ export function ConnectionEditor({ draft, onChange, disabled, allowAdvanced }: {
           <Heading>NetworkManager properties</Heading>
           <PanelSectionRow>
             <div style={{ fontSize: "0.85em", opacity: 0.8, padding: "8px 0" }}>
-              nmcli syntax; clear a value to reset it.
+              Only supported non-secret properties can be edited here. Use nmcli syntax; clear a value to reset it.
             </div>
           </PanelSectionRow>
           {draft.advanced.map((property) => (
