@@ -98,6 +98,13 @@ class LoggingSettings(TypedDict):
 
 class UISettings(TypedDict):
     show_advanced_settings: bool
+    include_prereleases: bool
+    auto_update_check: bool
+
+
+def _default_ui_settings() -> UISettings:
+    # Update checks contact GitHub, so they stay opt-in.
+    return {"show_advanced_settings": False, "include_prereleases": False, "auto_update_check": False}
 
 
 class Profile(TypedDict):
@@ -1652,17 +1659,30 @@ class Plugin:
             try:
                 settings = json.loads(self._settings_path("ui.json").read_text())
             except FileNotFoundError:
-                return {"success": True, "show_advanced_settings": False}
+                return {"success": True, **_default_ui_settings()}
+            # Files written before update preferences existed only contain the advanced flag.
             if not isinstance(settings, dict) or not isinstance(settings.get("show_advanced_settings"), bool):
                 raise ValueError("Invalid UI settings")
-            return {"success": True, "show_advanced_settings": settings["show_advanced_settings"]}
+            defaults = _default_ui_settings()
+            if any(not isinstance(settings.get(key, False), bool) for key in defaults):
+                raise ValueError("Invalid UI settings")
+            return {"success": True, **{key: settings.get(key, value) for key, value in defaults.items()}}
         except (OSError, ValueError, NetworkManagerError) as error:
             return self._failure(NetworkManagerError(f"Unable to read UI settings: {error}"))
 
-    async def set_ui_settings(self, show_advanced_settings: bool) -> dict[str, object]:
-        if not isinstance(show_advanced_settings, bool):
-            return self._failure(NetworkManagerError("Show advanced settings must be a boolean."))
-        settings: UISettings = {"show_advanced_settings": show_advanced_settings}
+    async def set_ui_settings(
+        self, show_advanced_settings: bool, include_prereleases: bool, auto_update_check: bool,
+    ) -> dict[str, object]:
+        if not all(
+            isinstance(value, bool)
+            for value in (show_advanced_settings, include_prereleases, auto_update_check)
+        ):
+            return self._failure(NetworkManagerError("UI settings must be booleans."))
+        settings: UISettings = {
+            "show_advanced_settings": show_advanced_settings,
+            "include_prereleases": include_prereleases,
+            "auto_update_check": auto_update_check,
+        }
         try:
             self._write_json(self._settings_path("ui.json"), settings, "UI")
         except NetworkManagerError as error:

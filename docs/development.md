@@ -42,32 +42,84 @@ These packages are not shipped in the plugin archive; avoid building untrusted
 source trees. `npm audit --omit=dev` reports no runtime dependency advisories
 for the committed lockfile at creation time.
 
-## Development releases
+## Branches and releases
 
-Every push to `main` runs `.github/workflows/development-release.yml`, which
-tests the backend, type-checks and builds the frontend, verifies the ZIP, then
-publishes it on the [GitHub Releases page](https://github.com/Polgonite/decky-wireguard/releases).
-All releases are marked **prerelease**, not stable or latest.
+Two long-lived branches produce two kinds of release. Both run
+`.github/workflows/release.yml` on every push, which tests the backend,
+type-checks and builds the frontend, verifies the ZIP, then publishes it on the
+[GitHub Releases page](https://github.com/Polgonite/decky-wireguard/releases).
+
+| Branch | Release | Version | Marked as |
+| --- | --- | --- | --- |
+| `main` | Stable | `package.json` as is, such as `0.2.0` | Latest release |
+| `dev` | Development build | `0.2.0-dev.<run>.<attempt>.sha<commit>` | **Pre-release**, never latest |
+
+Work happens on `dev`, which the maintainer can push to directly. `main` only
+receives pull requests from `dev`, so each merge into `main` publishes a stable
+release. Both branches are protected by GitHub rulesets, see
+[Branch protection](#branch-protection).
+
+### Versioning rules
+
+- `package.json` holds the next version, as plain `MAJOR.MINOR.PATCH`. Development
+  builds append `-dev.<run>.<attempt>.sha<commit>` (the workflow run ID, attempt
+  number, and short commit SHA) in the packaged `package.json` and ZIP filename.
+  Source versions are not committed back, and reruns create distinct releases
+  instead of overwriting assets.
+- A stable version is immutable. The workflow fails if tag `v<version>` already
+  exists or if the version is lower than the latest stable release. Bump the
+  version on `dev` before the next release; that also applies to `dev` right
+  after a stable release, because its development builds must sort above the
+  latest stable version to ever be offered to anyone.
+- SemVer 2.0 precedence applies: `0.2.0-dev.…` is older than `0.2.0`, and
+  development builds order by run ID, attempt, then commit.
+- Releases target the exact pushed commit.
+
+### Update channels
+
+The updater selects the highest eligible version, not the latest publication
+date, and never installs a version that is not newer than the installed one.
+
+- By default only the latest stable release is considered. It is found through
+  GitHub's `releases/latest`, so many development builds cannot hide it.
+- With **Development updates** enabled (advanced settings), the newest 100
+  releases are also considered, together with the latest stable release. A
+  stable release outranks the development builds of the same version.
+- Installations of a development build follow the same rules. Without the
+  opt-in they only move to a stable release that is newer than their own.
+- Automatic checks (**Check for updates automatically**, off by default) use
+  the same rules and only show a notification.
+- A missing SHA-256 digest, an invalid asset URL, a network error, or an installed
+  version that is not valid SemVer ends the check with a visible error. The
+  updater does not fall back to another build.
+
+### CI
 
 Both CI jobs use Ubuntu 24.04 runners to avoid automatic OS migrations.
 The checkout and setup actions use Node.js 24 internally; the project still
 builds with Node.js 22.
 
-Each build gets a version such as `0.1.0-dev.123456789.1.shaabcdef0`, containing
-the workflow run ID, attempt number, and short commit SHA. Reruns create distinct
-releases instead of overwriting previous assets. That version is embedded in the
-packaged `package.json` and ZIP filename; source versions are not committed back.
-Releases target the exact pushed commit. The pre-commit checks job uses the same
-locked uv environment as local development. It is currently disabled because
-checks run locally before pushing. To enforce checks on pull requests and pushes
-and block publication on failure, remove its `if: ${{ false }}` and uncomment
-`needs: checks` on the release job.
-Runs are not canceled or grouped by a
-concurrency limit, so each push can publish its own build after successful checks.
+The pre-commit checks job uses the same locked uv environment as local
+development. It is currently disabled because checks run locally before
+pushing. To enforce checks on pull requests and pushes and block publication
+on failure, remove its `if: ${{ false }}` and uncomment `needs: checks` on the
+release job. Runs on the same branch are queued by a concurrency group (never
+canceled), and each push publishes its own build after successful checks.
 
 The workflow uses the automatic `GITHUB_TOKEN` with `contents: write`; no
 additional secret is required. Repository or organization policies must allow
 GitHub Actions to create releases.
+
+### Branch protection
+
+Two repository rulesets (Settings → Rules) protect `main` and `dev`. Both
+require pull requests with one approval from a code owner (`.github/CODEOWNERS`
+names the maintainer), dismiss stale approvals, and block force pushes and
+deletion. The repository admin can bypass them: always on `dev`, so direct
+pushes work, but only through a pull request on `main`, so merging a `dev`
+pull request into `main` is possible without a second reviewer while direct
+pushes to `main` are rejected. No status checks are required while the CI
+checks job is disabled.
 
 ## Development environment and pre-commit
 

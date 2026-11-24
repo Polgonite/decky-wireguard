@@ -1,12 +1,17 @@
-name: Development release
+name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 permissions:
   contents: read
+
+# Serialize builds per branch so two pushes cannot race to publish the same version.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   checks:
@@ -40,7 +45,7 @@ jobs:
           uv run --locked pre-commit run --all-files
 
   release:
-    name: Build and publish development release
+    name: Build and publish ${{ github.ref_name == 'main' && 'stable' || 'development' }} release
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # Re-enable together with the checks job above.
@@ -64,14 +69,54 @@ jobs:
           uv sync --locked
           uv run --locked npm ci
 
-      - name: Assign unique development version
+      - name: Select version and release channel
         id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
         shell: bash
         run: |
-          base_version="$(uv run --locked node -p "require('./package.json').version.split('-')[0]")"
-          version="${base_version}-dev.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.sha${GITHUB_SHA:0:7}"
-          uv run --locked npm version "$version" --no-git-tag-version --ignore-scripts
+          package_version="$(uv run --locked node -p "require('./package.json').version")"
+          base_version="${package_version%%-*}"
+          if ! [[ "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::package.json version '${package_version}' must start with a plain MAJOR.MINOR.PATCH version."
+            exit 1
+          fi
+
+          # Stable releases are immutable and every later build must sort above the latest one,
+          # otherwise the updater (which never downgrades) would not offer it.
+          if [ "$(gh api "repos/${GH_REPO}/git/matching-refs/tags/v${base_version}" \
+              --jq "any(.[]; .ref == \"refs/tags/v${base_version}\")")" = "true" ]; then
+            echo "::error::Version ${base_version} is already released as v${base_version}. Bump the version in package.json."
+            exit 1
+          fi
+          if latest="$(gh api "repos/${GH_REPO}/releases/latest" --jq .tag_name 2>&1)"; then
+            latest="${latest#v}"
+            if [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+              [ "$(printf '%s\n%s\n' "$latest" "$base_version" | sort -V | tail -n1)" != "$base_version" ]; then
+              echo "::error::Version ${base_version} is older than the latest stable release ${latest}. Bump the version in package.json."
+              exit 1
+            fi
+          elif [[ "$latest" != *"HTTP 404"* ]]; then
+            echo "::error::Could not look up the latest stable release: ${latest}"
+            exit 1
+          fi
+
+          if [ "$BRANCH" = main ]; then
+            if [ "$package_version" != "$base_version" ]; then
+              echo "::error::Stable releases from main need a plain MAJOR.MINOR.PATCH version, not '${package_version}'."
+              exit 1
+            fi
+            version="$base_version"
+            channel=stable
+          else
+            version="${base_version}-dev.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.sha${GITHUB_SHA:0:7}"
+            channel=development
+            uv run --locked npm version "$version" --no-git-tag-version --ignore-scripts
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
       - name: Run tests including offline NetworkManager conversion
         run: |
@@ -109,7 +154,24 @@ jobs:
               assert archive.getinfo("decky-wireguard/dist/index.js").file_size > 0
           PY
 
+      - name: Publish stable release
+        if: steps.version.outputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          gh release create "v${VERSION}" \
+            "out/decky-wireguard-${VERSION}.zip" \
+            --target "$GITHUB_SHA" \
+            --title "WireGuard ${VERSION}" \
+            --notes "Stable release built from commit ${GITHUB_SHA}. Install the attached ZIP through Decky Loader, or update from the plugin's settings. Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --generate-notes \
+            --latest
+
       - name: Publish development prerelease
+        if: steps.version.outputs.channel == 'development'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

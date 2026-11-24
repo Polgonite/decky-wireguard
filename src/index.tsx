@@ -8,7 +8,7 @@ import { FaChevronRight, FaShieldAlt } from "react-icons/fa";
 import { CONFIG_ROUTE, ConfigPage, configPath } from "./config-page";
 import { useSelectedConnection } from "./plugin-navigation";
 import { loadUISettings, saveUISettings, useUISettings } from "./ui-settings";
-import { UpdateButton } from "./updater";
+import { UpdateButton, startUpdateMonitor } from "./updater";
 
 type ConnectionState = "connected" | "connecting" | "disconnecting" | "disconnected" | "unknown";
 type HandshakeState = "inactive" | "waiting" | "established" | "timeout" | "unknown";
@@ -450,13 +450,13 @@ function Content() {
               description="Show advanced editor options and Smart connect wait controls."
               checked={uiSettings.showAdvanced}
               disabled={!uiSettings.loaded || uiSettings.saving}
-              onChange={(checked) => void saveUISettings(checked)}
+              onChange={(checked) => void saveUISettings({ showAdvanced: checked })}
             />
           </PanelSectionRow>
           {uiSettings.error && (
             <PanelSectionRow>
               <div role="alert" style={{ color: "#ffb5b5", overflowWrap: "anywhere", padding: "8px 0" }}>
-                Advanced settings: {uiSettings.error}
+                Settings: {uiSettings.error}
               </div>
             </PanelSectionRow>
           )}
@@ -468,6 +468,26 @@ function Content() {
             </PanelSectionRow>
           )}
           <LoggingControls onChange={() => void refresh()} />
+          <PanelSectionRow>
+            <ToggleField
+              label="Check for updates automatically"
+              description="Show a notification when a new release is available. Contacts GitHub shortly after the plugin loads and twice a day."
+              checked={uiSettings.autoUpdateCheck}
+              disabled={!uiSettings.loaded || uiSettings.saving}
+              onChange={(checked) => void saveUISettings({ autoUpdateCheck: checked })}
+            />
+          </PanelSectionRow>
+          {uiSettings.showAdvanced && (
+            <PanelSectionRow>
+              <ToggleField
+                label="Development updates"
+                description="Also offer pre-release development builds. They may be unstable. Updates never downgrade."
+                checked={uiSettings.includePrereleases}
+                disabled={!uiSettings.loaded || uiSettings.saving}
+                onChange={(checked) => void saveUISettings({ includePrereleases: checked })}
+              />
+            </PanelSectionRow>
+          )}
           <UpdateButton />
         </PanelSection>
       </Focusable>
@@ -759,6 +779,7 @@ function Content() {
 
 export default definePlugin(() => {
   const stopMonitoring = monitorSteamReadiness();
+  const stopUpdateMonitor = startUpdateMonitor();
   routerHook.addRoute(CONFIG_ROUTE, ConfigPage, { exact: true });
   return {
     name: "WireGuard",
@@ -768,6 +789,7 @@ export default definePlugin(() => {
     onDismount: () => {
       routerHook.removeRoute(CONFIG_ROUTE);
       stopMonitoring();
+      stopUpdateMonitor();
     },
   };
 });

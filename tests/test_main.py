@@ -60,6 +60,8 @@ def settings_directory(test, *additional_variables):
 
 
 class UISettingsTests(unittest.IsolatedAsyncioTestCase):
+    DEFAULTS = {"show_advanced_settings": False, "include_prereleases": False, "auto_update_check": False}
+
     async def asyncSetUp(self):
         self.directory = settings_directory(self)
         self.path = self.directory / "ui.json"
@@ -68,26 +70,33 @@ class UISettingsTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_and_persistence_across_plugin_instances(self):
         startup = self.directory / "startup.json"
         startup.write_text('{"after_boot": [], "last_boot_id": null, "requirements": {}}')
-        self.assertEqual(await self.plugin.get_ui_settings(), {
-            "success": True, "show_advanced_settings": False,
-        })
+        self.assertEqual(await self.plugin.get_ui_settings(), {"success": True, **self.DEFAULTS})
         self.assertFalse(self.path.exists())
 
-        for enabled in (True, False):
-            with self.subTest(enabled=enabled):
-                self.assertEqual(await self.plugin.set_ui_settings(enabled), {
-                    "success": True, "show_advanced_settings": enabled,
-                })
-                self.assertEqual(await Plugin().get_ui_settings(), {
-                    "success": True, "show_advanced_settings": enabled,
-                })
-                self.assertEqual(json.loads(self.path.read_text()), {"show_advanced_settings": enabled})
+        for values in (
+            (True, False, False), (False, True, False), (False, False, True), (True, True, True), (False, False, False),
+        ):
+            with self.subTest(values=values):
+                saved = dict(zip(self.DEFAULTS, values, strict=True))
+                self.assertEqual(await self.plugin.set_ui_settings(*values), {"success": True, **saved})
+                self.assertEqual(await Plugin().get_ui_settings(), {"success": True, **saved})
+                self.assertEqual(json.loads(self.path.read_text()), saved)
         self.assertEqual(
             startup.read_text(), '{"after_boot": [], "last_boot_id": null, "requirements": {}}',
         )
 
+    async def test_settings_saved_before_update_preferences_keep_their_values(self):
+        self.path.write_text('{"show_advanced_settings": true}')
+        self.assertEqual(await self.plugin.get_ui_settings(), {
+            "success": True, **self.DEFAULTS, "show_advanced_settings": True,
+        })
+
     async def test_invalid_or_unavailable_settings_are_reported(self):
-        for content in ('not json', '{}', '{"show_advanced_settings": "true"}', '[]'):
+        for content in (
+            'not json', '{}', '{"show_advanced_settings": "true"}', '[]',
+            '{"show_advanced_settings": false, "include_prereleases": 1}',
+            '{"show_advanced_settings": false, "auto_update_check": null}',
+        ):
             with self.subTest(content=content), self.assertLogs("decky-wireguard"):
                 self.path.write_text(content)
                 result = await self.plugin.get_ui_settings()
@@ -99,16 +108,20 @@ class UISettingsTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("settings directory is unavailable", result["error"])
 
     async def test_invalid_or_failed_writes_preserve_the_saved_preference(self):
-        await self.plugin.set_ui_settings(True)
-        with self.assertLogs("decky-wireguard"):
-            self.assertFalse((await self.plugin.set_ui_settings("yes"))["success"])
+        await self.plugin.set_ui_settings(True, True, True)
+        for values in (("yes", True, True), (True, 1, True), (True, True, None)):
+            with self.subTest(values=values), self.assertLogs("decky-wireguard"):
+                self.assertFalse((await self.plugin.set_ui_settings(*values))["success"])
         with patch("main.os.replace", side_effect=PermissionError("Read-only disk")), self.assertLogs(
             "decky-wireguard",
         ):
-            result = await self.plugin.set_ui_settings(False)
+            result = await self.plugin.set_ui_settings(False, False, False)
         self.assertFalse(result["success"])
         self.assertIn("Unable to save UI settings", result["error"])
-        self.assertEqual((await Plugin().get_ui_settings())["show_advanced_settings"], True)
+        self.assertEqual(
+            await Plugin().get_ui_settings(),
+            {"success": True, "show_advanced_settings": True, "include_prereleases": True, "auto_update_check": True},
+        )
         self.assertEqual(list(self.directory.iterdir()), [self.path])
 
 

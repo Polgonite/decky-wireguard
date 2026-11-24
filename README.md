@@ -26,7 +26,8 @@ their `.conf` file or add the profile through NetworkManager.
 
 Download a ZIP from the
 [GitHub Releases page](https://github.com/Polgonite/decky-wireguard/releases).
-Releases are prereleases, not stable releases.
+Stable releases are the ones not marked **Pre-release**; pre-releases are
+development builds that may be unstable.
 
 1. Enable Developer Mode in Decky Loader settings.
 2. Choose **Install Plugin from ZIP File** and select the downloaded ZIP.
@@ -56,6 +57,19 @@ provide a kill switch or disconnect other tunnels.
 Open **Settings** from the connection list, choose **Update to latest build**,
 and approve Decky's installation dialog. This needs an internet connection.
 You can also install a downloaded release ZIP using Decky's plugin installer.
+
+Updates only offer stable releases that are newer than the version you have
+installed; the plugin never downgrades. To downgrade, install an older ZIP
+yourself.
+
+Turn on **Check for updates automatically** to get a notification when a new
+release is available. It is off by default and contacts GitHub shortly after
+the plugin loads and then about twice a day. It never installs anything.
+
+If you want development builds too, enable **Show advanced settings** and then
+**Development updates**. These pre-release builds may be unstable. The setting
+stays on if you hide advanced settings again, and **Settings** shows whether you
+are subscribed to development updates next to your installed version.
 
 ## Documentation
 

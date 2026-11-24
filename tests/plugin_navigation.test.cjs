@@ -15,6 +15,9 @@ const navigationCompiled = compile("plugin-navigation.ts");
 const settingsCompiled = compile("ui-settings.ts");
 const indexCompiled = compile("index.tsx");
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+const uiSettingsResult = (show = false, prereleases = false, auto = false) => ({
+  success: true, show_advanced_settings: show, include_prereleases: prereleases, auto_update_check: auto,
+});
 const profile = {
   uuid: "home", name: "Home", device: "", state: "disconnected",
   handshake: "inactive", handshake_error: null, probe_sent: null,
@@ -25,7 +28,12 @@ function plugin(profiles, backend, options = {}) {
   let cursor = 0;
   let effects = [];
   let pluginExits = 0;
-  let showAdvanced = options.advanced ?? false;
+  const preferences = {
+    show_advanced_settings: options.advanced ?? false,
+    include_prereleases: false,
+    auto_update_check: false,
+  };
+  const monitors = { started: 0, stopped: 0 };
   const navigations = [];
   const intervals = [];
   const subscriptions = [];
@@ -62,8 +70,10 @@ function plugin(profiles, backend, options = {}) {
           if (route === "get_profiles") return { success: true, profiles: profiles.map((item) => ({ ...item })) };
           if (route === "get_ui_settings" || route === "set_ui_settings") {
             if (options.uiBackend) return options.uiBackend(route, ...args);
-            if (route === "set_ui_settings") showAdvanced = args[0];
-            return { success: true, show_advanced_settings: showAdvanced };
+            if (route === "set_ui_settings") {
+              [preferences.show_advanced_settings, preferences.include_prereleases, preferences.auto_update_check] = args;
+            }
+            return { success: true, ...preferences };
           }
           if (backend && route !== "set_steam_readiness") return backend(route, ...args);
           if (route === "get_startup_settings" || route === "set_steam_readiness") {
@@ -84,7 +94,10 @@ function plugin(profiles, backend, options = {}) {
       if (name === "./plugin-navigation") return navigation.exports;
       if (name === "./ui-settings") return uiSettings.exports;
       if (name === "./config-page") return { configPath: (uuid) => `/config/${uuid}` };
-      if (name === "./updater") return { UpdateButton: "UpdateButton" };
+      if (name === "./updater") return {
+        UpdateButton: "UpdateButton",
+        startUpdateMonitor: () => { monitors.started++; return () => { monitors.stopped++; }; },
+      };
       if (name === "react-icons/fa") return {};
       throw new Error(`Unexpected module: ${name}`);
     },
@@ -94,11 +107,14 @@ function plugin(profiles, backend, options = {}) {
   runInNewContext(navigationCompiled, navigation);
   runInNewContext(settingsCompiled, uiSettings);
   runInNewContext(indexCompiled, context);
-  const content = context.exports.default().content.type;
+  const loaded = context.exports.default();
+  const content = loaded.content.type;
   return {
     navigation: navigation.exports,
     navigations,
     intervals,
+    monitors,
+    dismount: () => loaded.onDismount(),
     subscribe: (listener) => subscriptions.at(-1)(listener),
     subscribeToSettings: (listener) => {
       uiSettings.exports.useUISettings();
@@ -616,7 +632,7 @@ test("the settings toggle hides wait switches without changing their saved value
   let showAdvanced = false;
   const uiBackend = (route, enabled) => {
     if (route === "set_ui_settings") showAdvanced = enabled;
-    return { success: true, show_advanced_settings: showAdvanced };
+    return uiSettingsResult(showAdvanced);
   };
   const panel = plugin([profile], (route) => {
     calls.push(route);
@@ -700,7 +716,7 @@ test("advanced preference updates notify all screens and serialize pending saves
   elementsIn(panel.render()).find((node) =>
     node.type === "ButtonItem" && node.props.children === "Settings").props.onClick();
   assert.equal(toggles(panel)["Show advanced settings"].disabled, true);
-  finishLoad({ success: true, show_advanced_settings: false });
+  finishLoad(uiSettingsResult(false));
   await flush();
   let firstUpdates = 0;
   let secondUpdates = 0;
@@ -712,7 +728,7 @@ test("advanced preference updates notify all screens and serialize pending saves
   assert.equal(writes, 1);
   assert.equal(toggles(panel)["Show advanced settings"].checked, false);
   assert.equal(toggles(panel)["Show advanced settings"].disabled, true);
-  finishSave({ success: true, show_advanced_settings: true });
+  finishSave(uiSettingsResult(true));
   await flush();
   assert.equal(toggles(panel)["Show advanced settings"].checked, true);
   assert.equal(toggles(panel)["Show advanced settings"].disabled, false);
@@ -729,10 +745,10 @@ test("advanced preference errors are visible, retryable, and do not change the t
     uiBackend: (route) => {
       if (route === "get_ui_settings") {
         return loadFails ? { success: false, error: "Read failed" }
-          : { success: true, show_advanced_settings: false };
+          : uiSettingsResult(false);
       }
       return saveFails ? { success: false, error: "Write failed" }
-        : { success: true, show_advanced_settings: true };
+        : uiSettingsResult(true);
     },
   });
   await panel.mount();
@@ -756,4 +772,79 @@ test("advanced preference errors are visible, retryable, and do not change the t
   await flush();
   assert.equal(toggles(panel)["Show advanced settings"].checked, true);
   assert.equal(elementsIn(panel.render()).some((node) => node.props?.role === "alert"), false);
+});
+
+function settingsLabels(panel) {
+  const labels = [];
+  const row = (node) => node.props?.children;
+  const section = elementsIn(panel.render()).find((node) => node.type === "PanelSection");
+  for (const item of [section.props.children].flat(Infinity)) {
+    if (!item || typeof item !== "object") continue;
+    const child = item.type === "PanelSectionRow" ? row(item) : item;
+    labels.push(child.props?.label ?? child.type?.name ?? child.type);
+  }
+  return labels;
+}
+
+test("the development updates toggle appears only with advanced settings, between logging and the update button", async () => {
+  const panel = plugin([], undefined, { advanced: false });
+  await panel.mount();
+  elementsIn(panel.render()).find((node) =>
+    node.type === "ButtonItem" && node.props.children === "Settings").props.onClick();
+  assert.equal(toggles(panel)["Development updates"], undefined);
+  assert.equal(toggles(panel)["Check for updates automatically"].checked, false);
+
+  toggles(panel)["Show advanced settings"].onChange(true);
+  await flush();
+  const labels = settingsLabels(panel);
+  const development = labels.indexOf("Development updates");
+  assert.ok(development > 0);
+  assert.equal(labels[development + 1], "UpdateButton");
+  assert.equal(labels[development - 1], "Check for updates automatically");
+  assert.ok(labels.indexOf("Show advanced settings") < labels.findIndex((label) => /Logging|LoggingControls/.test(label)));
+  assert.ok(labels.findIndex((label) => /Logging|LoggingControls/.test(label)) < development);
+  assert.equal(toggles(panel)["Development updates"].checked, false);
+});
+
+test("the update preferences save independently and the development choice survives hiding advanced settings", async () => {
+  const saved = [];
+  const panel = plugin([], undefined, {
+    advanced: true,
+    uiBackend: (route, ...args) => {
+      if (route === "set_ui_settings") saved.push(args);
+      return uiSettingsResult(...(saved.at(-1) ?? [true, false, false]));
+    },
+  });
+  await panel.mount();
+  elementsIn(panel.render()).find((node) =>
+    node.type === "ButtonItem" && node.props.children === "Settings").props.onClick();
+
+  toggles(panel)["Development updates"].onChange(true);
+  await flush();
+  toggles(panel)["Check for updates automatically"].onChange(true);
+  await flush();
+  toggles(panel)["Show advanced settings"].onChange(false);
+  await flush();
+  assert.deepEqual(saved, [[true, true, false], [true, true, true], [false, true, true]]);
+  assert.equal(toggles(panel)["Development updates"], undefined);
+  assert.equal(toggles(panel)["Check for updates automatically"].checked, true);
+
+  toggles(panel)["Show advanced settings"].onChange(true);
+  await flush();
+  assert.equal(toggles(panel)["Development updates"].checked, true);
+});
+
+test("the update toggles stay disabled until the saved settings are loaded", async () => {
+  const panel = plugin([], undefined, { uiBackend: () => ({ success: false, error: "Read failed" }) });
+  await panel.mount();
+  elementsIn(panel.render()).find((node) =>
+    node.type === "ButtonItem" && node.props.children === "Settings").props.onClick();
+  assert.equal(toggles(panel)["Check for updates automatically"].disabled, true);
+});
+
+test("the update monitor runs for the plugin's lifetime", async () => {
+  const panel = plugin([]);
+  assert.deepEqual({ ...panel.monitors }, { started: 1, stopped: 0 });
+  panel.dismount();
+  assert.deepEqual({ ...panel.monitors }, { started: 1, stopped: 1 });
 });
