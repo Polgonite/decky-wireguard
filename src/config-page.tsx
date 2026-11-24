@@ -8,7 +8,8 @@ import { ConnectionEditor } from "./connection-editor";
 import { returnToPlugin } from "./plugin-navigation";
 import { useUISettings } from "./ui-settings";
 import {
-  AdvancedProperty, draftChanged, EditorDraft, emptyDraft, fromDraft, importConf, rebaseDraft, toDraft, WireGuardConfig,
+  AdvancedProperty, draftChanged, EditorDraft, emptyDraft, fromDraft, importConf, rebaseDraft, SecretFlags, toDraft,
+  WireGuardConfig,
 } from "./wireguard-config";
 
 type Result<T> = ({ success: true } & T) | {
@@ -16,7 +17,7 @@ type Result<T> = ({ success: true } & T) | {
 };
 
 const getConnectionConfig = callable<
-  [uuid: string], Result<{ config: WireGuardConfig; advanced: AdvancedProperty[]; revision: string }>
+  [uuid: string], Result<{ config: WireGuardConfig; advanced: AdvancedProperty[]; revision: string; secret_flags: SecretFlags }>
 >("get_connection_config");
 const setConnectionConfig = callable<
   [uuid: string, config: WireGuardConfig, advanced: AdvancedProperty[], revision: string], Result<object>
@@ -100,7 +101,7 @@ export function ConfigPage() {
       if (!result.success) throw new Error(result.error);
       if (typeof result.revision !== "string" || !result.revision) throw new Error("Missing profile revision.");
       if (mounted.current && id === request.current) {
-        const loaded = toDraft(result.config, result.advanced);
+        const loaded = toDraft(result.config, result.advanced, result.secret_flags);
         const keep = recoveryLoad?.keep;
         setDraft(keep ? rebaseDraft(keep.base, keep.local, loaded) : loaded);
         connectionUuid.current = target;

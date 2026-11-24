@@ -231,9 +231,9 @@ async def _command(executable: str, *arguments: str, wait: int = 10, input_data:
     return stdout.decode("utf-8", errors="replace")
 
 
-async def _nmcli(*arguments: str, wait: int = 10) -> str:
+async def _nmcli(*arguments: str, wait: int = 10, escape: bool = True) -> str:
     return await _command(
-        "nmcli", "--terse", "--escape", "yes", "--colors", "no", "--wait", str(wait),
+        "nmcli", "--terse", "--escape", "yes" if escape else "no", "--colors", "no", "--wait", str(wait),
         *arguments, wait=wait,
     )
 
@@ -983,6 +983,25 @@ def _peer_config(peer: dict[str, dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _secret_flags(settings: Settings) -> dict[str, object]:
+    wireguard = settings.get("wireguard", {})
+    return {
+        "private_key": _data(wireguard, "private-key-flags", 0),
+        "peers": {
+            peer["public-key"]["data"]: _data(peer, "preshared-key-flags", SECRET_NOT_REQUIRED)
+            for peer in _data(wireguard, "peers", [])
+        },
+    }
+
+
+def _check_key_edit(flags: int, label: str) -> None:
+    if flags not in (0, SECRET_NOT_REQUIRED):
+        raise NetworkManagerError(
+            f"{label} cannot be edited here with its current secret-storage policy. "
+            "Use NetworkManager's editor."
+        )
+
+
 def _wireguard_config(settings: Settings) -> dict[str, object]:
     """Represent NetworkManager settings with the fields of a WireGuard .conf file."""
     try:
@@ -1099,8 +1118,14 @@ def _apply_peers(
             raise NetworkManagerError(
                 f"{label} was changed outside this editor. Reload the configuration and try again."
             )
-        # Start from the stored peer to keep properties this editor does not show.
-        values = {} if original is None else copy.deepcopy(existing[original])
+        # Imported peers have no original ID; match their public key to retain stored policy.
+        stored = existing.get(original if original is not None else public_key)
+        if original not in (None, public_key) and public_key in existing and (
+            _data(existing[public_key], "preshared-key-flags", SECRET_NOT_REQUIRED)
+            != _data(existing[original], "preshared-key-flags", SECRET_NOT_REQUIRED)
+        ):
+            raise NetworkManagerError(f"{label} cannot replace a peer with a different secret-storage policy.")
+        values = copy.deepcopy(stored) if stored is not None else {}
         values["public-key"] = _variant("s", public_key)
         allowed: list[str] = []
         for entry in _entries(str(peer["allowed_ips"])):
@@ -1122,7 +1147,8 @@ def _apply_peers(
             str(peer["persistent_keepalive"]), f"{label} persistent keepalive", 65535, off=True,
         ))
         preshared_key = _wireguard_key(str(peer["preshared_key"]), f"{label} preshared key", False)
-        if original is None or preshared_key != _data(values, "preshared-key", ""):
+        if stored is None or preshared_key != _data(values, "preshared-key", ""):
+            _check_key_edit(_data(values, "preshared-key-flags", SECRET_NOT_REQUIRED), f"{label} preshared key")
             if preshared_key:
                 values["preshared-key"] = _variant("s", preshared_key)
             else:
@@ -1226,6 +1252,27 @@ def _validate_wireguard_settings(
                 )
 
 
+def _set_search_domains(families: dict[int, dict[str, dict[str, object]]], domains: list[str]) -> None:
+    previous = {v: _data(values, "dns-search", []) for v, values in families.items()}
+    enabled = {v: set(previous[v]) for v, values in families.items()
+               if _data(values, "method", None) not in NO_ADDRESS_METHODS}
+    if domains and not enabled:
+        raise NetworkManagerError("DNS: search domains need a tunnel address in Address.")
+    # The editor flattens both lists. A server or address edit must not reorder
+    # either family's search path, even if the two paths overlap.
+    unchanged = domains == list(dict.fromkeys(domain for path in previous.values() for domain in path))
+    assigned = {v: list(previous[v]) if unchanged and v in enabled else [] for v in families}
+    for domain in dict.fromkeys(domains):
+        owners = [v for v, path in enabled.items() if domain in path]
+        if not owners:
+            assigned[next(iter(enabled))].append(domain)
+        elif not unchanged:
+            for v in owners:
+                assigned[v].append(domain)
+    for v, values in families.items():
+        values["dns-search"] = _variant("as", assigned[v])
+
+
 def _validate_advanced_names(keys: list[str]) -> None:
     guarded = STRUCTURED_PROPERTIES | IDENTITY_PROPERTIES | DIRECT_PROPERTIES
     for key in keys:
@@ -1268,8 +1315,9 @@ def _apply_wireguard_config(
     if "name" in changed:
         connection["id"] = _variant("s", name)
     if "private_key" in changed:
+        _check_key_edit(_data(wireguard, "private-key-flags", 0), "Private key")
         wireguard["private-key"] = _variant("s", private_key)
-        wireguard["private-key-flags"] = _variant("u", 0)
+        wireguard.setdefault("private-key-flags", _variant("u", 0))
     if "mtu" in changed:
         wireguard["mtu"] = _variant("u", mtu)
     if "listen_port" in changed:
@@ -1284,8 +1332,7 @@ def _apply_wireguard_config(
                 values["method"] = _variant("s", "manual")
             elif not addresses[version] and method == "manual":
                 values["method"] = _variant("s", "disabled")
-    # Address changes can disable a family, so search domains may need to move.
-    if changed & {"addresses", "dns"}:
+    if "dns" in changed:
         for version, values in families.items():
             if "dns-data" in values:
                 values["dns-data"] = _variant("as", servers[version])
@@ -1301,15 +1348,8 @@ def _apply_wireguard_config(
                 values["dns"] = _variant("aay", [
                     list(ip_address(server).packed) for server in servers[6]
                 ])
-            values["dns-search"] = _variant("as", [])
-        if domains:
-            family = next((
-                values for values in families.values()
-                if _data(values, "method", None) not in NO_ADDRESS_METHODS
-            ), None)
-            if family is None:
-                raise NetworkManagerError("DNS: search domains need a tunnel address in Address.")
-            family["dns-search"] = _variant("as", domains)
+    if changed & {"addresses", "dns"}:
+        _set_search_domains(families, domains)
     _validate_wireguard_settings(settings, advanced or [])
     return bool(changed)
 
@@ -1799,14 +1839,13 @@ class Plugin:
         return value == "yes"
 
     async def _advanced_properties(self, uuid: str) -> list[dict[str, str]]:
-        output = await _nmcli("--fields", "all", "connection", "show", "uuid", uuid)
+        output = await _nmcli(
+            "--mode", "multiline", "--fields", "all", "connection", "show", "uuid", uuid, escape=False,
+        )
         properties: list[dict[str, str]] = []
         for line in output.splitlines():
-            fields = _split_fields(line)
-            if len(fields) != 2 or not fields[0].islower():
-                continue
-            key, value = fields
-            if key in DIRECT_PROPERTIES or key in OFFLINE_PROPERTIES:
+            key, separator, value = line.partition(":")
+            if separator and (key in DIRECT_PROPERTIES or key in OFFLINE_PROPERTIES):
                 properties.append({"key": key, "value": value})
         return properties
 
@@ -1833,6 +1872,7 @@ class Plugin:
                     "revision": token,
                     "config": config,
                     "advanced": advanced,
+                    "secret_flags": _secret_flags(settings),
                 }
         except NetworkManagerError as error:
             return self._failure(error)

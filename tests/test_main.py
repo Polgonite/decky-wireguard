@@ -1300,7 +1300,8 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
             self.nmcli_calls.append(arguments)
             if arguments == FIELDS:
                 return f"{HOME}:wireguard:Home:::\n"
-            if arguments == ("--fields", "all", "connection", "show", "uuid", HOME):
+            if arguments == ("--mode", "multiline", "--fields", "all", "connection", "show", "uuid", HOME):
+                self.assertFalse(kwargs["escape"])
                 return (
                     "GENERAL.NAME:Home\n"
                     "connection.id:Home\n"
@@ -1309,6 +1310,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                     "wireguard.private-key:<hidden>\n"
                     "wireguard.fwmark:0x0\n"
                     "ipv4.dns-priority:0\n"
+                    "ipv6.gateway:2001:db8::1\n"
                 )
             self.fail(f"Unexpected nmcli call: {arguments}")
 
@@ -1338,6 +1340,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {
             "success": True,
             "revision": REVISION,
+            "secret_flags": {"private_key": 0, "peers": {PEER: 0}},
             "config": {
                 "name": "Home", "private_key": PRIVATE, "addresses": "10.0.0.2/32",
                 "dns": "10.0.0.1", "mtu": "1420", "listen_port": "",
@@ -1351,6 +1354,7 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                 {"key": "connection.zone", "value": ""},
                 {"key": "wireguard.fwmark", "value": "0x0"},
                 {"key": "ipv4.dns-priority", "value": "0"},
+                {"key": "ipv6.gateway", "value": "2001:db8::1"},
             ],
         })
 
@@ -1424,6 +1428,34 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
             self.updates[0]["wireguard"]["peers"]["data"][0]["preshared-key"], v("s", PSK),
         )
 
+    async def test_managed_key_policies_survive_edits_and_matching_peer_imports(self):
+        self.settings["wireguard"]["private-key-flags"] = v("u", 1)
+        self.settings["wireguard"]["peers"]["data"][0]["preshared-key-flags"] = v("u", 2)
+        del self.secrets["wireguard"]["peers"]["data"][0]["preshared-key"]
+        loaded = await self.plugin.get_connection_config(HOME)
+        self.assertEqual(loaded["secret_flags"], {"private_key": 1, "peers": {PEER: 2}})
+        config = loaded["config"]
+        for imported in (False, True):
+            with self.subTest(imported=imported):
+                changed = copy.deepcopy(config)
+                peer = changed["peers"][0]
+                if imported:
+                    peer["original_public_key"] = None
+                peer["preshared_key"] = wg_key(9)
+                with self.assertLogs("decky-wireguard"):
+                    result = await self.plugin.set_connection_config(HOME, changed, [], REVISION)
+                self.assertIn("preshared key cannot be edited", result["error"])
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.set_connection_config(HOME, {**config, "private_key": wg_key(9)}, [], REVISION)
+        self.assertIn("Private key cannot be edited", result["error"])
+        self.assertFalse(self.updates)
+        config["peers"][0].update(original_public_key=None, endpoint="new.example:51820")
+        result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
+        self.assertTrue(result["success"], result)
+        [written] = self.updates
+        self.assertEqual(written["wireguard"]["private-key-flags"], v("u", 1))
+        self.assertEqual(written["wireguard"]["peers"]["data"][0]["preshared-key-flags"], v("u", 2))
+
     async def test_update_rewrites_changed_fields_and_preserves_everything_else(self):
         original = copy.deepcopy(self.settings)
         config = await self.config()
@@ -1494,18 +1526,38 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         self.settings["ipv6"].update({
             "method": v("s", "manual"),
             "address-data": v("aa{sv}", [{"address": v("s", "fd00::2"), "prefix": v("u", 128)}]),
-            "dns-search": v("as", ["corp.example"]),
+            "dns-search": v("as", ["corp.example", "~v6.example"]),
         })
         self.settings["ipv4"]["dns-search"] = v("as", ["corp.example"])
         config = await self.config()
-        self.assertEqual(config["dns"], "10.0.0.1, corp.example")
+        self.assertEqual(config["dns"], "10.0.0.1, corp.example, ~v6.example")
         config["addresses"] = "10.0.0.2/32"
         self.assertEqual(await self.plugin.set_connection_config(HOME, config, [], REVISION), {"success": True})
         update = self.updates[0]
         self.assertEqual(update["ipv6"]["method"], v("s", "disabled"))
         self.assertEqual(update["ipv6"]["dns-search"], v("as", []))
-        self.assertEqual(update["ipv4"]["dns-search"], v("as", ["corp.example"]))
+        self.assertEqual(update["ipv4"]["dns-search"], v("as", ["corp.example", "~v6.example"]))
         self.assertEqual(update["ipv4"]["dns"], v("au", [ipv4_dns("10.0.0.1")]))
+
+    async def test_address_and_dns_edits_preserve_split_dns_owners_and_search_order(self):
+        self.settings["ipv4"]["dns-search"] = v("as", ["shared.example", "v4.example"])
+        self.settings["ipv6"].update({
+            "method": v("s", "manual"),
+            "address-data": v("aa{sv}", [{"address": v("s", "fd00::2"), "prefix": v("u", 128)}]),
+            "dns-search": v("as", ["~internal.example", "shared.example"]),
+        })
+        config = await self.config()
+        for changes in ({"addresses": "10.0.0.3/32, fd00::2/128"},
+                        {"dns": config["dns"].replace("10.0.0.1", "10.0.0.53")}):
+            result = await self.plugin.set_connection_config(HOME, {**config, **changes}, [], REVISION)
+            self.assertTrue(result["success"], result)
+            for family in ("ipv4", "ipv6"):
+                self.assertEqual(self.updates[-1][family]["dns-search"], self.settings[family]["dns-search"])
+        config["dns"] = "~internal.example, shared.example, new.example"
+        result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self.updates[-1]["ipv4"]["dns-search"], v("as", ["shared.example", "new.example"]))
+        self.assertEqual(self.updates[-1]["ipv6"]["dns-search"], v("as", ["~internal.example", "shared.example"]))
 
     @unittest.skipUnless(shutil.which("nmcli"), "Offline conversion requires NetworkManager")
     async def test_advanced_and_structured_changes_are_persisted_in_one_update(self):

@@ -32,15 +32,21 @@ export interface EditableProperty extends AdvancedProperty {
   isNew: boolean;
 }
 
+export interface SecretFlags {
+  private_key: number;
+  peers: Record<string, number>;
+}
+
 export interface EditorDraft {
   config: Omit<WireGuardConfig, "peers"> & { peers: EditablePeer[] };
   advanced: EditableProperty[];
+  secretFlags: SecretFlags;
 }
 
 export function emptyDraft(): EditorDraft {
   return toDraft({
     name: "", private_key: "", addresses: "", dns: "", mtu: "", listen_port: "", peers: [],
-  }, []);
+  }, [], { private_key: 0, peers: {} });
 }
 
 /** Import tunnel identity and peers, but retain unrelated NetworkManager policy. */
@@ -116,8 +122,13 @@ export function newPeer(id: string): EditablePeer {
   };
 }
 
-export function toDraft(config: WireGuardConfig, advanced: AdvancedProperty[]): EditorDraft {
+export function toDraft(config: WireGuardConfig, advanced: AdvancedProperty[], secretFlags: SecretFlags): EditorDraft {
+  if (!Number.isInteger(secretFlags?.private_key) ||
+      config.peers.some((peer) => !Number.isInteger(secretFlags.peers?.[peer.public_key]))) {
+    throw new Error("Missing key storage policy. Reload the profile before editing.");
+  }
   return {
+    secretFlags,
     config: { ...config, peers: config.peers.map((peer, index) => ({ ...peer, id: `peer-${index}` })) },
     advanced: advanced.map((property) => ({
       ...property, id: property.key, originalValue: property.value, isNew: false,
@@ -246,7 +257,18 @@ export function rebaseDraft(base: EditorDraft, local: EditorDraft, fresh: Editor
     config[key] = local.config[key];
   };
   for (const key of ["name", "private_key", "addresses", "dns", "mtu", "listen_port", "peers"] as const) copy(key);
+  if (config.private_key !== fresh.config.private_key && base.secretFlags.private_key !== fresh.secretFlags.private_key) {
+    throw new Error("The private key's storage policy changed. Your draft was kept.");
+  }
   if (config.peers === local.config.peers) {
+    for (const saved of fresh.config.peers) {
+      const key = saved.public_key;
+      if (base.secretFlags.peers[key] === fresh.secretFlags.peers[key]) continue;
+      const edited = config.peers.find((peer) => trimSpace(peer.public_key) === key);
+      if (!edited || trimSpace(edited.preshared_key) !== saved.preshared_key) {
+        throw new Error("A peer's preshared-key storage policy changed. Your draft was kept.");
+      }
+    }
     config.peers = config.peers.map((peer) => {
       const saved = fresh.config.peers.find((candidate) => comparablePeer(candidate) === comparablePeer(peer));
       return saved ? { ...peer, original_public_key: saved.original_public_key } : peer;
@@ -261,7 +283,7 @@ export function rebaseDraft(base: EditorDraft, local: EditorDraft, fresh: Editor
     if (latest) latest.value = value;
     else advanced.push({ key, value, originalValue: "", isNew: true, id: key });
   }
-  const rebased = { config, advanced };
+  const rebased = { ...fresh, config, advanced };
   if (config.addresses !== fresh.config.addresses) {
     const addresses = entries(config.addresses);
     const updates = fromDraft(rebased).advanced;

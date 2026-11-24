@@ -16,10 +16,11 @@ runInNewContext(compile("wireguard-config.ts"), configContext);
 const config = configContext.exports;
 const compiled = compile("config-page.tsx");
 const navigationCompiled = compile("plugin-navigation.ts");
+const noPeerFlags = { private_key: 0, peers: {} };
 const saved = config.toDraft({
   name: "Home", private_key: "", addresses: "10.0.0.2/32", dns: "", mtu: "",
   listen_port: "", peers: [],
-}, []);
+}, [], noPeerFlags);
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 function deferred() {
@@ -196,7 +197,7 @@ for (const input of ["back", "cancel"]) {
     assert.equal(editor.modals.length, 0);
     assert.equal(editor.render().backDisabled, true);
 
-    reload.resolve({ success: true, config: draft.config, advanced: [], revision: "saved-snapshot" });
+    reload.resolve({ success: true, config: draft.config, advanced: [], revision: "saved-snapshot", secret_flags: noPeerFlags });
     await flush();
     assert.equal(editor.render().backDisabled, false);
     editor.render()[input]();
@@ -242,7 +243,7 @@ test("import browses folders and only updates the draft until Save is pressed", 
     if (route === "read_conf_file") return { success: true, text: "[Interface]\nPrivateKey = imported\n" };
     if (route === "set_connection_config") return { success: true };
     if (route === "get_profiles") return { success: true, profiles: [{ uuid: "test", state: "disconnected" }] };
-    if (route === "get_connection_config") return { success: true, config: saved.config, advanced: [], revision: "import-snapshot" };
+    if (route === "get_connection_config") return { success: true, config: saved.config, advanced: [], revision: "import-snapshot", secret_flags: noPeerFlags };
     assert.fail(`Unexpected call: ${route}`);
   }, {
     pick: async (type, _start, files, folders, _filter, extensions) => {
@@ -290,7 +291,7 @@ test("new connections start locally, create only on Save, and use the created UU
     if (route === "create_connection_config") return { success: true, uuid: "created" };
     if (route === "set_connection_config") return { success: true };
     if (route === "get_profiles") return { success: true, profiles: [{ uuid: "created", state: "disconnected" }] };
-    if (route === "get_connection_config") return { success: true, config: draft.config, advanced: [], revision: "new-snapshot" };
+    if (route === "get_connection_config") return { success: true, config: draft.config, advanced: [], revision: "new-snapshot", secret_flags: noPeerFlags };
     assert.fail(`Unexpected call: ${route}`);
   }, { uuid: "new", saved: null });
   await editor.mount();
@@ -329,7 +330,7 @@ test("after creation a failed reload keeps the draft and only retries the read",
     if (route === "create_connection_config") return { success: true, uuid: "created" };
     if (route === "get_profiles") return { success: true, profiles: [] };
     if (route === "get_connection_config") return available
-      ? { success: true, config: draft.config, advanced: [], revision: "fresh-snapshot" }
+      ? { success: true, config: draft.config, advanced: [], revision: "fresh-snapshot", secret_flags: noPeerFlags }
       : { success: false, error: "temporarily unavailable" };
     if (route === "set_connection_config") return { success: true };
     assert.fail(`Unexpected call: ${route}`);
@@ -377,7 +378,7 @@ test("a stale save reloads non-overlapping edits without writing until Save is p
   const local = { ...saved, config: { ...saved.config, name: "My edit" } };
   const fresh = { ...saved.config, mtu: "1400" };
   const editor = page(local, (route, uuid, ...args) => {
-    if (route === "get_connection_config") return { success: true, config: fresh, advanced: [], revision: "fresh" };
+    if (route === "get_connection_config") return { success: true, config: fresh, advanced: [], revision: "fresh", secret_flags: noPeerFlags };
     if (route === "set_connection_config") {
       writes.push(args);
       return { success: false, code: "reload_required", error: "Profile changed" };
@@ -403,7 +404,7 @@ test("recovery keeps unrelated edits after a lost reply and a canonicalized peer
       original_public_key: "peer", public_key: "peer", preshared_key: "",
       allowed_ips: "10.0.0.0/24", endpoint: "", persistent_keepalive: "25",
     }],
-  }, []);
+  }, [], { private_key: 0, peers: { peer: 4 } });
   const draftPeer = {
     id: "peer-0", original_public_key: "peer", public_key: "peer", preshared_key: "",
     allowed_ips: "10.0.0.8", endpoint: "", persistent_keepalive: "off",
@@ -418,7 +419,7 @@ test("recovery keeps unrelated edits after a lost reply and a canonicalized peer
     if (route === "get_connection_config") {
       return {
         success: true, config: { ...base.config, name: writes.length > 2 ? "My edit" : base.config.name, peers: [persistedPeer] },
-        advanced: [], revision: "fresh",
+        advanced: [], revision: "fresh", secret_flags: base.secretFlags,
       };
     }
     if (route === "set_connection_config") {
@@ -451,7 +452,7 @@ test("an overlapping external change keeps the draft until discard is confirmed"
   const local = { ...saved, config: { ...saved.config, name: "My edit" } };
   const editor = page(local, (route) => {
     if (route === "set_connection_config") return { success: false, code: "reload_required", error: "Profile changed" };
-    return { success: true, config: { ...saved.config, name: "External edit" }, advanced: [], revision: "fresh" };
+    return { success: true, config: { ...saved.config, name: "External edit" }, advanced: [], revision: "fresh", secret_flags: noPeerFlags };
   });
   editor.render().save();
   await flush();
@@ -472,7 +473,7 @@ test("an unverified UUID collision only opens the saved profile after confirmati
   const editor = page(null, (route, ...args) => {
     calls.push(route);
     if (route === "create_connection_config") return { success: false, code: "uuid_exists", error: "Already exists", uuid: args[2] };
-    if (route === "get_connection_config") return { success: true, config: saved.config, advanced: [], revision: "existing" };
+    if (route === "get_connection_config") return { success: true, config: saved.config, advanced: [], revision: "existing", secret_flags: noPeerFlags };
     assert.fail(`Unexpected backend call: ${route}`);
   }, { uuid: "new", saved: null });
   await editor.mount();
@@ -506,7 +507,7 @@ test("advanced editor controls disappear when disabled without losing draft edit
   let cursor = 0;
   let draft = config.toDraft({ ...saved.config, mtu: "1380" }, [
     { key: "ipv4.dns-priority", value: "0" },
-  ]);
+  ], noPeerFlags);
   const element = (type, props) => ({ type, props });
   const context = {
     exports: {},

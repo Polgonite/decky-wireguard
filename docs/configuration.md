@@ -40,8 +40,11 @@ Select **Retry reload** to read the saved profile before editing again; this
 does not repeat the write. If another editor changes the profile, choose
 **Reload and keep my edits** to combine changes to different fields. If both
 copies changed the same field (including the peer list) differently, the draft
-is kept and nothing is written. Address edits also conflict with an external
-IP method change if saving would overwrite that method. A peer already saved
+is kept and nothing is written. A key edit also conflicts if another editor
+changed that key's storage policy. Use NetworkManager's editor to change
+agent-owned or non-saved keys; Decky will not convert them to disk-stored keys.
+Address edits also conflict with an external IP method change if saving would
+overwrite that method. A peer already saved
 with equivalent settings does not conflict, even if Allowed IPs or keepalive
 have been normalized. **Discard edits and reload** asks for
 confirmation.
@@ -109,8 +112,10 @@ For native WireGuard, IPv4 methods are limited to `manual` or `disabled`; IPv6
 also permits `ignore` and `link-local`. `manual` requires at least one address
 of that family. Methods without static addressing cannot be combined with
 static addresses or DNS/search domains. DHCP/`auto` and `shared` are not
-supported. UUID, connection type, and `connection.autoconnect` are managed
-outside the raw advanced-property editor; use the startup controls for
+supported. Existing DNS search and routing domains stay with their IPv4 or
+IPv6 family. New domains, or domains whose only family was disabled, go to
+IPv4 if it has a tunnel address, otherwise IPv6. UUID, connection type, and
+`connection.autoconnect` are managed outside the raw advanced-property editor; use the startup controls for
 autoconnect. **Add property** accepts only the following full property names;
 other stored settings are left alone. Use NetworkManager's editor for unlisted
 properties. Do not enter credentials in these fields.

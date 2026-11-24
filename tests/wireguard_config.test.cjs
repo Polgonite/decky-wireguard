@@ -10,7 +10,10 @@ const context = { exports: {}, URL };
 runInNewContext(ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 }).outputText, context);
-const { advancedSettingLabel, draftChanged, emptyDraft, fromDraft, importConf, publicKeyFromPrivate, rebaseDraft, toDraft } = context.exports;
+const { advancedSettingLabel, draftChanged, emptyDraft, fromDraft, importConf, publicKeyFromPrivate, rebaseDraft } = context.exports;
+const toDraft = (config, advanced, flags = {
+  private_key: 0, peers: Object.fromEntries(config.peers.map((peer) => [peer.public_key, 0])),
+}) => context.exports.toDraft(config, advanced, flags);
 const key = (hex) => Buffer.from(hex, "hex").toString("base64");
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
@@ -77,6 +80,29 @@ test("rebasing a persisted new peer keeps its saved identity and unrelated draft
   assert.deepEqual(plain(rebased.config.peers), plain(fresh.config.peers));
   const changed = toDraft({ ...config, peers: [{ ...peer, preshared_key: "different" }] }, []);
   assert.throws(() => rebaseDraft(base, local, changed), /Both copies changed peers/);
+});
+
+test("recovery refuses key edits across storage policy changes but keeps unrelated edits", () => {
+  const base = toDraft(config, [], { private_key: 0, peers: { peer: 4 } });
+  const fresh = toDraft(config, [], { private_key: 1, peers: { peer: 2 } });
+  const local = structuredClone(base);
+  local.config.private_key = "new private key";
+  assert.throws(() => rebaseDraft(base, local, fresh), /private key's storage policy changed/);
+  local.config.private_key = base.config.private_key;
+  local.config.peers[0].preshared_key = "new preshared key";
+  assert.throws(() => rebaseDraft(base, local, fresh), /preshared-key storage policy changed/);
+  local.config.peers[0].preshared_key = base.config.peers[0].preshared_key;
+  local.config.peers[0].endpoint = "new.example:51820";
+  const merged = rebaseDraft(base, local, fresh);
+  assert.equal(merged.config.peers[0].endpoint, "new.example:51820");
+  assert.deepEqual(merged.secretFlags, fresh.secretFlags);
+});
+
+test("recovery refuses overlapping IPv6 gateway edits", () => {
+  const gateway = (value) => toDraft(config, [{ key: "ipv6.gateway", value }]);
+  const local = gateway("fd00::1");
+  local.advanced[0].value = "fd00::3";
+  assert.throws(() => rebaseDraft(gateway("fd00::1"), local, gateway("fd00::2")), /Both copies changed ipv6.gateway/);
 });
 
 test("rebasing compares canonical peer settings and retains saved identities", () => {
