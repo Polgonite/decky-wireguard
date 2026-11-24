@@ -74,7 +74,8 @@ jobs:
           uv run --locked python tools/verify_package.py "$(uv run --locked node -p "require('./package.json').version")"
 
   release:
-    name: Publish ${{ github.ref_name == 'main' && 'stable release' || 'development build' }}
+    # Static name: GitHub shows expressions in the names of skipped jobs unevaluated.
+    name: Publish release
     # Pull requests only run the checks. Publication needs a push and successful checks.
     needs: checks
     if: github.event_name == 'push'
