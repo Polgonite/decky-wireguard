@@ -125,6 +125,16 @@ export function toDraft(config: WireGuardConfig, advanced: AdvancedProperty[]): 
   };
 }
 
+function storedPeerFields(peer: PeerConfig): Omit<PeerConfig, "original_public_key"> {
+  return {
+    public_key: peer.public_key,
+    preshared_key: peer.preshared_key,
+    allowed_ips: peer.allowed_ips,
+    endpoint: peer.endpoint,
+    persistent_keepalive: peer.persistent_keepalive,
+  };
+}
+
 export function fromDraft(draft: EditorDraft): { config: WireGuardConfig; advanced: AdvancedProperty[] } {
   const configured = draft.advanced.filter((property) => property.key.trim() !== "");
   const keys = configured.map((property) => property.key.trim());
@@ -134,11 +144,7 @@ export function fromDraft(draft: EditorDraft): { config: WireGuardConfig; advanc
       ...draft.config,
       peers: draft.config.peers.map((peer) => ({
         original_public_key: peer.original_public_key,
-        public_key: peer.public_key,
-        preshared_key: peer.preshared_key,
-        allowed_ips: peer.allowed_ips,
-        endpoint: peer.endpoint,
-        persistent_keepalive: peer.persistent_keepalive,
+        ...storedPeerFields(peer),
       })),
     },
     advanced: configured
@@ -156,10 +162,12 @@ export function draftChanged(draft: EditorDraft, saved: EditorDraft): boolean {
 /** Replay only local edits onto a fresh snapshot; never overwrite an overlapping external edit. */
 export function rebaseDraft(base: EditorDraft, local: EditorDraft, fresh: EditorDraft): EditorDraft {
   const config = { ...fresh.config };
+  const comparable = (value: string | EditablePeer[]) =>
+    Array.isArray(value) ? JSON.stringify(value.map(storedPeerFields)) : value;
   const copy = <K extends keyof EditorDraft["config"]>(key: K) => {
-    const previous = JSON.stringify(base.config[key]);
-    const edited = JSON.stringify(local.config[key]);
-    const latest = JSON.stringify(fresh.config[key]);
+    const previous = comparable(base.config[key]);
+    const edited = comparable(local.config[key]);
+    const latest = comparable(fresh.config[key]);
     if (edited === previous || latest === edited) return;
     if (latest !== previous) throw new Error(`Both copies changed ${key}. Your draft was kept.`);
     config[key] = local.config[key];

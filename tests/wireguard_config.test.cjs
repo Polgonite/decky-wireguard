@@ -10,7 +10,7 @@ const context = { exports: {} };
 runInNewContext(ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 }).outputText, context);
-const { advancedSettingLabel, draftChanged, emptyDraft, fromDraft, importConf, publicKeyFromPrivate, toDraft } = context.exports;
+const { advancedSettingLabel, draftChanged, emptyDraft, fromDraft, importConf, publicKeyFromPrivate, rebaseDraft, toDraft } = context.exports;
 const key = (hex) => Buffer.from(hex, "hex").toString("base64");
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
@@ -64,6 +64,19 @@ test("unsaved changes include peer removal and named new properties, not blank r
   const blank = { id: "new", key: " ", value: "", originalValue: "", isNew: true };
   assert.equal(draftChanged({ ...saved, advanced: [blank] }, saved), false);
   assert.equal(draftChanged({ ...saved, advanced: [{ ...blank, key: "ipv4.dns-priority" }] }, saved), true);
+});
+
+test("rebasing a persisted new peer keeps its saved identity and unrelated draft edits", () => {
+  const base = toDraft({ ...config, peers: [] }, []);
+  const local = {
+    ...base, config: { ...config, name: "Unsaved name", peers: [{ ...peer, id: "new-peer-0", original_public_key: null }] },
+  };
+  const fresh = toDraft(config, []);
+  const rebased = rebaseDraft(base, local, fresh);
+  assert.equal(rebased.config.name, "Unsaved name");
+  assert.deepEqual(plain(rebased.config.peers), plain(fresh.config.peers));
+  const changed = toDraft({ ...config, peers: [{ ...peer, preshared_key: "different" }] }, []);
+  assert.throws(() => rebaseDraft(base, local, changed), /Both copies changed peers/);
 });
 
 test("advanced property labels are readable", () => {

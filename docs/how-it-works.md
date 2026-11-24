@@ -30,8 +30,11 @@ owner lookup and write use the same authenticated connection. One `Update2` pers
 if its version still matches. It does not reapply the firewall zone or metered
 setting to an active tunnel. New profiles use a single `AddConnection`. There is no
 temporary live profile or rollback write. If the reply is lost, the backend
-checks for matching, persisted settings. When it cannot confirm the result it
-reports that uncertainty instead of overwriting potentially newer settings.
+checks for matching, persisted settings at a stable revision. It treats known
+NetworkManager defaults and equivalent DNS representations alike, but still
+compares keys, secret-storage flags, and unrecognized settings. When it cannot
+confirm the result it reports that uncertainty instead of overwriting potentially
+newer settings.
 
 The backend invokes system tools directly; it does not use a shell. Profile
 operations are serialized and restricted to native NetworkManager WireGuard

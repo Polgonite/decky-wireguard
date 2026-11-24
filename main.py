@@ -205,7 +205,7 @@ async def _command(executable: str, *arguments: str, wait: int = 10, input_data:
 
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(input_data), timeout=wait + 5)
-    except (TimeoutError, asyncio.CancelledError) as error:
+    except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError) as error:
         if process.returncode is None:
             try:
                 process.kill()
@@ -594,13 +594,12 @@ class _Bus:
         self.serial += 1
         sent = False
         try:
-            async with asyncio.timeout(DBUS_TIMEOUT):
-                self.writer.write(_dbus_message(
-                    1, self.serial, path, interface, method, destination, signature, list(values),
-                ))
-                sent = True
-                return await self._reply(values)
-        except (OSError, asyncio.IncompleteReadError, ValueError, TypeError, struct.error) as error:
+            self.writer.write(_dbus_message(
+                1, self.serial, path, interface, method, destination, signature, list(values),
+            ))
+            sent = True
+            return await asyncio.wait_for(self._reply(values), DBUS_TIMEOUT)
+        except (asyncio.TimeoutError, OSError, asyncio.IncompleteReadError, ValueError, TypeError, struct.error) as error:
             if sent:
                 raise UnconfirmedWrite("No confirmation from NetworkManager. Reload before retrying.") from error
             raise NetworkManagerError("Unable to communicate with NetworkManager over D-Bus.") from error
@@ -644,24 +643,29 @@ class _Bus:
 @asynccontextmanager
 async def _system_bus():
     writer = None
+
+    async def connect() -> _Bus:
+        nonlocal writer
+        address, guid = _system_bus_address()
+        reader, writer = await asyncio.open_unix_connection(address)
+        _verify_bus_peer(writer)
+        identity = str(os.getuid()).encode("ascii").hex()
+        writer.write(b"\0AUTH EXTERNAL " + identity.encode("ascii") + b"\r\n")
+        await writer.drain()
+        auth = (await reader.readline()).split()
+        if len(auth) != 2 or auth[0] != b"OK" or (guid and auth[1].lower() != guid.lower().encode()):
+            raise NetworkManagerError("Unable to authenticate to the system D-Bus.")
+        writer.write(b"BEGIN\r\n")
+        bus = _Bus(reader, writer)
+        hello = await bus.call("/org/freedesktop/DBus", DBUS_SERVICE, "Hello", destination=DBUS_SERVICE)
+        if len(hello) != 1 or not isinstance(hello[0], str) or not hello[0].startswith(":"):
+            raise NetworkManagerError("Unable to initialize the system D-Bus connection.")
+        return bus
+
     try:
         try:
-            async with asyncio.timeout(DBUS_TIMEOUT):
-                address, guid = _system_bus_address()
-                reader, writer = await asyncio.open_unix_connection(address)
-                _verify_bus_peer(writer)
-                identity = str(os.getuid()).encode("ascii").hex()
-                writer.write(b"\0AUTH EXTERNAL " + identity.encode("ascii") + b"\r\n")
-                await writer.drain()
-                auth = (await reader.readline()).split()
-                if len(auth) != 2 or auth[0] != b"OK" or (guid and auth[1].lower() != guid.lower().encode()):
-                    raise NetworkManagerError("Unable to authenticate to the system D-Bus.")
-                writer.write(b"BEGIN\r\n")
-                bus = _Bus(reader, writer)
-                hello = await bus.call("/org/freedesktop/DBus", DBUS_SERVICE, "Hello", destination=DBUS_SERVICE)
-                if len(hello) != 1 or not isinstance(hello[0], str) or not hello[0].startswith(":"):
-                    raise NetworkManagerError("Unable to initialize the system D-Bus connection.")
-        except (OSError, ValueError, UnconfirmedWrite) as error:
+            bus = await asyncio.wait_for(connect(), DBUS_TIMEOUT)
+        except (asyncio.TimeoutError, OSError, ValueError, UnconfirmedWrite) as error:
             raise NetworkManagerError("Unable to initialize the system D-Bus connection.") from error
         yield bus
     finally:
@@ -849,19 +853,55 @@ async def _nm_update(bus: _Bus, ref: ProfileRef, settings: Settings, revision: i
             raise
 
 
+def _comparable_settings(settings: Settings) -> Settings:
+    # Normalize only known readback differences. Unknown settings and secrets
+    # must still compare exactly, even when the daemon is newer than libnm.
+    result = copy.deepcopy(settings)
+    _normalize_ip_settings(result)
+
+    def omit_default(values: dict[str, dict[str, object]], key: str, signature: str, default: object) -> None:
+        if values.get(key) == _variant(signature, default):
+            del values[key]
+
+    if result.get("proxy") == {}:
+        del result["proxy"]
+    connection = result.get("connection", {})
+    connection.pop("timestamp", None)  # last activation, not an editable setting
+    omit_default(connection, "permissions", "as", [])
+    for key in ("autoconnect-ports", "autoconnect-slaves"):
+        omit_default(connection, key, "i", -1)
+    for version in (4, 6):
+        values = result.get(f"ipv{version}", {})
+        if "dns" in values:
+            values["dns-data"] = _variant("as", _dns_servers(values, version))
+            del values["dns"]
+        for key in ("address-data", "route-data"):
+            omit_default(values, key, "aa{sv}", [])
+        for key in ("dns-search", "dns-data"):
+            omit_default(values, key, "as", [])
+    wireguard = result.get("wireguard", {})
+    for key in ("private-key-flags", "mtu", "listen-port", "fwmark"):
+        omit_default(wireguard, key, "u", 0)
+    omit_default(wireguard, "peers", "aa{sv}", [])
+    for peer in _data(wireguard, "peers", []):
+        omit_default(peer, "allowed-ips", "as", [])
+        omit_default(peer, "persistent-keepalive", "u", 0)
+        omit_default(peer, "preshared-key-flags", "u", SECRET_NOT_REQUIRED)
+    return result
+
+
 async def _matches_persisted_profile(intended: Settings, expected: ProfileRef | None = None) -> bool:
     # Only turn a lost acknowledgement into success with positive evidence.
-    # NetworkManager may normalize defaults; uncertain is safer than a false match.
     try:
         async with _system_bus() as bus:
             ref = await _nm_profile_ref(bus, intended["connection"]["uuid"]["data"])
             if expected is not None and ref != expected:
                 return False
             revision, actual = await _nm_snapshot(bus, ref)
-            _normalize_ip_settings(actual)
             dirty = await bus.call(ref.path, "org.freedesktop.DBus.Properties", "Get", "ss",
                                    NM_CONNECTION_INTERFACE, "Unsaved", destination=ref.owner)
-            return (actual == intended and dirty == [_variant("b", False)]
+            return (dirty == [_variant("b", False)]
+                    and _comparable_settings(actual) == _comparable_settings(intended)
                     and await _nm_revision(bus, ref) == revision)
     except NetworkManagerError:
         return False
@@ -1423,14 +1463,13 @@ async def _send_probe(device: str, targets: list[ProbeTarget]) -> int:
                 destination = (str(target.address), 53 if target.dns else 0)
                 if not ipv4:
                     destination = (*destination, 0, 0)
-                await asyncio.wait_for(
-                    asyncio.get_running_loop().sock_sendto(probe, payload, destination), timeout=1,
-                )
+                probe.connect(destination)
+                await asyncio.wait_for(asyncio.get_running_loop().sock_sendall(probe, payload), timeout=1)
                 sent = True
-        except OSError as error:
-            detail = f"Unable to send tunnel probe on {device} to {target.address}: {error}"
-            logger.warning("Tunnel probe send failed (errno=%s).", error.errno)
-            failures.append(detail)
+        except (OSError, asyncio.TimeoutError) as error:
+            reason = "send timed out" if isinstance(error, asyncio.TimeoutError) else str(error)
+            logger.warning("Tunnel probe send failed (errno=%s).", getattr(error, "errno", None))
+            failures.append(f"Unable to send tunnel probe on {device} to {target.address}: {reason}")
     if not sent:
         raise NetworkManagerError("; ".join(failures) or "No tunnel probe targets available.")
     return len(failures)
@@ -1670,7 +1709,7 @@ class Plugin:
                 ),
                 timeout=2,
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             self._log(logging.DEBUG, "%s peer_snapshot_timed_out", self._profile_ref(uuid))
             return
         if handler is not self._log_handler or not self._logging["debug"]:
@@ -1990,7 +2029,7 @@ class Plugin:
             kind, state, ipv4, ipv6 = fields
             if any(value not in ("unknown", "none", "portal", "limited", "full") for value in (ipv4, ipv6)):
                 raise NetworkManagerError("NetworkManager returned unexpected device connectivity data.")
-            if kind in ("wifi", "ethernet", "gsm", "cdma", "bluetooth") and state == "connected":
+            if kind in ("wifi", "ethernet", "gsm", "cdma", "bt", "bluetooth") and state == "connected":
                 ready |= ipv4 == "full" or ipv6 == "full"
         return ready
 

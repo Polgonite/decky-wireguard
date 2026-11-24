@@ -39,8 +39,9 @@ If a save succeeds but reloading fails, the editor keeps the draft visible.
 Select **Retry reload** to read the saved profile before editing again; this
 does not repeat the write. If another editor changes the profile, choose
 **Reload and keep my edits** to combine changes to different fields. If both
-copies changed the same field (including the peer list), the draft is kept
-and nothing is written. **Discard edits and reload** asks for confirmation.
+copies changed the same field (including the peer list) differently, the draft
+is kept and nothing is written. A peer already saved with the same settings
+does not conflict. **Discard edits and reload** asks for confirmation.
 If a save
 times out, check the profile in the connection list before retrying: the
 complete change may already have reached disk. Retrying the same new draft

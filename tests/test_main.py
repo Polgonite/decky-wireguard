@@ -48,11 +48,18 @@ WIFI = "33333333-3333-4333-8333-333333333333"
 FIELDS = ("--fields", "UUID,TYPE,NAME,DEVICE,STATE,ACTIVE-PATH", "connection", "show")
 
 
+def settings_directory(test, *additional_variables):
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    env = patch.dict(os.environ, dict.fromkeys(("DECKY_PLUGIN_SETTINGS_DIR", *additional_variables), directory.name))
+    env.start()
+    test.addCleanup(env.stop)
+    return Path(directory.name)
+
+
 class UISettingsTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        directory = self.enterContext(tempfile.TemporaryDirectory())
-        self.enterContext(patch.dict(os.environ, {"DECKY_PLUGIN_SETTINGS_DIR": directory}))
-        self.directory = Path(directory)
+        self.directory = settings_directory(self)
         self.path = self.directory / "ui.json"
         self.plugin = Plugin()
 
@@ -105,15 +112,10 @@ class UISettingsTests(unittest.IsolatedAsyncioTestCase):
 
 class StartupTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.directory = Path(directory.name)
+        self.directory = settings_directory(self)
         self.settings_path = self.directory / "startup.json"
         self.boot_path = self.directory / "boot-id"
         self.boot_path.write_text(HOME)
-        environment = patch.dict(os.environ, {"DECKY_PLUGIN_SETTINGS_DIR": directory.name})
-        environment.start()
-        self.addCleanup(environment.stop)
         boot = patch("main.BOOT_ID_PATH", self.boot_path)
         boot.start()
         self.addCleanup(boot.stop)
@@ -529,6 +531,8 @@ class InternetReadinessTests(unittest.IsolatedAsyncioTestCase):
             ("wifi:connected:full:none\n", True),
             ("ethernet:connected:none:full\n", True),
             ("gsm:connected:full:none\n", True),
+            ("bt:connected:full:none\n", True),
+            ("bt:connected:portal:none\n", False),
             ("wireguard:connected:full:full\nwifi:connected:limited:none\n", False),
             ("tun:connected:full:full\n", False),
             ("wifi:disconnected:full:full\n", False),
@@ -623,12 +627,9 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.plugin.get_profiles(), {"success": True, "profiles": []})
 
     def diagnostic_directory(self):
-        directory = self.enterContext(tempfile.TemporaryDirectory())
-        self.enterContext(patch.dict(os.environ, {
-            "DECKY_PLUGIN_SETTINGS_DIR": directory, "DECKY_PLUGIN_LOG_DIR": directory,
-        }))
+        directory = settings_directory(self, "DECKY_PLUGIN_LOG_DIR")
         self.addAsyncCleanup(self.plugin._unload)
-        return Path(directory) / DIAGNOSTIC_LOG
+        return directory / DIAGNOSTIC_LOG
 
     async def test_diagnostics_default_off_and_persist_without_debug_after_disabling(self):
         log = self.diagnostic_directory()
@@ -706,6 +707,16 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
                        "/active/42", "public-key", "10.0.0.1", endpoint, "198.51.100.35", ":51820",
                        "Sensitive command error"):
             self.assertNotIn(secret, text)
+
+    async def test_debug_snapshot_timeout_does_not_interrupt_profile_monitoring(self):
+        log = self.diagnostic_directory()
+        self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
+        await self.plugin.set_logging_settings(True, True)
+        wait_for = asyncio.wait_for
+        with patch("main.asyncio.wait_for", new=lambda operation, timeout: wait_for(operation, 0)):
+            result = await self.plugin.get_profiles()
+        self.assertTrue(result["success"])
+        self.assertIn("tunnel-1 peer_snapshot_timed_out", log.read_text())
 
     async def test_peer_health_returns_per_peer_handshakes_and_traffic_counters(self):
         self.nmcli.return_value = f"{HOME}:wireguard:Home:wg0:activated:/active/1\n"
@@ -1305,9 +1316,12 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         async def system_bus():
             yield self.bus
 
-        self.enterContext(patch("main._system_bus", system_bus))
-        for target, side_effect in (("main._command", command), ("main._nmcli", nmcli)):
-            patcher = patch(target, new_callable=AsyncMock, side_effect=side_effect)
+        for target, replacement in (
+            ("main._system_bus", system_bus),
+            ("main._command", AsyncMock(side_effect=command)),
+            ("main._nmcli", AsyncMock(side_effect=nmcli)),
+        ):
+            patcher = patch(target, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -1694,12 +1708,6 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("preshared-key", peer)
         nmcli.assert_not_called()
 
-    async def test_timed_out_dbus_request_is_an_unconfirmed_write(self):
-        reader = asyncio.StreamReader()
-        writer = Mock(write=Mock(), drain=AsyncMock())
-        with patch("main.DBUS_TIMEOUT", 0.01), self.assertRaises(UnconfirmedWrite):
-            await _Bus(reader, writer).call("/", "org.example", "Update2")
-
     async def test_lost_create_reply_reconciles_the_draft_uuid_without_deleting(self):
         config = {**await self.config(), "peers": []}
         with (patch("main._dbus_call", side_effect=UnconfirmedWrite("No reply")) as add,
@@ -1710,6 +1718,47 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verify.await_args.args[0]["connection"]["uuid"], v("s", WORK))
         add.assert_awaited_once()
         self.assertEqual(add.await_args.args[4]["connection"]["uuid"], v("s", WORK))
+
+    async def test_create_retry_recognizes_persisted_defaults_but_not_a_different_profile(self):
+        config = await self.config()
+        config["peers"][0].update(original_public_key=None, persistent_keepalive="")
+        with patch("main._dbus_call", return_value=[CONNECTION_PATH]) as add:
+            await self.plugin.create_connection_config(config, [], WORK)
+        stored = copy.deepcopy(add.await_args.args[4])
+        stored["proxy"] = {}
+        stored["connection"].update({"permissions": v("as", []), "autoconnect-ports": v("i", -1)})
+        del stored["wireguard"]["private-key-flags"]
+        del stored["wireguard"]["peers"]["data"][0]["persistent-keepalive"]
+        for family in ("ipv4", "ipv6"):
+            stored[family]["route-data"] = v("aa{sv}", [])
+            del stored[family]["dns-search"]
+            del stored[family]["dns"]
+        stored["ipv4"]["dns-data"] = v("as", ["10.0.0.1"])
+
+        with (patch("main._dbus_call") as add, patch("main._nm_profile_ref", return_value=REF),
+              patch("main._nm_snapshot", return_value=(43, stored)) as snapshot,
+              patch("main._nm_revision", return_value=43), patch.object(self.bus, "call", return_value=[v("b", False)])):
+            for failure in (UnconfirmedWrite("No reply"), DuplicateUuid("Already exists")):
+                add.side_effect = failure
+                self.assertEqual(await self.plugin.create_connection_config(config, [], WORK),
+                                 {"success": True, "uuid": WORK})
+            for group, field, value in (
+                ("wireguard", "private-key", v("s", wg_key(7))),
+                ("peer", "preshared-key", v("s", wg_key(7))),
+                ("peer", "preshared-key-flags", v("u", 1)),
+                ("peer", "future-option", v("i", 1)),
+                ("connection", "uuid", v("s", HOME)),
+                ("ipv4", "dns-data", v("as", ["10.0.0.9"])),
+            ):
+                with self.subTest(field=field), self.assertLogs("decky-wireguard"):
+                    actual = copy.deepcopy(stored)
+                    fields = actual["wireguard"]["peers"]["data"][0] if group == "peer" else actual[group]
+                    fields[field] = value
+                    snapshot.return_value = (43, actual)
+                    result = await self.plugin.create_connection_config(config, [], WORK)
+                    self.assertEqual((result["success"], result["code"], result["uuid"]), (False, "uuid_exists", WORK))
+            self.assertTrue(all(call.args[2] == "AddConnection" for call in add.await_args_list))
+        self.assertFalse(self.updates)
 
     async def test_lost_update_reply_confirms_only_matching_persisted_settings(self):
         intended = {"connection": {"id": v("s", "Changed"), "uuid": v("s", HOME)}}
@@ -1729,18 +1778,6 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(UnconfirmedWrite):
                         await _nm_update(self.bus, REF, intended, 42)
                 self.assertEqual([call.args[2] for call in bus.await_args_list], ["Update2", "Get"])
-
-    async def test_duplicate_create_only_succeeds_on_a_verified_match(self):
-        config = {**await self.config(), "peers": []}
-        with (patch("main._dbus_call", side_effect=DuplicateUuid("Already exists")) as add,
-              patch("main._matches_persisted_profile", side_effect=[True, False])):
-            first = await self.plugin.create_connection_config(config, [], WORK)
-            with self.assertLogs("decky-wireguard"):
-                second = await self.plugin.create_connection_config(config, [], WORK)
-        self.assertEqual(first, {"success": True, "uuid": WORK})
-        self.assertEqual((second["success"], second["code"], second["uuid"]), (False, "uuid_exists", WORK))
-        self.assertEqual([call.args[2] for call in add.await_args_list], ["AddConnection", "AddConnection"])
-        self.assertFalse(self.updates)
 
     async def test_invalid_new_profiles_are_rejected_before_creation(self):
         config = await self.config()
@@ -2096,7 +2133,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         ]
         send = AsyncMock()
         with patch("main.socket.socket") as create, patch.object(
-            asyncio.get_running_loop(), "sock_sendto", send,
+            asyncio.get_running_loop(), "sock_sendall", send,
         ):
             await _send_probe("wg0", targets)
         protocols = [call.args[2] for call in create.call_args_list]
@@ -2113,12 +2150,13 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(packets[0][2:], b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\0\0\2\0\1")
         self.assertEqual(packets[1][0], 8)
         self.assertEqual(packets[3][0], 128)
-        self.assertEqual(send.await_args_list[0].args[2], ("10.0.0.53", 53))
-        self.assertEqual(send.await_args_list[3].args[2], ("fd00::1", 0, 0, 0))
+        self.assertEqual([call.args[0] for call in probe.connect.call_args_list], [
+            ("10.0.0.53", 53), ("10.0.0.1", 0), ("fd00::53", 53, 0, 0), ("fd00::1", 0, 0, 0),
+        ])
 
     async def test_binding_failure_never_sends_unbound_probe(self):
         with patch("main.socket.socket") as create, patch.object(
-            asyncio.get_running_loop(), "sock_sendto", new_callable=AsyncMock,
+            asyncio.get_running_loop(), "sock_sendall", new_callable=AsyncMock,
         ) as send:
             create.return_value.__enter__.return_value.setsockopt.side_effect = PermissionError(
                 "denied",
@@ -2127,24 +2165,25 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
                 NetworkManagerError, "denied",
             ):
                 await _send_probe("wg0", [ProbeTarget(ip_address("10.0.0.1"))])
+            create.return_value.__enter__.return_value.connect.assert_not_called()
             send.assert_not_awaited()
 
     async def test_failed_probe_does_not_prevent_other_targets_from_being_tried(self):
-        with patch("main.socket.socket"), patch.object(
-            asyncio.get_running_loop(), "sock_sendto",
-            new_callable=AsyncMock, side_effect=[OSError("no route"), None],
-        ) as send, self.assertLogs("decky-wireguard"):
-            await _send_probe("wg0", [
-                ProbeTarget(ip_address("10.0.0.1")), ProbeTarget(ip_address("fd00::1")),
-            ])
-        self.assertEqual(send.await_count, 2)
+        for error in (OSError("no route"), asyncio.TimeoutError()):
+            with (self.subTest(error=type(error)), patch("main.socket.socket"), patch.object(
+                asyncio.get_running_loop(), "sock_sendall", side_effect=[error, None],
+            ) as send, self.assertLogs("decky-wireguard")):
+                failures = await _send_probe("wg0", [
+                    ProbeTarget(ip_address("10.0.0.1")), ProbeTarget(ip_address("fd00::1")),
+                ])
+                self.assertEqual((failures, send.await_count), (1, 2))
 
     async def test_restricted_ping_sockets_use_root_raw_socket_with_valid_checksum(self):
         raw = Mock()
         with patch(
             "main.socket.socket", side_effect=[PermissionError("ping group restricted"), raw],
         ) as create, patch.object(
-            asyncio.get_running_loop(), "sock_sendto", new_callable=AsyncMock,
+            asyncio.get_running_loop(), "sock_sendall", new_callable=AsyncMock,
         ) as send:
             raw.__enter__ = Mock(return_value=raw)
             raw.__exit__ = Mock(return_value=False)
@@ -2159,6 +2198,21 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SubprocessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_timed_out_dbus_request_is_an_unconfirmed_write(self):
+        reader = asyncio.StreamReader()
+        writer = Mock(write=Mock(), drain=AsyncMock())
+        with patch("main.DBUS_TIMEOUT", 0.01), self.assertRaises(UnconfirmedWrite):
+            await _Bus(reader, writer).call("/", "org.example", "Update2")
+
+    async def test_dbus_auth_timeout_closes_socket_before_sending_settings(self):
+        writer = bus_writer()
+        with (patch("main.DBUS_TIMEOUT", 0.01),
+              patch("main.asyncio.open_unix_connection", return_value=(asyncio.StreamReader(), writer)),
+              self.assertRaisesRegex(NetworkManagerError, "initialize")):
+            await _dbus_call(NM_SETTINGS_PATH, "org.freedesktop.NetworkManager.Settings", "AddConnection")
+        writer.write.assert_called_once()
+        writer.transport.abort.assert_called_once()
+
     async def test_untrusted_bus_peer_is_rejected_before_any_bytes_are_sent(self):
         writer = bus_writer(2000)
         with (patch("main.asyncio.open_unix_connection", return_value=(AsyncMock(), writer)),
@@ -2326,8 +2380,8 @@ class SubprocessTests(unittest.IsolatedAsyncioTestCase):
             await _nmcli("connection", "up", "uuid", HOME)
 
     async def test_timeout_and_cancellation_kill_and_reap_process(self):
-        for failure in [TimeoutError(), asyncio.CancelledError()]:
-            with self.subTest(failure=type(failure).__name__):
+        for failure in (TimeoutError(), asyncio.TimeoutError(), asyncio.CancelledError()):
+            with self.subTest(failure=type(failure)):
                 process = Mock(
                     returncode=None,
                     communicate=AsyncMock(side_effect=[failure, (b"", b"")]),
