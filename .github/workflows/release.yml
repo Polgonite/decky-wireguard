@@ -1,4 +1,4 @@
-name: Release
+name: CI and release
 
 on:
   push:
@@ -9,15 +9,16 @@ permissions:
   contents: read
 
 # Serialize builds per branch so two pushes cannot race to publish the same version.
+# Superseded pull request runs are canceled; running releases never are (GitHub
+# still replaces an older waiting run with the newest one).
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   checks:
-    name: Pre-commit checks in uv venv
-    # Disabled: checks run locally before pushing. Remove this line to re-enable.
-    if: ${{ false }}
+    # Required status check on main (see docs/development.md#branch-protection); keep the name stable.
+    name: Checks
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -32,11 +33,12 @@ jobs:
           enable-cache: true
 
       - name: Install development dependencies
+        id: deps
         run: |
           uv sync --locked
           uv run --locked npm ci
 
-      - name: Run pre-commit checks
+      - name: Lint, type-check, and test (pre-commit)
         run: |
           if ! command -v nmcli >/dev/null; then
             sudo apt-get update
@@ -44,13 +46,40 @@ jobs:
           fi
           uv run --locked pre-commit run --all-files
 
+      - name: Validate release version
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET: ${{ github.base_ref || github.ref_name }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$TARGET" = main ] &&
+            { [ "$HEAD_BRANCH" != dev ] || [ "$HEAD_REPO" != "$GH_REPO" ]; }; then
+            echo "::error::Stable releases are promoted from dev. Target dev with this pull request instead of main."
+            exit 1
+          fi
+          channel=development
+          if [ "$TARGET" = main ]; then channel=stable; fi
+          gh api --paginate "repos/${GH_REPO}/git/matching-refs/tags/v" --jq '.[].ref' |
+            uv run --locked python tools/release_version.py select --channel "$channel" \
+              --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --sha "$GITHUB_SHA"
+
+      - name: Build and verify installable ZIP
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          uv run --locked npm run package
+          uv run --locked python tools/verify_package.py "$(uv run --locked node -p "require('./package.json').version")"
+
   release:
-    name: Build and publish ${{ github.ref_name == 'main' && 'stable' || 'development' }} release
+    name: Publish ${{ github.ref_name == 'main' && 'stable release' || 'development build' }}
+    # Pull requests only run the checks. Publication needs a push and successful checks.
+    needs: checks
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # Re-enable together with the checks job above.
-    # needs: checks
-    if: github.event_name == 'push'
     permissions:
       contents: write
     steps:
@@ -77,54 +106,18 @@ jobs:
           BRANCH: ${{ github.ref_name }}
         shell: bash
         run: |
-          package_version="$(uv run --locked node -p "require('./package.json').version")"
-          base_version="${package_version%%-*}"
-          if ! [[ "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::package.json version '${package_version}' must start with a plain MAJOR.MINOR.PATCH version."
-            exit 1
-          fi
+          channel=development
+          if [ "$BRANCH" = main ]; then channel=stable; fi
+          gh api --paginate "repos/${GH_REPO}/git/matching-refs/tags/v" --jq '.[].ref' |
+            uv run --locked python tools/release_version.py select --channel "$channel" \
+              --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --sha "$GITHUB_SHA" \
+              --output "$GITHUB_OUTPUT"
 
-          # Stable releases are immutable and every later build must sort above the latest one,
-          # otherwise the updater (which never downgrades) would not offer it.
-          if [ "$(gh api "repos/${GH_REPO}/git/matching-refs/tags/v${base_version}" \
-              --jq "any(.[]; .ref == \"refs/tags/v${base_version}\")")" = "true" ]; then
-            echo "::error::Version ${base_version} is already released as v${base_version}. Bump the version in package.json."
-            exit 1
-          fi
-          if latest="$(gh api "repos/${GH_REPO}/releases/latest" --jq .tag_name 2>&1)"; then
-            latest="${latest#v}"
-            if [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
-              [ "$(printf '%s\n%s\n' "$latest" "$base_version" | sort -V | tail -n1)" != "$base_version" ]; then
-              echo "::error::Version ${base_version} is older than the latest stable release ${latest}. Bump the version in package.json."
-              exit 1
-            fi
-          elif [[ "$latest" != *"HTTP 404"* ]]; then
-            echo "::error::Could not look up the latest stable release: ${latest}"
-            exit 1
-          fi
-
-          if [ "$BRANCH" = main ]; then
-            if [ "$package_version" != "$base_version" ]; then
-              echo "::error::Stable releases from main need a plain MAJOR.MINOR.PATCH version, not '${package_version}'."
-              exit 1
-            fi
-            version="$base_version"
-            channel=stable
-          else
-            version="${base_version}-dev.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.sha${GITHUB_SHA:0:7}"
-            channel=development
-            uv run --locked npm version "$version" --no-git-tag-version --ignore-scripts
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-
-      - name: Run tests including offline NetworkManager conversion
-        run: |
-          if ! command -v nmcli >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends network-manager
-          fi
-          uv run --locked npm test
+      - name: Embed development version
+        if: steps.version.outputs.channel == 'development'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: uv run --locked npm version "$VERSION" --no-git-tag-version --ignore-scripts
 
       - name: Build installable ZIP
         run: uv run --locked npm run package
@@ -132,27 +125,7 @@ jobs:
       - name: Verify installable ZIP
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          uv run --locked python - <<'PY'
-          import json
-          import os
-          from zipfile import ZipFile
-
-          version = os.environ["VERSION"]
-          with ZipFile(f"out/decky-wireguard-{version}.zip") as archive:
-              assert archive.testzip() is None, "Corrupt ZIP archive"
-              expected = {
-                  "plugin.json", "package.json", "main.py", "dist/index.js", "README.md",
-                  "py_modules/nm_keyfile.py", "py_modules/read_conf.py", "docs/configuration.md", "docs/development.md",
-                  "docs/how-it-works.md", "docs/troubleshooting.md",
-              }
-              assert set(archive.namelist()) == {
-                  f"decky-wireguard/{name}" for name in expected
-              }, "Unexpected ZIP layout"
-              package = json.loads(archive.read("decky-wireguard/package.json"))
-              assert package["version"] == version, "Incorrect embedded version"
-              assert archive.getinfo("decky-wireguard/dist/index.js").file_size > 0
-          PY
+        run: uv run --locked python tools/verify_package.py "$VERSION"
 
       - name: Publish stable release
         if: steps.version.outputs.channel == 'stable'
@@ -160,14 +133,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ steps.version.outputs.version }}
+          KIND: ${{ steps.version.outputs.kind }}
+          PREVIOUS: ${{ steps.version.outputs.previous }}
         shell: bash
         run: |
+          if [ -n "$PREVIOUS" ]; then
+            summary="Stable ${KIND} release after ${PREVIOUS}"
+            since=(--notes-start-tag "$PREVIOUS")
+          else
+            summary="First stable release"
+            since=()
+          fi
           gh release create "v${VERSION}" \
             "out/decky-wireguard-${VERSION}.zip" \
             --target "$GITHUB_SHA" \
             --title "WireGuard ${VERSION}" \
-            --notes "Stable release built from commit ${GITHUB_SHA}. Install the attached ZIP through Decky Loader, or update from the plugin's settings. Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
-            --generate-notes \
+            --notes "${summary}, built from commit ${GITHUB_SHA}. Install the attached ZIP through Decky Loader, or update from the plugin's settings. Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --generate-notes "${since[@]}" \
             --latest
 
       - name: Publish development prerelease
@@ -185,3 +167,39 @@ jobs:
             --notes "Automated development build of commit ${GITHUB_SHA}. Not a stable release. Install the attached ZIP through Decky Loader. Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
             --prerelease \
             --latest=false
+
+      - name: Verify published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+          CHANNEL: ${{ steps.version.outputs.channel }}
+        shell: bash
+        run: |
+          tag="v${VERSION}"
+          asset="decky-wireguard-${VERSION}.zip"
+          prerelease=false
+          if [ "$CHANNEL" = development ]; then prerelease=true; fi
+
+          tag_target="$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq '"\(.object.type) \(.object.sha)"')"
+          if [ "$tag_target" != "commit ${GITHUB_SHA}" ]; then
+            echo "::error::Tag ${tag} points to '${tag_target}' instead of commit ${GITHUB_SHA}."
+            exit 1
+          fi
+          if ! gh api "repos/${GH_REPO}/releases/tags/${tag}" | jq -e \
+              --arg asset "$asset" --arg sha "$GITHUB_SHA" --argjson prerelease "$prerelease" \
+              '.draft == false and .prerelease == $prerelease and .target_commitish == $sha
+                and (.body | contains($sha)) and [.assets[].name] == [$asset]' >/dev/null; then
+            echo "::error::Release ${tag} does not have the expected prerelease flag, commit, notes, or single asset ${asset}."
+            exit 1
+          fi
+          gh release download "$tag" --pattern "$asset" --dir "${RUNNER_TEMP}/published"
+          if ! cmp "out/${asset}" "${RUNNER_TEMP}/published/${asset}"; then
+            echo "::error::The published ${asset} differs from the verified build."
+            exit 1
+          fi
+          if [ "$CHANNEL" = stable ] && [ "$(gh api "repos/${GH_REPO}/releases/latest" --jq .tag_name)" != "$tag" ]; then
+            echo "::error::${tag} is not marked as the latest release."
+            exit 1
+          fi
+          echo "Published ${tag} from ${GITHUB_SHA} with verified asset ${asset}."

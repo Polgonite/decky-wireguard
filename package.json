@@ -10,7 +10,8 @@
     "lint": "eslint src rollup.config.js eslint.config.js",
     "typecheck": "tsc --noEmit",
     "test": "python3 -m unittest discover -s tests -v && node --test tests/*.test.cjs",
-    "package": "npm run build && python3 tools/package.py"
+    "package": "npm run build && python3 tools/package.py",
+    "bump": "python3 tools/release_version.py bump"
   },
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
