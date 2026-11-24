@@ -42,7 +42,8 @@ does not repeat the write. If another editor changes the profile, choose
 copies changed the same field (including the peer list) differently, the draft
 is kept and nothing is written. Address edits also conflict with an external
 IP method change if saving would overwrite that method. A peer already saved
-with the same settings does not conflict. **Discard edits and reload** asks for
+with equivalent settings does not conflict, even if Allowed IPs or keepalive
+have been normalized. **Discard edits and reload** asks for
 confirmation.
 If a save
 times out, check the profile in the connection list before retrying: the

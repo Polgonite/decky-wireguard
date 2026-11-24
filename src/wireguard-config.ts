@@ -135,6 +135,73 @@ function storedPeerFields(peer: PeerConfig): Omit<PeerConfig, "original_public_k
   };
 }
 
+function ipv4Number(text: string): bigint | null {
+  const parts = text.split(".");
+  if (parts.length !== 4 || parts.some((part) =>
+    !/^(0|[1-9][0-9]{0,2})$/.test(part) || Number(part) > 255)) return null;
+  return parts.reduce((value, part) => (value << 8n) | BigInt(part), 0n);
+}
+
+function networkValue(entry: string): string {
+  const fallback = `invalid:${entry}`;
+  const parts = entry.split("/");
+  if (parts.length > 2 || !parts[0]) return fallback;
+  const address = parts[0];
+  const ipv6 = address.includes(":");
+  const bits = ipv6 ? 128 : 32;
+  let value: bigint | null;
+  if (ipv6) {
+    if (!/^[0-9a-fA-F:.]+$/.test(address)) return fallback;
+    try {
+      const canonical = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+      const halves = canonical.split("::");
+      const left = halves[0] ? halves[0].split(":") : [];
+      const right = halves[1] ? halves[1].split(":") : [];
+      const groups = halves.length === 2
+        ? [...left, ...Array<string>(8 - left.length - right.length).fill("0"), ...right]
+        : left;
+      value = groups.reduce((result, group) => (result << 16n) | BigInt(`0x${group}`), 0n);
+    } catch {
+      return fallback;
+    }
+  } else {
+    value = ipv4Number(address);
+    if (value === null) return fallback;
+  }
+  let prefix = bits;
+  if (parts.length === 2) {
+    const mask = parts[1]!;
+    if (/^[0-9]+$/.test(mask)) {
+      prefix = Number(mask);
+    } else if (!ipv6) {
+      const maskValue = ipv4Number(mask);
+      if (maskValue === null) return fallback;
+      let binary = maskValue.toString(2).padStart(32, "0");
+      if (binary.startsWith("0") && maskValue !== 0n) {
+        binary = [...binary].map((bit) => bit === "0" ? "1" : "0").join("");
+      }
+      if (!/^1*0*$/.test(binary)) return fallback;
+      prefix = binary.indexOf("0") === -1 ? 32 : binary.indexOf("0");
+    } else return fallback;
+    if (!Number.isInteger(prefix) || prefix < 0 || prefix > bits) return fallback;
+  }
+  const shift = BigInt(bits - prefix);
+  return `${bits}:${(value >> shift) << shift}/${prefix}`;
+}
+
+function comparablePeer(peer: PeerConfig): string {
+  const keepalive = peer.persistent_keepalive.trim();
+  const number = /^[0-9]+$/.test(keepalive) ? Number(keepalive) : NaN;
+  return JSON.stringify({
+    public_key: peer.public_key.trim(),
+    preshared_key: peer.preshared_key.trim(),
+    allowed_ips: peer.allowed_ips.split(/[\s,]+/).filter(Boolean).map(networkValue),
+    endpoint: peer.endpoint.trim(),
+    persistent_keepalive: !keepalive || keepalive.toLowerCase() === "off" ? "0"
+      : Number.isSafeInteger(number) && number <= 65535 ? String(number) : keepalive,
+  });
+}
+
 export function fromDraft(draft: EditorDraft): { config: WireGuardConfig; advanced: AdvancedProperty[] } {
   const configured = draft.advanced.filter((property) => property.key.trim() !== "");
   const keys = configured.map((property) => property.key.trim());
@@ -163,7 +230,7 @@ export function draftChanged(draft: EditorDraft, saved: EditorDraft): boolean {
 export function rebaseDraft(base: EditorDraft, local: EditorDraft, fresh: EditorDraft): EditorDraft {
   const config = { ...fresh.config };
   const comparable = (value: string | EditablePeer[]) =>
-    Array.isArray(value) ? JSON.stringify(value.map(storedPeerFields)) : value;
+    Array.isArray(value) ? JSON.stringify(value.map(comparablePeer)) : value;
   const copy = <K extends keyof EditorDraft["config"]>(key: K) => {
     const previous = comparable(base.config[key]);
     const edited = comparable(local.config[key]);
@@ -173,6 +240,12 @@ export function rebaseDraft(base: EditorDraft, local: EditorDraft, fresh: Editor
     config[key] = local.config[key];
   };
   for (const key of ["name", "private_key", "addresses", "dns", "mtu", "listen_port", "peers"] as const) copy(key);
+  if (config.peers === local.config.peers) {
+    config.peers = config.peers.map((peer) => {
+      const saved = fresh.config.peers.find((candidate) => comparablePeer(candidate) === comparablePeer(peer));
+      return saved ? { ...peer, original_public_key: saved.original_public_key } : peer;
+    });
+  }
   const advanced = fresh.advanced.map((p) => ({ ...p }));
   for (const { key, value } of fromDraft(local).advanced) {
     const previous = base.advanced.find((p) => p.key === key);

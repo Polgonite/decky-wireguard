@@ -6,7 +6,7 @@ const { runInNewContext } = require("node:vm");
 const ts = require("typescript");
 
 const source = readFileSync(resolve(__dirname, "../src/wireguard-config.ts"), "utf8");
-const context = { exports: {} };
+const context = { exports: {}, URL };
 runInNewContext(ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
 }).outputText, context);
@@ -77,6 +77,64 @@ test("rebasing a persisted new peer keeps its saved identity and unrelated draft
   assert.deepEqual(plain(rebased.config.peers), plain(fresh.config.peers));
   const changed = toDraft({ ...config, peers: [{ ...peer, preshared_key: "different" }] }, []);
   assert.throws(() => rebaseDraft(base, local, changed), /Both copies changed peers/);
+});
+
+test("rebasing compares canonical peer settings and retains saved identities", () => {
+  const base = toDraft({ ...config, peers: [] }, []);
+  const localPeer = {
+    ...peer, id: "new-peer", original_public_key: null, public_key: " peer ",
+    preshared_key: " key ", endpoint: " vpn.example.com:51820 ",
+    allowed_ips: "10.0.0.8, 192.0.2.129/24 2001:DB8::1234/64, ::ffff:192.0.2.1",
+    persistent_keepalive: " OFF ",
+  };
+  const persistedPeer = {
+    ...peer, preshared_key: "key", allowed_ips: "10.0.0.8/32, 192.0.2.0/24, 2001:db8::/64, ::ffff:c000:201/128",
+    persistent_keepalive: "",
+  };
+  const local = { ...base, config: { ...base.config, name: "Unsaved name", peers: [localPeer] } };
+  const fresh = toDraft({ ...config, peers: [persistedPeer] }, []);
+  const rebased = rebaseDraft(base, local, fresh);
+  assert.equal(rebased.config.name, "Unsaved name");
+  assert.deepEqual(plain(rebased.config.peers), plain(fresh.config.peers));
+
+  const different = toDraft({ ...config, peers: [{ ...persistedPeer, allowed_ips: "10.0.0.9/32" }] }, []);
+  assert.throws(() => rebaseDraft(base, local, different), /Both copies changed peers/);
+  const differentKeepalive = toDraft({ ...config, peers: [{ ...persistedPeer, persistent_keepalive: "25" }] }, []);
+  assert.throws(() => rebaseDraft(base, local, differentKeepalive), /Both copies changed peers/);
+  for (const invalid of ["10.0.0.08", "10.0.0.8/33", "2001:db8:::1", "10.0.0.8/"]) {
+    const invalidLocal = { ...local, config: { ...local.config, peers: [{ ...localPeer, allowed_ips: invalid }] } };
+    assert.throws(() => rebaseDraft(base, invalidLocal, fresh), /Both copies changed peers/);
+  }
+});
+
+test("rebasing peer edits retains saved identities for individually matching peers", () => {
+  const savedPeer = { ...peer, allowed_ips: "10.0.0.8/32", persistent_keepalive: "" };
+  const secondPeer = { ...peer, original_public_key: "second", public_key: "second" };
+  const base = toDraft({ ...config, peers: [savedPeer, secondPeer] }, []);
+  const local = {
+    ...base, config: { ...base.config, peers: [
+      { ...base.config.peers[0], original_public_key: null, allowed_ips: "10.0.0.8", persistent_keepalive: "off" },
+      { ...base.config.peers[1], endpoint: "other.example.com:51820" },
+    ] },
+  };
+  const rebased = rebaseDraft(base, local, toDraft({ ...config, peers: [savedPeer, secondPeer] }, []));
+  assert.equal(rebased.config.peers[0].original_public_key, "peer");
+  assert.equal(rebased.config.peers[1].endpoint, "other.example.com:51820");
+  assert.equal(rebased.config.peers[1].original_public_key, "second");
+});
+
+test("rebasing recognizes network masks and numeric keepalive equivalents", () => {
+  const base = toDraft({ ...config, peers: [] }, []);
+  for (const [allowed_ips, persistent_keepalive] of [
+    ["10.0.0.8/255.255.255.0", "00025"],
+    ["10.0.0.8/0.0.0.255", "25"],
+  ]) {
+    const local = { ...base, config: { ...base.config, peers: [
+      { ...peer, id: "new", original_public_key: null, allowed_ips, persistent_keepalive },
+    ] } };
+    const fresh = toDraft({ ...config, peers: [{ ...peer, allowed_ips: "10.0.0.0/24" }] }, []);
+    assert.deepEqual(plain(rebaseDraft(base, local, fresh).config.peers), plain(fresh.config.peers));
+  }
 });
 
 test("rebasing addresses detects external IP methods that the backend would overwrite", () => {

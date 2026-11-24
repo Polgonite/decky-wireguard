@@ -11,7 +11,7 @@ function compile(file) {
   }).outputText;
 }
 
-const configContext = { exports: {} };
+const configContext = { exports: {}, URL };
 runInNewContext(compile("wireguard-config.ts"), configContext);
 const config = configContext.exports;
 const compiled = compile("config-page.tsx");
@@ -395,6 +395,56 @@ test("a stale save reloads non-overlapping edits without writing until Save is p
   editor.render().save();
   await flush();
   assert.equal(writes[1][2], "fresh");
+});
+
+test("recovery keeps unrelated edits after a lost reply and a canonicalized peer save", async () => {
+  const base = config.toDraft({
+    ...saved.config, peers: [{
+      original_public_key: "peer", public_key: "peer", preshared_key: "",
+      allowed_ips: "10.0.0.0/24", endpoint: "", persistent_keepalive: "25",
+    }],
+  }, []);
+  const draftPeer = {
+    id: "peer-0", original_public_key: "peer", public_key: "peer", preshared_key: "",
+    allowed_ips: "10.0.0.8", endpoint: "", persistent_keepalive: "off",
+  };
+  const persistedPeer = {
+    original_public_key: "peer", public_key: "peer", preshared_key: "",
+    allowed_ips: "10.0.0.8/32", endpoint: "", persistent_keepalive: "",
+  };
+  const local = { ...base, config: { ...base.config, peers: [draftPeer] } };
+  const writes = [];
+  const editor = page(local, (route, _uuid, ...args) => {
+    if (route === "get_connection_config") {
+      return {
+        success: true, config: { ...base.config, name: writes.length > 2 ? "My edit" : base.config.name, peers: [persistedPeer] },
+        advanced: [], revision: "fresh",
+      };
+    }
+    if (route === "set_connection_config") {
+      writes.push(args);
+      if (writes.length === 1) throw new Error("Lost reply");
+      if (writes.length === 3) return { success: true };
+      return { success: false, code: "reload_required", error: "Profile changed" };
+    }
+    if (route === "get_profiles") return { success: true, profiles: [] };
+    assert.fail(`Unexpected backend call: ${route}`);
+  }, { saved: base });
+  editor.render().save();
+  await flush();
+  editor.render().change({ ...local, config: { ...local.config, name: "My edit" } });
+  editor.render().save();
+  await flush();
+  editor.render().click("Reload and keep my edits");
+  await flush();
+  assert.equal(editor.render().draft.config.name, "My edit");
+  assert.equal(editor.render().draft.config.peers[0].original_public_key, "peer");
+  editor.render().save();
+  await flush();
+  assert.equal(writes[2][0].name, "My edit");
+  assert.equal(writes[2][0].peers[0].original_public_key, "peer");
+  assert.equal(writes[2][2], "fresh");
+  assert.ok(editor.render().messages.some((text) => text.startsWith("Saved.")));
 });
 
 test("an overlapping external change keeps the draft until discard is confirmed", async () => {
