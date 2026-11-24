@@ -19,6 +19,7 @@ uv run --locked npm run package
 The installable archive is `out/decky-wireguard-0.1.0.zip`. Its single top-level
 `decky-wireguard` directory contains the backend, plugin metadata, compiled
 `dist/index.js`, the README, and four allowlisted Markdown guides in `docs/`.
+It also contains the project license and third-party license texts and notices.
 No third-party Python packages or runtime npm installation are needed. The
 bundled `py_modules/nm_keyfile.py` uses `ctypes` with the system's `libnm` for
 offline advanced-property conversion. Profile editing requires NetworkManager

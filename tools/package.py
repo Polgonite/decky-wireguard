@@ -5,6 +5,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 FILES = (
     "plugin.json", "package.json", "main.py", "py_modules/nm_keyfile.py", "py_modules/read_conf.py", "dist/index.js",
+    "LICENSE", "THIRD-PARTY-NOTICES.md", "LICENSES/decky-api-LGPL-2.1.txt", "LICENSES/react-icons-MIT.txt",
     "README.md", "docs/configuration.md", "docs/development.md", "docs/how-it-works.md",
     "docs/troubleshooting.md",
 )

@@ -2,6 +2,7 @@
   "name": "decky-wireguard",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Manage existing NetworkManager WireGuard connections from Decky Loader.",
   "type": "module",
   "scripts": {

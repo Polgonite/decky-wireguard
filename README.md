@@ -77,3 +77,9 @@ are subscribed to development updates next to your installed version.
 - [Troubleshooting and diagnostic logs](docs/troubleshooting.md)
 - [How status checks and Smart connect work](docs/how-it-works.md)
 - [Building, testing, and contributing](docs/development.md)
+
+## License
+
+The project's original code is licensed under the [MIT License](LICENSE).
+Third-party components retain their own licenses; see
+[third-party notices](THIRD-PARTY-NOTICES.md).

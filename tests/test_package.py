@@ -14,11 +14,16 @@ class PackageTests(unittest.TestCase):
             for name in FILES:
                 path = root / name
                 path.parent.mkdir(exist_ok=True)
-                path.write_text('{"version":"1.2.3"}' if name == "package.json" else "fixture")
+                path.write_text('{"version":"1.2.3","license":"MIT"}' if name == "package.json" else "fixture")
             archive = build(root)
             verify(archive, "1.2.3")
             with self.assertRaisesRegex(SystemExit, "does not match"):
                 verify(archive, "1.2.4")
+            (root / "package.json").write_text('{"version":"1.2.3","license":"ISC"}')
+            with self.assertRaisesRegex(SystemExit, "license"):
+                verify(build(root), "1.2.3")
+            (root / "package.json").write_text('{"version":"1.2.3","license":"MIT"}')
+            archive = build(root)
             with ZipFile(archive, "a") as extra:
                 extra.writestr("decky-wireguard/docs/local.md", "not for distribution")
             with self.assertRaisesRegex(SystemExit, r"unexpected: \['decky-wireguard/docs/local.md'\]"):
@@ -30,7 +35,7 @@ class PackageTests(unittest.TestCase):
             for name in FILES:
                 path = root / name
                 path.parent.mkdir(exist_ok=True)
-                path.write_text('{"version":"test"}' if name == "package.json" else "fixture")
+                path.write_text('{"version":"test","license":"MIT"}' if name == "package.json" else "fixture")
             extra = root / "docs/local.md"
             extra.write_text("not for distribution")
             with ZipFile(build(root)) as archive:
