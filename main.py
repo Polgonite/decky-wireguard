@@ -588,6 +588,18 @@ class _Bus:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.reader, self.writer = reader, writer
         self.serial = 0
+        self._watched_profile: ProfileRef | None = None
+        self.profile_updates = 0
+
+    async def watch_profile_updates(self, ref: ProfileRef) -> None:
+        rule = (
+            f"type='signal',sender='{ref.owner}',path='{ref.path}',"
+            f"interface='{NM_CONNECTION_INTERFACE}',member='Updated'"
+        )
+        await self.call("/org/freedesktop/DBus", DBUS_SERVICE, "AddMatch", "s", rule,
+                        destination=DBUS_SERVICE)
+        self._watched_profile = ref
+        self.profile_updates = 0
 
     async def call(self, path: str, interface: str, method: str, signature: str = "",
                    *values: object, destination: str = NM_SERVICE) -> list[object]:
@@ -608,6 +620,11 @@ class _Bus:
         await self.writer.drain()
         while True:
             message_type, _, fields, body = await _dbus_read_message(self.reader)
+            ref = self._watched_profile
+            if (message_type == 4 and ref is not None
+                    and fields.get(1) == ref.path and fields.get(2) == NM_CONNECTION_INTERFACE
+                    and fields.get(3) == "Updated" and fields.get(7) == ref.owner):
+                self.profile_updates += 1
             if fields.get(5) != self.serial or message_type not in (2, 3):
                 continue
             if message_type == 3:
@@ -720,13 +737,16 @@ async def _nm_profile_ref(bus: _Bus, uuid: str) -> ProfileRef:
 
 
 async def _nm_snapshot(bus: _Bus, ref: ProfileRef) -> tuple[int, Settings]:
+    await bus.watch_profile_updates(ref)
     before = await _nm_revision(bus, ref)
     secrets = _settings_reply(await bus.call(
         ref.path, NM_CONNECTION_INTERFACE, "GetSecrets", "s", "wireguard", destination=ref.owner,
     ))
+    updates = bus.profile_updates
     revision = await _nm_revision(bus, ref)
-    # NetworkManager updates its secret cache once even for already-saved keys.
-    if revision not in (before, before + 1):
+    # GetSecrets may itself advance the version, but an Updated signal after
+    # its reply means the returned secrets no longer belong to this revision.
+    if revision not in (before, before + 1) or bus.profile_updates != updates:
         raise ProfileConflict("The profile changed while reading its keys. Reload before editing.")
     settings = _settings_reply(await bus.call(ref.path, NM_CONNECTION_INTERFACE, "GetSettings", destination=ref.owner))
     try:

@@ -1310,7 +1310,8 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.fail(f"Unexpected nmcli call: {arguments}")
 
-        self.bus = Mock(call=AsyncMock(side_effect=dbus_call))
+        self.bus = Mock(call=AsyncMock(side_effect=dbus_call), watch_profile_updates=AsyncMock(),
+                        profile_updates=0)
 
         @asynccontextmanager
         async def system_bus():
@@ -1591,6 +1592,32 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
             result = await self.plugin.get_connection_config(HOME)
         self.assertFalse(result["success"])
         self.assertIsNone(self.plugin._editor_snapshot)
+
+    async def test_external_key_change_after_secret_reply_cannot_be_saved_as_stale(self):
+        original_call = self.bus.call.side_effect
+        changed_key = wg_key(9)
+        changed = False
+
+        async def change_after_reply(path, interface, method, signature="", *values, destination):
+            nonlocal changed
+            if method == "Get" and self.calls[-1:] == ["GetSecrets"] and not changed:
+                self.revision += 1
+                self.secrets["wireguard"]["private-key"] = v("s", changed_key)
+                self.bus.profile_updates += 1
+                changed = True
+            return await original_call(path, interface, method, signature, *values, destination=destination)
+
+        self.bus.call.side_effect = change_after_reply
+        with self.assertLogs("decky-wireguard"):
+            result = await self.plugin.get_connection_config(HOME)
+        self.assertFalse(result["success"])
+        self.assertIsNone(self.plugin._editor_snapshot)
+        loaded = await self.plugin.get_connection_config(HOME)
+        self.assertEqual(loaded["config"]["private_key"], changed_key)
+        config = {**loaded["config"], "name": "Changed"}
+        self.assertEqual(await self.plugin.set_connection_config(HOME, config, [], loaded["revision"]),
+                         {"success": True})
+        self.assertEqual(self.updates[0]["wireguard"]["private-key"], v("s", changed_key))
 
     async def test_restarted_bus_reusing_owner_path_and_version_cannot_receive_update(self):
         config = {**await self.config(), "name": "New name"}
@@ -2198,6 +2225,32 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SubprocessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dbus_tracks_only_watched_profile_updates_in_message_order(self):
+        bus = _Bus(asyncio.StreamReader(), bus_writer())
+        with patch.object(bus, "call", new_callable=AsyncMock) as call:
+            await bus.watch_profile_updates(REF)
+        call.assert_awaited_once_with(
+            "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s",
+            f"type='signal',sender='{REF.owner}',path='{REF.path}',"
+            "interface='org.freedesktop.NetworkManager.Settings.Connection',member='Updated'",
+            destination="org.freedesktop.DBus",
+        )
+        fields = {1: REF.path, 2: "org.freedesktop.NetworkManager.Settings.Connection",
+                  3: "Updated", 7: REF.owner}
+        bus.serial = 1
+        with patch("main._dbus_read_message", new_callable=AsyncMock, side_effect=[
+            (4, 1, {**fields, 7: ":1.999"}, b""),
+            (4, 2, fields, b""),
+            (2, 3, {5: 1}, b""),
+            (4, 4, fields, b""),
+            (2, 5, {5: 2}, b""),
+        ]):
+            await bus._reply(())
+            self.assertEqual(bus.profile_updates, 1)
+            bus.serial = 2
+            await bus._reply(())
+            self.assertEqual(bus.profile_updates, 2)
+
     async def test_timed_out_dbus_request_is_an_unconfirmed_write(self):
         reader = asyncio.StreamReader()
         writer = Mock(write=Mock(), drain=AsyncMock())

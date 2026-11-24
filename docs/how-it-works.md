@@ -23,7 +23,8 @@ The editor uses the system `libnm` to prepare the full draft before changing a
 live profile. It retains unrelated settings from the original D-Bus profile.
 The snapshot identifies the system bus instance, NetworkManager service owner,
 profile object path, and version. Reading keys can advance that version, so the
-editor records the revision after the secret read and does not reread keys on
+editor watches for profile updates after the secret reply and records the
+revision only if no intervening update occurred. It does not reread keys on
 save. The backend holds only the latest editor snapshot, in memory for at most
 30 minutes. If it expires, reload to keep non-conflicting edits. During a save,
 owner lookup and write use the same authenticated connection. One `Update2` persists the result on that same object only
