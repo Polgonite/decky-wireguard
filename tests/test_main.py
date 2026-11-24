@@ -7,6 +7,7 @@ import shutil
 import socket
 import struct
 import tempfile
+import time
 import unittest
 from contextlib import asynccontextmanager
 from ipaddress import ip_address
@@ -16,6 +17,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from main import (
     DIAGNOSTIC_LOG,
     DuplicateUuid,
+    EDITOR_SNAPSHOT_TTL,
     NetworkManagerError,
     UnconfirmedWrite,
     NM_SETTINGS_PATH,
@@ -1579,6 +1581,66 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.plugin.set_connection_config(HOME, config, [], token)
                 self.assertIn("Reload before saving", result["error"])
                 self.assertFalse(self.updates)
+
+    async def test_snapshot_deadline_includes_suspend_and_rejects_at_expiry(self):
+        now = [100.0]
+        with patch("main.time.clock_gettime", side_effect=lambda _: now[0]) as clock:
+            config = {**await self.config(), "name": "Changed"}
+            now[0] += EDITOR_SNAPSHOT_TTL - 1
+            self.assertEqual(await self.plugin.set_connection_config(HOME, config, [], REVISION),
+                             {"success": True})
+            self.updates.clear()
+            now[0] += 1
+            with self.assertLogs("decky-wireguard"):
+                result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
+            self.assertEqual(result["code"], "reload_required")
+            self.assertIsNone(self.plugin._editor_snapshot)
+            self.assertIsNone(self.plugin._editor_deadline)
+            self.assertIsNone(self.plugin._editor_expiry)
+            self.assertFalse(self.updates)
+            self.assertTrue(all(call.args == (time.CLOCK_BOOTTIME,) for call in clock.call_args_list))
+
+    async def test_expired_snapshot_is_cleared_after_resume_without_logging_or_requests(self):
+        now = [100.0]
+        with patch("main.time.clock_gettime", side_effect=lambda _: now[0]), \
+                patch("main.EDITOR_SNAPSHOT_TTL", 2):
+            await self.config()
+            now[0] += 3
+            await asyncio.sleep(1.1)
+            self.assertIsNone(self.plugin._editor_snapshot)
+            self.assertIsNone(self.plugin._editor_deadline)
+            self.assertIsNone(self.plugin._editor_expiry)
+
+    async def test_resume_observer_discards_expired_snapshot_with_logging_disabled(self):
+        now = [100.0]
+        with patch("main.time.clock_gettime", side_effect=lambda _: now[0]):
+            await self.config()
+            now[0] += EDITOR_SNAPSHOT_TTL
+            await self.plugin.set_steam_readiness(True)
+            self.assertIsNone(self.plugin._editor_snapshot)
+            self.assertIsNone(self.plugin._editor_expiry)
+
+    async def test_snapshot_expiring_during_save_is_not_used_or_written(self):
+        import main
+
+        for stage in ("revision", "prepare"):
+            with self.subTest(stage=stage):
+                now = [100.0]
+                with patch("main.time.clock_gettime", side_effect=lambda _: now[0]):
+                    config = {**await self.config(), "name": "Changed"}
+                    original = main._nm_revision if stage == "revision" else main._prepare_settings
+
+                    async def expire_after(*args):
+                        result = await original(*args)
+                        now[0] += EDITOR_SNAPSHOT_TTL
+                        return result
+
+                    target = "main._nm_revision" if stage == "revision" else "main._prepare_settings"
+                    with patch(target, side_effect=expire_after), self.assertLogs("decky-wireguard"):
+                        result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
+                    self.assertEqual(result["code"], "reload_required")
+                    self.assertIsNone(self.plugin._editor_snapshot)
+                    self.assertFalse(self.updates)
 
     async def test_secret_refresh_version_is_the_save_baseline_and_secrets_are_not_reread(self):
         self.secret_bump = 1

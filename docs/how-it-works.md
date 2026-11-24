@@ -25,8 +25,9 @@ The snapshot identifies the system bus instance, NetworkManager service owner,
 profile object path, and version. Reading keys can advance that version, so the
 editor watches for profile updates after the secret reply and records the
 revision only if no intervening update occurred. It does not reread keys on
-save. The backend holds only the latest editor snapshot, in memory for at most
-30 minutes. If it expires, reload to keep non-conflicting edits. During a save,
+save. The backend holds only the latest editor snapshot, which expires after
+30 minutes including time spent suspended; it is cleared promptly after resume
+if expired. If it expires, reload to keep non-conflicting edits. During a save,
 owner lookup and write use the same authenticated connection. One `Update2` persists the result on that same object only
 if its version still matches. It does not reapply the firewall zone or metered
 setting to an active tunnel. New profiles use a single `AddConnection`. There is no

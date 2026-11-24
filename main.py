@@ -1514,6 +1514,7 @@ class Plugin:
         self._lock = asyncio.Lock()
         self._editor_snapshot: tuple[str, Settings] | None = None
         self._editor_expiry: asyncio.TimerHandle | None = None
+        self._editor_deadline: float | None = None
         self._active_paths: dict[str, str] = {}
         self._activations: dict[str, Activation] = {}
         self._pending_activations: dict[str, tuple[float, int]] = {}
@@ -1713,6 +1714,7 @@ class Plugin:
         return f"{self._profile_ref(uuid)}-peer-{refs.setdefault(peer, len(refs) + 1)}"
 
     def _observe_resume(self) -> None:
+        self._discard_expired_editor_snapshot()
         if self._log_handler is None or not hasattr(time, "CLOCK_BOOTTIME"):
             return
         # BOOTTIME includes suspend; monotonic time (used for verification) does not.
@@ -1827,7 +1829,8 @@ class Plugin:
                 token = ref.revision_token(revision)
                 self._clear_editor_snapshot()
                 self._editor_snapshot = token, settings
-                self._editor_expiry = asyncio.get_running_loop().call_later(EDITOR_SNAPSHOT_TTL, self._clear_editor_snapshot)
+                self._editor_deadline = time.clock_gettime(time.CLOCK_BOOTTIME) + EDITOR_SNAPSHOT_TTL
+                self._check_editor_expiry()
                 return {
                     "success": True,
                     "revision": token,
@@ -1839,9 +1842,31 @@ class Plugin:
 
     def _clear_editor_snapshot(self) -> None:
         self._editor_snapshot = None
+        self._editor_deadline = None
         if self._editor_expiry is not None:
             self._editor_expiry.cancel()
             self._editor_expiry = None
+
+    def _discard_expired_editor_snapshot(self) -> None:
+        if (self._editor_deadline is not None
+                and time.clock_gettime(time.CLOCK_BOOTTIME) >= self._editor_deadline):
+            self._clear_editor_snapshot()
+
+    def _check_editor_expiry(self) -> None:
+        self._discard_expired_editor_snapshot()
+        if self._editor_deadline is not None:
+            # A short monotonic timer rechecks BOOTTIME promptly after suspend.
+            remaining = self._editor_deadline - time.clock_gettime(time.CLOCK_BOOTTIME)
+            self._editor_expiry = asyncio.get_running_loop().call_later(
+                max(0, min(1, remaining)), self._check_editor_expiry,
+            )
+
+    def _current_editor_snapshot(self, revision: str) -> Settings:
+        self._discard_expired_editor_snapshot()
+        snapshot = self._editor_snapshot
+        if snapshot is None or snapshot[0] != revision:
+            raise ProfileConflict("The edit snapshot is no longer current. Reload before saving.")
+        return snapshot[1]
 
     async def read_conf_file(self, path: str) -> dict[str, object]:
         try:
@@ -1965,17 +1990,17 @@ class Plugin:
                     return await self._create_connection_config(config, advanced, request_uuid)
                 if not isinstance(revision, str) or not revision:
                     raise NetworkManagerError("A loaded profile revision is required. Reload before saving.")
-                snapshot = self._editor_snapshot
-                if snapshot is None or snapshot[0] != revision:
-                    raise ProfileConflict("The edit snapshot is no longer current. Reload before saving.")
+                self._current_editor_snapshot(revision)
                 async with _system_bus() as bus:
                     profile = await self._profile(uuid)
                     ref = await _nm_profile_ref(bus, profile["uuid"])
                     current = await _nm_revision(bus, ref)
                     if revision != ref.revision_token(current):
                         raise ProfileConflict("The profile changed outside this editor. Reload before saving.")
-                    settings = copy.deepcopy(snapshot[1])
-                    if await _prepare_settings(settings, config, advanced):
+                    settings = copy.deepcopy(self._current_editor_snapshot(revision))
+                    changed = await _prepare_settings(settings, config, advanced)
+                    self._current_editor_snapshot(revision)
+                    if changed:
                         await _nm_update(bus, ref, settings, current)
                 return {"success": True}
         except (ProfileConflict, UnconfirmedWrite) as error:
