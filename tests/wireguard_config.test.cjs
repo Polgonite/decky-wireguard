@@ -137,6 +137,19 @@ test("rebasing recognizes network masks and numeric keepalive equivalents", () =
   }
 });
 
+test("rebasing treats the control characters Python calls whitespace like the backend", () => {
+  const base = toDraft({ ...config, peers: [] }, []);
+  for (const space of ["\u001c", "\u001d", "\u001e", "\u001f", "\u0085"]) {
+    const local = { ...base, config: { ...base.config, peers: [{
+      ...peer, id: "new", original_public_key: null, public_key: `peer${space}`,
+      allowed_ips: `10.0.0.0/24${space}10.0.1.0/24`, endpoint: `vpn.example.com:51820${space}`,
+      persistent_keepalive: `25${space}`,
+    }] } };
+    const fresh = toDraft({ ...config, peers: [{ ...peer, allowed_ips: "10.0.0.0/24, 10.0.1.0/24" }] }, []);
+    assert.deepEqual(plain(rebaseDraft(base, local, fresh).config.peers), plain(fresh.config.peers));
+  }
+});
+
 test("rebasing addresses detects external IP methods that the backend would overwrite", () => {
   const methods = (ipv4, ipv6) => [
     { key: "ipv4.method", value: ipv4 }, { key: "ipv6.method", value: ipv6 },

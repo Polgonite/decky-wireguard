@@ -135,6 +135,12 @@ function storedPeerFields(peer: PeerConfig): Omit<PeerConfig, "original_public_k
   };
 }
 
+// Python's str.strip() and \s (used by the backend) also treat U+001C-U+001F and U+0085 as
+// whitespace and never U+FEFF; JavaScript's \s and trim() are the opposite.
+const SPACE = "\\t-\\r\\u001c-\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+const trimSpace = (text: string) => text.replace(new RegExp(`^[${SPACE}]+|[${SPACE}]+$`, "g"), "");
+const entries = (text: string) => text.split(new RegExp(`[${SPACE},]+`)).filter(Boolean);
+
 function ipv4Number(text: string): bigint | null {
   const parts = text.split(".");
   if (parts.length !== 4 || parts.some((part) =>
@@ -190,13 +196,13 @@ function networkValue(entry: string): string {
 }
 
 function comparablePeer(peer: PeerConfig): string {
-  const keepalive = peer.persistent_keepalive.trim();
+  const keepalive = trimSpace(peer.persistent_keepalive);
   const number = /^[0-9]+$/.test(keepalive) ? Number(keepalive) : NaN;
   return JSON.stringify({
-    public_key: peer.public_key.trim(),
-    preshared_key: peer.preshared_key.trim(),
-    allowed_ips: peer.allowed_ips.split(/[\s,]+/).filter(Boolean).map(networkValue),
-    endpoint: peer.endpoint.trim(),
+    public_key: trimSpace(peer.public_key),
+    preshared_key: trimSpace(peer.preshared_key),
+    allowed_ips: entries(peer.allowed_ips).map(networkValue),
+    endpoint: trimSpace(peer.endpoint),
     persistent_keepalive: !keepalive || keepalive.toLowerCase() === "off" ? "0"
       : Number.isSafeInteger(number) && number <= 65535 ? String(number) : keepalive,
   });
@@ -257,7 +263,7 @@ export function rebaseDraft(base: EditorDraft, local: EditorDraft, fresh: Editor
   }
   const rebased = { config, advanced };
   if (config.addresses !== fresh.config.addresses) {
-    const addresses = config.addresses.split(/[\s,]+/).filter(Boolean);
+    const addresses = entries(config.addresses);
     const updates = fromDraft(rebased).advanced;
     // Address saves recalculate both methods before applying explicit advanced updates.
     for (const family of ["ipv4", "ipv6"] as const) {

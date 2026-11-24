@@ -1728,7 +1728,8 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
     async def test_may_fail_no_is_rejected_for_disabled_or_ignored_families(self):
         config = await self.config()
         for family, method in (("ipv4", "disabled"), ("ipv6", "disabled"), ("ipv6", "ignore")):
-            for value in ("no", "N", "fa", "false", "of", "off", "0", "-00", "+0x0"):
+            for value in ("no", "N", "fa", "false", "of", "off", "0", "-00", "+0x0",
+                          "0b0", "0B0", "-0b0", "+0b00"):
                 with self.subTest(family=family, method=method, value=value):
                     changes = {"addresses": "", "dns": ""} if family == "ipv4" else {}
                     edits = [

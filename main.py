@@ -814,18 +814,15 @@ async def _prepare_settings(settings: Settings, config: dict[str, object], advan
         return changed
     requested = {item["key"]: item["value"].strip() for item in remaining}
     for family in ("ipv4", "ipv6"):
-        may_fail = requested.get(f"{family}.may-fail", "").lower()
+        may_fail = requested.get(f"{family}.may-fail")
         method = _data(settings.get(family, {}), "method", "disabled")
-        false_value = (
-            bool(may_fail) and (
-                "no".startswith(may_fail) or "false".startswith(may_fail)
-                or (len(may_fail) >= 2 and "off".startswith(may_fail))
-                or re.fullmatch(r"[+-]?(?:0+|0x0+)", may_fail) is not None
-            )
-        )
-        if method in ("disabled", "ignore") and false_value:
+        # nmcli reads many spellings as false (for example 0b0), so accept only known true ones.
+        if (
+            method in ("disabled", "ignore") and may_fail is not None
+            and may_fail.lower() not in ("", "1", "on", "y", "yes", "t", "true")
+        ):
             raise NetworkManagerError(
-                f"{family}.may-fail cannot be set to no when {family}.method is {method}; "
+                f"{family}.may-fail cannot be set to {may_fail!r} when {family}.method is {method}; "
                 "NetworkManager would discard it."
             )
         never = requested.get(f"{family}.never-default")
