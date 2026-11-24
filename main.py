@@ -869,6 +869,12 @@ async def _prepare_settings(settings: Settings, config: dict[str, object], advan
                     settings.setdefault(group, {})[field] = new[field]
                 else:
                     settings.get(group, {}).pop(field, None)
+    # Older libnm omits some fields from the keyfile (for example a gateway
+    # without addresses), so the diff above cannot see their requested removal.
+    for key in allowed:
+        group, _, field = key.partition(".")
+        if field not in after.get(group, {}):
+            settings.get(group, {}).pop(field, None)
     _normalize_ip_settings(settings)
     _validate_wireguard_settings(settings, [])
     return True
