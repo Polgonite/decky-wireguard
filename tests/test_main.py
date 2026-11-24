@@ -1663,6 +1663,70 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["success"])
         self.assertFalse(self.updates)
 
+    async def test_may_fail_no_is_rejected_for_disabled_or_ignored_families(self):
+        config = await self.config()
+        for family, method in (("ipv4", "disabled"), ("ipv6", "disabled"), ("ipv6", "ignore")):
+            for value in ("no", "N", "fa", "false", "of", "off", "0", "-00", "+0x0"):
+                with self.subTest(family=family, method=method, value=value):
+                    changes = {"addresses": "", "dns": ""} if family == "ipv4" else {}
+                    edits = [
+                        {"key": f"{family}.method", "value": method},
+                        {"key": f"{family}.may-fail", "value": value},
+                    ]
+                    self.calls.clear()
+                    with self.assertLogs("decky-wireguard"):
+                        result = await self.plugin.set_connection_config(
+                            HOME, {**config, **changes}, edits, REVISION,
+                        )
+                    self.assertFalse(result["success"])
+                    self.assertIn(f"{family}.may-fail", result["error"])
+                    self.assertIn("NetworkManager would discard it", result["error"])
+                    self.assertNotIn("offline modify", self.calls)
+                    self.assertNotIn("Update2", self.calls)
+        self.assertFalse(self.updates)
+
+    async def test_may_fail_no_is_rejected_when_family_is_already_disabled(self):
+        self.settings["ipv4"] = {"method": v("s", "disabled")}
+        config = await self.config()
+        for family in ("ipv4", "ipv6"):
+            with self.subTest(family=family), self.assertLogs("decky-wireguard"):
+                result = await self.plugin.set_connection_config(
+                    HOME, {**config, "name": "Changed"},
+                    [{"key": f"{family}.may-fail", "value": "no"}], REVISION,
+                )
+                self.assertFalse(result["success"])
+                self.assertIn(f"{family}.method is disabled", result["error"])
+                self.assertFalse(self.updates)
+
+    async def test_may_fail_no_cannot_create_a_disabled_family(self):
+        config = await self.config()
+        config["peers"][0]["original_public_key"] = None
+        with self.assertLogs("decky-wireguard"), patch("main._dbus_call") as dbus:
+            result = await self.plugin.create_connection_config(
+                config, [{"key": "ipv6.may-fail", "value": "no"}],
+            )
+        self.assertFalse(result["success"])
+        self.assertIn("ipv6.method is disabled", result["error"])
+        dbus.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("nmcli"), "Offline conversion requires NetworkManager")
+    async def test_may_fail_valid_values_are_preserved(self):
+        config = await self.config()
+        for key, value, method, expected in (
+            ("ipv4.may-fail", "no", "manual", False),
+            ("ipv6.may-fail", "no", "link-local", False),
+            ("ipv6.may-fail", "yes", "disabled", True),
+            ("ipv6.may-fail", "", "ignore", True),
+        ):
+            with self.subTest(key=key, value=value, method=method):
+                family = key.split(".")[0]
+                result = await self.plugin.set_connection_config(HOME, config, [
+                    {"key": f"{family}.method", "value": method},
+                    {"key": key, "value": value},
+                ], REVISION)
+                self.assertTrue(result["success"], result)
+                self.assertEqual(self.updates[-1][family].get("may-fail", v("b", True))["data"], expected)
+
     async def test_invalid_changes_are_rejected_before_anything_is_saved(self):
         cases = [
             ({"private_key": "short"}, "Private key must be a 44-character"),

@@ -126,6 +126,8 @@ profile, so related changes such as clearing the last address and its gateway
 can be saved together. A gateway cannot be combined with `never-default=yes`
 for the same IP family. If an edit would implicitly change another routing
 property, the editor rejects it; change both properties explicitly instead.
+NetworkManager discards `may-fail=no` when the IP method is `disabled` or
+`ignore`, so the editor rejects that combination.
 
 These are local compatibility checks, not a connectivity test. They cannot
 verify that the remote peer has matching keys, accepts the chosen addresses, or
