@@ -1534,6 +1534,14 @@ class ConnectionConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.updates[0]["ipv6"]["method"], v("s", "manual"))
         self.assertEqual(self.updates[0]["ipv6"]["address-data"]["data"][0]["prefix"], v("u", 64))
 
+    async def test_adding_address_changes_link_local_method_to_manual(self):
+        self.settings["ipv6"]["method"] = v("s", "link-local")
+        config = await self.config()
+        config["addresses"] += ", fd00::1/64"
+        result = await self.plugin.set_connection_config(HOME, config, [], REVISION)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self.updates[0]["ipv6"]["method"], v("s", "manual"))
+
     @unittest.skipUnless(shutil.which("nmcli"), "Offline conversion requires NetworkManager")
     async def test_last_address_gateway_and_routes_can_be_removed_together(self):
         self.settings["ipv4"]["gateway"] = v("s", "10.0.0.1")

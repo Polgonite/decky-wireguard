@@ -79,6 +79,54 @@ test("rebasing a persisted new peer keeps its saved identity and unrelated draft
   assert.throws(() => rebaseDraft(base, local, changed), /Both copies changed peers/);
 });
 
+test("rebasing addresses detects external IP methods that the backend would overwrite", () => {
+  const methods = (ipv4, ipv6) => [
+    { key: "ipv4.method", value: ipv4 }, { key: "ipv6.method", value: ipv6 },
+  ];
+  const draft = (addresses, ipv4, ipv6) => toDraft({ ...config, addresses }, methods(ipv4, ipv6));
+  const base = draft("10.0.0.2/32", "manual", "disabled");
+  const local = draft("10.0.0.2/32, fd00::1/64", "manual", "disabled");
+  const changed = draft("10.0.0.2/32", "manual", "link-local");
+  assert.throws(() => rebaseDraft(base, local, changed), /Both copies changed ipv6\.method/);
+
+  // Both families are recalculated, even if the edited address is in the other family.
+  const ipv4Local = draft("10.0.0.3/32", "manual", "disabled");
+  const externalManual = draft("10.0.0.2/32", "manual", "manual");
+  assert.throws(() => rebaseDraft(base, ipv4Local, externalManual), /Both copies changed ipv6\.method/);
+
+  const explicit = draft(local.config.addresses, "manual", "disabled");
+  explicit.advanced[1].value = "link-local";
+  assert.throws(() => rebaseDraft(base, explicit, changed), /Both copies changed ipv6\.method/);
+
+  const ipv4Base = draft("", "disabled", "disabled");
+  const ipv4Added = draft("10.0.0.2/32", "disabled", "disabled");
+  const ipv4External = draft("", "ignore", "disabled");
+  assert.throws(() => rebaseDraft(ipv4Base, ipv4Added, ipv4External), /Both copies changed ipv4\.method/);
+
+  const missingMethod = draft("10.0.0.2/32", "manual", "link-local");
+  missingMethod.advanced = missingMethod.advanced.filter((property) => property.key !== "ipv6.method");
+  assert.throws(() => rebaseDraft(base, local, missingMethod), /Cannot safely rebase addresses.*ipv6\.method/);
+});
+
+test("rebasing addresses preserves external methods when the effective result agrees", () => {
+  const draft = (addresses, ipv4, ipv6) => toDraft({ ...config, addresses }, [
+    { key: "ipv4.method", value: ipv4 }, { key: "ipv6.method", value: ipv6 },
+  ]);
+  const base = draft("10.0.0.2/32", "manual", "disabled");
+  const local = draft("10.0.0.2/32, fd00::1/64", "manual", "disabled");
+  const sameEffective = draft("10.0.0.2/32", "manual", "manual");
+  assert.equal(rebaseDraft(base, local, sameEffective).config.addresses, local.config.addresses);
+  const noImplicitWrite = draft(local.config.addresses, "manual", "link-local");
+  assert.equal(rebaseDraft(base, local, noImplicitWrite).advanced[1].value, "link-local");
+  const unrelatedFamily = draft("10.0.0.2/32", "manual", "ignore");
+  const ipv4Local = draft("10.0.0.3/32", "manual", "disabled");
+  assert.equal(rebaseDraft(base, ipv4Local, unrelatedFamily).advanced[1].value, "ignore");
+
+  const explicit = draft(local.config.addresses, "manual", "disabled");
+  explicit.advanced[1].value = "manual";
+  assert.equal(rebaseDraft(base, explicit, sameEffective).config.addresses, local.config.addresses);
+});
+
 test("advanced property labels are readable", () => {
   assert.equal(advancedSettingLabel("ipv4.dns-search"), "IPv4: DNS Search");
   assert.equal(advancedSettingLabel("future.custom-property"), "Future: Custom Property");

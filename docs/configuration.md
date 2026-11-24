@@ -40,8 +40,10 @@ Select **Retry reload** to read the saved profile before editing again; this
 does not repeat the write. If another editor changes the profile, choose
 **Reload and keep my edits** to combine changes to different fields. If both
 copies changed the same field (including the peer list) differently, the draft
-is kept and nothing is written. A peer already saved with the same settings
-does not conflict. **Discard edits and reload** asks for confirmation.
+is kept and nothing is written. Address edits also conflict with an external
+IP method change if saving would overwrite that method. A peer already saved
+with the same settings does not conflict. **Discard edits and reload** asks for
+confirmation.
 If a save
 times out, check the profile in the connection list before retrying: the
 complete change may already have reached disk. Retrying the same new draft

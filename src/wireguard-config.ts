@@ -182,7 +182,29 @@ export function rebaseDraft(base: EditorDraft, local: EditorDraft, fresh: Editor
     if (latest) latest.value = value;
     else advanced.push({ key, value, originalValue: "", isNew: true, id: key });
   }
-  return { config, advanced };
+  const rebased = { config, advanced };
+  if (config.addresses !== fresh.config.addresses) {
+    const addresses = config.addresses.split(/[\s,]+/).filter(Boolean);
+    const updates = fromDraft(rebased).advanced;
+    // Address saves recalculate both methods before applying explicit advanced updates.
+    for (const family of ["ipv4", "ipv6"] as const) {
+      const key = `${family}.method`;
+      const previous = base.advanced.find((property) => property.key === key)?.value;
+      const latest = fresh.advanced.find((property) => property.key === key)?.value;
+      if (previous === undefined || latest === undefined) {
+        throw new Error(`Cannot safely rebase addresses without ${key}. Your draft was kept.`);
+      }
+      const hasAddress = addresses.some((address) => address.includes(":") === (family === "ipv6"));
+      let effective = latest;
+      if (hasAddress && ["disabled", "ignore", "link-local"].includes(latest)) effective = "manual";
+      else if (!hasAddress && latest === "manual") effective = "disabled";
+      effective = updates.find((property) => property.key === key)?.value ?? effective;
+      if (latest !== previous && effective !== latest) {
+        throw new Error(`Both copies changed ${key}. Your draft was kept.`);
+      }
+    }
+  }
+  return rebased;
 }
 
 export function advancedSettingLabel(key: string): string {
